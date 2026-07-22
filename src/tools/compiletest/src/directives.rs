@@ -160,6 +160,8 @@ pub(crate) struct TestProps {
     // empty before the test starts. Incremental mode tests will reuse the
     // incremental directory between passes in the same test.
     pub(crate) incremental: bool,
+    // Whether invoking rustc for this crate is a test failure.
+    pub(crate) rustc_not_invoked: bool,
     // If `true`, this test is a known bug.
     //
     // When set, some requirements are relaxed. Currently, this only means no
@@ -252,6 +254,7 @@ mod directives {
     pub(crate) const ASSEMBLY_OUTPUT: &str = "assembly-output";
     pub(crate) const STDERR_PER_BITWIDTH: &str = "stderr-per-bitwidth";
     pub(crate) const INCREMENTAL: &str = "incremental";
+    pub(crate) const RUSTC_NOT_INVOKED: &str = "rustc-not-invoked";
     pub(crate) const KNOWN_BUG: &str = "known-bug";
     pub(crate) const TEST_MIR_PASS: &str = "test-mir-pass";
     pub(crate) const REMAP_SRC_BASE: &str = "remap-src-base";
@@ -296,6 +299,7 @@ impl TestProps {
             forbid_output: vec![],
             incremental_dir: None,
             incremental: false,
+            rustc_not_invoked: false,
             known_bug: false,
             pass_fail_mode: None,
             no_pass_override: false,
@@ -897,7 +901,7 @@ pub(crate) fn make_test_description(
     aux_props: &mut AuxProps,
 ) -> CollectedTestDesc {
     let mut ignore_message: Option<Cow<'static, str>> = None;
-    let mut should_fail = false;
+    let mut should_fail = ShouldFail::No;
 
     // Perform a per-file (rather than per-line) ignore decision to skip running debuginfo tests
     // if we don't have a debugger for them available.
@@ -971,7 +975,26 @@ pub(crate) fn make_test_description(
                     });
                 }
 
-                should_fail |= config.parse_name_directive(ln, "should-fail");
+                if ln.name == "should-fail" {
+                    let directive = if ln.value_after_colon().is_some() {
+                        let message = config
+                            .parse_name_value_directive(ln, "should-fail")
+                            .unwrap()
+                            .trim()
+                            .replace(
+                                "$DIR",
+                                path.parent().expect("test file path has no parent").as_str(),
+                            );
+                        ShouldFail::Message(message)
+                    } else {
+                        config.parse_name_directive(ln, "should-fail");
+                        ShouldFail::Any
+                    };
+                    if should_fail != ShouldFail::No && should_fail != directive {
+                        panic!("conflicting `//@ should-fail` directives in `{path}`");
+                    }
+                    should_fail = directive;
+                }
             },
         );
     }
@@ -979,11 +1002,7 @@ pub(crate) fn make_test_description(
     // The `should-fail` annotation doesn't apply to pretty tests,
     // since we run the pretty printer across all tests by default.
     // If desired, we could add a `should-fail-pretty` annotation.
-    let should_fail = if should_fail && config.mode != TestMode::Pretty {
-        ShouldFail::Yes
-    } else {
-        ShouldFail::No
-    };
+    let should_fail = if config.mode == TestMode::Pretty { ShouldFail::No } else { should_fail };
 
     CollectedTestDesc {
         name,

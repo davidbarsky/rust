@@ -147,6 +147,9 @@ fn make_directive_handlers_map() -> HashMap<&'static str, Handler> {
         handler(NO_PREFER_DYNAMIC, |config, ln, props| {
             config.set_name_directive(ln, NO_PREFER_DYNAMIC, &mut props.no_prefer_dynamic);
         }),
+        handler(RUSTC_NOT_INVOKED, |config, ln, props| {
+            config.set_name_directive(ln, RUSTC_NOT_INVOKED, &mut props.rustc_not_invoked);
+        }),
         handler(PRETTY_MODE, |config, ln, props| {
             if let Some(m) = config.parse_name_value_directive(ln, PRETTY_MODE) {
                 props.pretty_mode = m;

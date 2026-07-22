@@ -6,7 +6,7 @@ use semver::Version;
 use crate::common::{Config, Debugger, TestMode};
 use crate::directives::{
     self, AuxProps, DIRECTIVE_HANDLERS_MAP, DirectivesCache, EarlyProps, Edition, EditionRange,
-    FileDirectives, KNOWN_DIRECTIVE_NAMES_SET, LineNumber, extract_llvm_version,
+    FileDirectives, KNOWN_DIRECTIVE_NAMES_SET, LineNumber, TestProps, extract_llvm_version,
     extract_version_range, line_directive, parse_edition, parse_normalize_rule,
 };
 use crate::executor::{CollectedTestDesc, ShouldFail, TestVariant};
@@ -301,12 +301,25 @@ fn check_ignore_debugger(config: &Config, contents: &str, debugger: Option<Debug
 fn should_fail() {
     let config: Config = cfg().build();
     let tn = String::new();
-    let p = Utf8Path::new("a.rs");
+    let p = Utf8Path::new("tests/case/main.rs");
 
     let d = make_test_description(&config, tn.clone(), p, p, "", None, None);
     assert_eq!(d.should_fail, ShouldFail::No);
-    let d = make_test_description(&config, tn, p, p, "//@ should-fail", None, None);
-    assert_eq!(d.should_fail, ShouldFail::Yes);
+    let d = make_test_description(&config, tn.clone(), p, p, "//@ should-fail", None, None);
+    assert_eq!(d.should_fail, ShouldFail::Any);
+    let d = make_test_description(
+        &config,
+        tn,
+        p,
+        p,
+        "//@ should-fail: auxiliary build of $DIR/auxiliary/a.rs failed",
+        None,
+        None,
+    );
+    assert_eq!(
+        d.should_fail,
+        ShouldFail::Message("auxiliary build of tests/case/auxiliary/a.rs failed".to_owned())
+    );
 }
 
 #[test]
@@ -314,6 +327,19 @@ fn revisions() {
     let config: Config = cfg().build();
 
     assert_eq!(parse_early_props(&config, "//@ revisions: a b c").revisions, vec!["a", "b", "c"],);
+}
+
+#[test]
+fn rustc_not_invoked() {
+    let config = cfg().mode("incremental").build();
+    let line =
+        line_directive(Utf8Path::new("auxiliary/b.rs"), LineNumber::ZERO, "//@ rustc-not-invoked")
+            .unwrap();
+    let mut props = TestProps::new();
+
+    DIRECTIVE_HANDLERS_MAP["rustc-not-invoked"].handle(&config, &line, &mut props);
+
+    assert!(props.rustc_not_invoked);
 }
 
 #[test]

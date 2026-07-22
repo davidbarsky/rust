@@ -5,6 +5,7 @@
 //! as closely as possible, for ease of migration. Now that libtest is no longer
 //! used, we can potentially redesign things to be a better fit for compiletest.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
@@ -20,6 +21,8 @@ use crate::panic_hook;
 
 mod deadline;
 mod json;
+#[cfg(test)]
+mod tests;
 
 pub(crate) fn run_tests(config: &Config, tests: Vec<CollectedTest>) -> bool {
     let tests_len = tests.len();
@@ -112,7 +115,7 @@ fn spawn_test_thread(
         config: Arc::clone(&test.config),
         testpaths: test.testpaths.clone(),
         variant: test.variant.clone(),
-        should_fail: test.desc.should_fail,
+        should_fail: test.desc.should_fail.clone(),
         completion_sender,
     };
     let thread_builder = thread::Builder::new().name(test.desc.name.clone());
@@ -163,14 +166,7 @@ fn test_thread_main(args: TestThreadArgs) {
         write!(stderr, "{panic_buf}");
     }
 
-    // Interpret the presence/absence of a panic as test failure/success.
-    let outcome = match (args.should_fail, panic_payload) {
-        (ShouldFail::No, None) | (ShouldFail::Yes, Some(_)) => TestOutcome::Succeeded,
-        (ShouldFail::No, Some(_)) => TestOutcome::Failed { message: None },
-        (ShouldFail::Yes, None) => {
-            TestOutcome::Failed { message: Some("`//@ should-fail` test did not fail as expected") }
-        }
-    };
+    let outcome = args.should_fail.outcome(panic_payload.as_deref());
 
     let stdout = capture.into_inner();
     args.completion_sender.send(TestCompletion { id: args.id, outcome, stdout }).unwrap();
@@ -353,10 +349,42 @@ impl CollectedTestDesc {
     }
 }
 
-/// Tests with `//@ should-fail` are tests of compiletest itself, and should
-/// be reported as successful if and only if they would have _failed_.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// Controls whether test-runner failures are inverted into successes.
+///
+/// Message matching requires a typed `TestFailure`, so an unrelated panic cannot satisfy an exact
+/// expectation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ShouldFail {
     No,
-    Yes,
+    Any,
+    Message(String),
 }
+
+impl ShouldFail {
+    fn outcome(self, panic_payload: Option<&(dyn Any + Send)>) -> TestOutcome {
+        match (self, panic_payload) {
+            (Self::No, None) | (Self::Any, Some(_)) => TestOutcome::Succeeded,
+            (Self::No, Some(_)) => TestOutcome::Failed { message: None },
+            (Self::Any | Self::Message(_), None) => TestOutcome::Failed {
+                message: Some("`//@ should-fail` test did not fail as expected"),
+            },
+            (Self::Message(expected), Some(payload)) => {
+                match payload.downcast_ref::<TestFailure>() {
+                    Some(actual) if actual.0 == expected => TestOutcome::Succeeded,
+                    Some(_) => TestOutcome::Failed {
+                        message: Some(
+                            "`//@ should-fail` test reported a different failure than expected",
+                        ),
+                    },
+                    None => TestOutcome::Failed {
+                        message: Some(
+                            "`//@ should-fail` test panicked instead of reporting the expected failure",
+                        ),
+                    },
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct TestFailure(pub(crate) String);
