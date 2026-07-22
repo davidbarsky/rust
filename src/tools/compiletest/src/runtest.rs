@@ -20,7 +20,7 @@ use crate::common::{
 };
 use crate::directives::{AuxCrate, TestProps};
 use crate::errors::{Error, ErrorKind, load_errors};
-use crate::executor::TestVariant;
+use crate::executor::{TestFailure, TestVariant};
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
 use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
@@ -1379,7 +1379,7 @@ impl<'test> TestCx<'test> {
             self.compose_and_run(rustc, self.config.host_compile_lib_path.as_path(), None, None);
         if !res.status.success() {
             self.fatal_proc_rec(
-                &format!("auxiliary build of {} failed to compile: ", self.config.minicore_path),
+                &format!("auxiliary build of {} failed to compile:", self.config.minicore_path),
                 &res,
             );
         }
@@ -1518,8 +1518,15 @@ impl<'test> TestCx<'test> {
             None,
         );
         if !auxres.status.success() {
+            if !aux_props.error_patterns.is_empty() || !aux_props.regex_error_patterns.is_empty() {
+                aux_cx.check_correct_failure_status(&auxres);
+                aux_cx.check_all_error_patterns(&aux_cx.get_output(&auxres), &auxres);
+                self.fatal(&format!(
+                    "auxiliary build of {aux_path} failed with expected diagnostics"
+                ));
+            }
             self.fatal_proc_rec(
-                &format!("auxiliary build of {aux_path} failed to compile: "),
+                &format!("auxiliary build of {aux_path} failed to compile:"),
                 &auxres,
             );
         }
@@ -2195,7 +2202,7 @@ impl<'test> TestCx<'test> {
     fn fatal(&self, err: &str) -> ! {
         writeln!(self.stdout, "\n{prefix}: {err}", prefix = self.error_prefix());
         error!("fatal error, panic: {:?}", err);
-        panic!("fatal error");
+        std::panic::resume_unwind(Box::new(TestFailure(err.to_owned())));
     }
 
     fn fatal_proc_rec(&self, err: &str, proc_res: &ProcRes) -> ! {
@@ -2226,7 +2233,7 @@ impl<'test> TestCx<'test> {
 
         // Use resume_unwind instead of panic!() to prevent a panic message + backtrace from
         // compiletest, which is unnecessary noise.
-        std::panic::resume_unwind(Box::new(()));
+        std::panic::resume_unwind(Box::new(TestFailure(err.to_owned())));
     }
 
     // codegen tests (using FileCheck)
