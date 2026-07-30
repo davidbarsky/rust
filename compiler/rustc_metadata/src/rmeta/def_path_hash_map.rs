@@ -9,6 +9,7 @@ use crate::rmeta::decoder::BlobDecodeContext;
 pub(crate) enum DefPathHashMapRef<'tcx> {
     OwnedFromMetadata(odht::HashTable<HashMapConfig, OwnedSlice>),
     BorrowedFromTcx(&'tcx DefPathHashMap),
+    OwnedForEncoding(DefPathHashMap),
 }
 
 impl DefPathHashMapRef<'_> {
@@ -19,7 +20,7 @@ impl DefPathHashMapRef<'_> {
     ) -> Option<DefIndex> {
         match *self {
             DefPathHashMapRef::OwnedFromMetadata(ref map) => map.get(&def_path_hash.local_hash()),
-            DefPathHashMapRef::BorrowedFromTcx(_) => {
+            DefPathHashMapRef::BorrowedFromTcx(_) | DefPathHashMapRef::OwnedForEncoding(_) => {
                 panic!("DefPathHashMap::BorrowedFromTcx variant only exists for serialization")
             }
         }
@@ -30,6 +31,11 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for DefPathHashMapRef<'tcx> {
     fn encode(&self, e: &mut EncodeContext<'a, 'tcx>) {
         match *self {
             DefPathHashMapRef::BorrowedFromTcx(def_path_hash_map) => {
+                let bytes = def_path_hash_map.raw_bytes();
+                e.emit_usize(bytes.len());
+                e.emit_raw_bytes(bytes);
+            }
+            DefPathHashMapRef::OwnedForEncoding(ref def_path_hash_map) => {
                 let bytes = def_path_hash_map.raw_bytes();
                 e.emit_usize(bytes.len());
                 e.emit_raw_bytes(bytes);

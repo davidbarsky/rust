@@ -1955,7 +1955,12 @@ impl CrateMetadata {
         let trait_impls = root
             .impls
             .decode(&blob)
-            .map(|trait_impls| (trait_impls.trait_id, trait_impls.impls))
+            .map(|trait_impls| {
+                (
+                    (trait_impls.trait_id.krate, DefIndex::from_u32(trait_impls.trait_id.index)),
+                    trait_impls.impls,
+                )
+            })
             .collect();
         let alloc_decoding_state =
             AllocDecodingState::new(root.interpret_alloc_index.decode(&blob).collect());

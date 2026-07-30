@@ -4,7 +4,7 @@ use rustc_index::Idx;
 use crate::rmeta::decoder::MetaBlob;
 use crate::rmeta::*;
 
-pub(super) trait IsDefault: Default {
+pub(crate) trait IsDefault: Default {
     fn is_default(&self) -> bool;
 }
 
@@ -50,7 +50,7 @@ impl<T> IsDefault for LazyArray<T> {
 /// Invariant: `Self::default()` should encode as `[0; BYTE_LEN]`,
 /// but this has no impact on safety.
 /// In debug builds, this invariant is checked in `[TableBuilder::set]`
-pub(super) trait FixedSizeEncoding: IsDefault {
+pub(crate) trait FixedSizeEncoding: IsDefault {
     /// This should be `[u8; BYTE_LEN]`;
     /// Cannot use an associated `const BYTE_LEN: usize` instead due to const eval limitations.
     type ByteArray;
@@ -486,19 +486,14 @@ impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>> TableBui
         }
     }
 
-    pub(crate) fn encode(&self, buf: &mut FileEncoder<'_>) -> LazyTable<I, T> {
-        let pos = buf.position();
-
+    pub(crate) fn encode(&self, position: usize, mut emit: impl FnMut(&[u8])) -> LazyTable<I, T> {
         let width = self.width;
         for block in &self.blocks {
-            buf.write_with(|dest| {
-                *dest = *block;
-                width
-            });
+            emit(&block[..width]);
         }
 
         LazyTable::from_position_and_encoded_size(
-            NonZero::new(pos).unwrap(),
+            NonZero::new(position).unwrap(),
             width,
             self.blocks.len(),
         )
