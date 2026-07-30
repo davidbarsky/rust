@@ -4,6 +4,7 @@ use std::fmt::Debug;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
+pub use rustc_attr_ir::{Namespace, NamespaceSet};
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 use rustc_hir_id::HirId;
 use rustc_macros::{Decodable, Encodable, StableHash};
@@ -607,42 +608,6 @@ impl Res {
 }
 
 impl<Id> IntoDiagArg for Res<Id> {
-    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
-        DiagArgValue::Str(Cow::Borrowed(self.descr()))
-    }
-}
-
-/// Different kinds of symbols can coexist even if they share the same textual name.
-/// Therefore, they each have a separate universe (known as a "namespace").
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
-#[derive(StableHash)]
-pub enum Namespace {
-    /// The type namespace includes `struct`s, `enum`s, `union`s, `trait`s, and `mod`s
-    /// (and, by extension, crates).
-    ///
-    /// Note that the type namespace includes other items; this is not an
-    /// exhaustive list.
-    TypeNS,
-    /// The value namespace includes `fn`s, `const`s, `static`s, and local variables (including function arguments).
-    ValueNS,
-    /// The macro namespace includes `macro_rules!` macros, declarative `macro`s,
-    /// procedural macros, attribute macros, `derive` macros, and non-macro attributes
-    /// like `#[inline]` and `#[rustfmt::skip]`.
-    MacroNS,
-}
-
-impl Namespace {
-    /// The English description of the namespace.
-    pub fn descr(self) -> &'static str {
-        match self {
-            Self::TypeNS => "type",
-            Self::ValueNS => "value",
-            Self::MacroNS => "macro",
-        }
-    }
-}
-
-impl IntoDiagArg for Namespace {
     fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
         DiagArgValue::Str(Cow::Borrowed(self.descr()))
     }

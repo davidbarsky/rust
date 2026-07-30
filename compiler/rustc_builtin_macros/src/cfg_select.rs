@@ -85,12 +85,14 @@ impl<'cx, 'sess> MacResult for CfgSelectResult<'cx, 'sess> {
             // Register item names that were not selected for error reporting. We do this
             // for `#[cfg]` too.
             for item in items {
-                for name in item.declared_idents() {
+                for (ident, visibility, namespaces) in item.declared_idents() {
                     ecx.resolver.append_stripped_cfg_item(
                         ecx.current_expansion.lint_node_id,
-                        name,
+                        ident,
                         cfg_entry.clone(),
                         cfg_entry.span(),
+                        visibility,
+                        namespaces,
                     );
                 }
             }

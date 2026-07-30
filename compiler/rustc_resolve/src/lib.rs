@@ -1976,7 +1976,13 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             .into_iter()
             .filter_map(|item| {
                 let parent_scope = self.owners.get(&item.parent_scope)?.def_id.to_def_id();
-                Some(StrippedCfgItem { parent_scope, ident: item.ident, cfg: item.cfg })
+                Some(StrippedCfgItem {
+                    parent_scope,
+                    ident: item.ident,
+                    cfg: item.cfg,
+                    visibility: item.visibility,
+                    namespaces: item.namespaces,
+                })
             })
             .collect();
         let disambiguators = self

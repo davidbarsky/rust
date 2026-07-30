@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use rustc_ast::{self as ast, Crate, DelegationSuffixes, NodeId};
 use rustc_ast_pretty::pprust;
-use rustc_attr_ir::{Attribute, AttributeKind, CfgEntry, StabilityLevel, StrippedCfgItem};
+use rustc_attr_ir::{
+    Attribute, AttributeKind, CfgEntry, StabilityLevel, StrippedCfgItem, StrippedCfgItemVisibility,
+};
 use rustc_attr_parsing::AttributeParser;
 use rustc_data_structures::sync::RwLock;
 use rustc_errors::{Applicability, StashKey};
@@ -18,7 +20,7 @@ use rustc_expand::compile_declarative_macro;
 use rustc_expand::expand::{
     AstFragment, AstFragmentKind, Invocation, InvocationKind, SupportsMacroExpansion,
 };
-use rustc_hir::def::{DefKind, MacroKinds, Namespace, NonMacroAttrKind};
+use rustc_hir::def::{DefKind, MacroKinds, Namespace, NamespaceSet, NonMacroAttrKind};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_lint_defs::builtin::{
     LEGACY_DERIVE_HELPERS, OUT_OF_SCOPE_MACRO_CALLS, UNUSED_MACRO_RULES, UNUSED_MACROS,
@@ -533,11 +535,15 @@ impl<'ra, 'tcx> ResolverExpand for Resolver<'ra, 'tcx> {
         ident: Ident,
         cfg: CfgEntry,
         cfg_span: Span,
+        visibility: StrippedCfgItemVisibility,
+        namespaces: NamespaceSet,
     ) {
         self.stripped_cfg_items.push(StrippedCfgItem {
             parent_scope: parent_node,
             ident,
             cfg: (cfg, cfg_span),
+            visibility,
+            namespaces,
         });
     }
 

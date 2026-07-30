@@ -19,6 +19,7 @@ pub use attr::*;
 pub use data_structures::*;
 pub use encode_cross_crate::EncodeCrossCrate;
 pub use lang_items::*;
+pub use namespace::{Namespace, NamespaceSet};
 pub use pretty_printing::PrintAttribute;
 pub use stability::*;
 
@@ -29,6 +30,7 @@ pub mod diagnostic;
 pub mod diagnostic_items;
 mod encode_cross_crate;
 pub mod lang_items;
+mod namespace;
 mod pretty_printing;
 mod stability;
 pub mod target;

@@ -13,6 +13,7 @@ use rustc_ast::{
     PatKind, StmtKind, SyntheticAttr, TyKind, token,
 };
 use rustc_ast_pretty::pprust;
+use rustc_attr_ir::StrippedCfgItemVisibility;
 use rustc_attr_ir::target::Target;
 use rustc_attr_parsing::parser::AllowExprMetavar;
 use rustc_attr_parsing::{
@@ -22,7 +23,7 @@ use rustc_attr_parsing::{
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_errors::PResult;
 use rustc_feature::Features;
-use rustc_hir::def::MacroKinds;
+use rustc_hir::def::{MacroKinds, NamespaceSet};
 use rustc_lint_defs::builtin::{UNUSED_ATTRIBUTES, UNUSED_DOC_COMMENTS};
 use rustc_parse::parser::{
     AllowConstBlockItems, AttemptLocalParseRecovery, CommaRecoveryMode, ForceCollect, Parser,
@@ -1287,7 +1288,7 @@ trait InvocationCollectorNode: HasAttrs + HasNodeId + Sized + DeclaredIdents {
 pub trait DeclaredIdents {
     /// All of the identifiers (items) declared by this node.
     /// This is an approximation and should only be used for diagnostics.
-    fn declared_idents(&self) -> Vec<Ident> {
+    fn declared_idents(&self) -> Vec<(Ident, StrippedCfgItemVisibility, NamespaceSet)> {
         vec![]
     }
 }
@@ -1456,7 +1457,13 @@ impl InvocationCollectorNode for Box<ast::Item> {
 }
 
 impl DeclaredIdents for Box<ast::Item> {
-    fn declared_idents(&self) -> Vec<Ident> {
+    fn declared_idents(&self) -> Vec<(Ident, StrippedCfgItemVisibility, NamespaceSet)> {
+        let visibility = match self.vis.kind {
+            ast::VisibilityKind::Public => StrippedCfgItemVisibility::Public,
+            ast::VisibilityKind::Restricted { .. } | ast::VisibilityKind::Inherited => {
+                StrippedCfgItemVisibility::Restricted
+            }
+        };
         if let ItemKind::Use(ut) = &self.kind {
             fn collect_use_tree_leaves(ut: &ast::UseTree, idents: &mut Vec<Ident>) {
                 match &ut.kind {
@@ -1471,9 +1478,35 @@ impl DeclaredIdents for Box<ast::Item> {
             }
             let mut idents = Vec::new();
             collect_use_tree_leaves(ut, &mut idents);
-            idents
+            idents.into_iter().map(|ident| (ident, visibility, NamespaceSet::All)).collect()
         } else {
-            self.kind.ident().into_iter().collect()
+            let namespaces = match &self.kind {
+                ItemKind::ExternCrate(..)
+                | ItemKind::Mod(..)
+                | ItemKind::TyAlias(..)
+                | ItemKind::Enum(..)
+                | ItemKind::Union(..)
+                | ItemKind::Trait(..)
+                | ItemKind::TraitAlias(..) => NamespaceSet::Type,
+                ItemKind::Static(..)
+                | ItemKind::Const(..)
+                | ItemKind::ConstBlock(..)
+                | ItemKind::Fn(..) => NamespaceSet::Value,
+                ItemKind::Struct(_, _, data) if data.ctor_node_id().is_some() => {
+                    NamespaceSet::TypeAndValue
+                }
+                ItemKind::Struct(..) => NamespaceSet::Type,
+                ItemKind::MacroDef(..) => NamespaceSet::Macro,
+                ItemKind::Delegation(..) => NamespaceSet::All,
+                ItemKind::Use(..)
+                | ItemKind::ForeignMod(..)
+                | ItemKind::GlobalAsm(..)
+                | ItemKind::Impl(..)
+                | ItemKind::MacCall(..)
+                | ItemKind::DelegationMac(..)
+                | ItemKind::TestBinderConstraints(..) => return Vec::new(),
+            };
+            self.kind.ident().into_iter().map(|ident| (ident, visibility, namespaces)).collect()
         }
     }
 }
@@ -2359,12 +2392,14 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
                         match res {
                             EvalConfigResult::True => continue,
                             EvalConfigResult::False { reason } => {
-                                for ident in node.declared_idents() {
+                                for (ident, visibility, namespaces) in node.declared_idents() {
                                     self.cx.resolver.append_stripped_cfg_item(
                                         self.cx.current_expansion.lint_node_id,
                                         ident,
                                         reason.clone(),
                                         reason.span(),
+                                        visibility,
+                                        namespaces,
                                     )
                                 }
                             }

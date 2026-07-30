@@ -8,12 +8,14 @@ use rustc_ast::attr::MarkedAttrs;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::visit::{AssocCtxt, Visitor};
 use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind, Safety};
-use rustc_attr_ir::{self as attrs, CfgEntry, Deprecation, Stability, find_attr};
+use rustc_attr_ir::{
+    self as attrs, CfgEntry, Deprecation, Stability, StrippedCfgItemVisibility, find_attr,
+};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::sync;
 use rustc_errors::{BufferedEarlyLint, DiagCtxtHandle, ErrorGuaranteed};
 use rustc_feature::Features;
-use rustc_hir::def::MacroKinds;
+use rustc_hir::def::{MacroKinds, NamespaceSet};
 use rustc_lint_defs::RegisteredTools;
 use rustc_parse::MACRO_ARGUMENTS;
 use rustc_parse::parser::Parser;
@@ -1106,6 +1108,8 @@ pub trait ResolverExpand {
         ident: Ident,
         cfg: CfgEntry,
         cfg_span: Span,
+        visibility: StrippedCfgItemVisibility,
+        namespaces: NamespaceSet,
     );
 
     /// Tools registered with `#![register_tool]` or `#![register_attribute_tool]`.
