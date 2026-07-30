@@ -393,18 +393,16 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     }
 }
 
-struct SpanLowerer {
-    is_incremental: bool,
-    def_id: LocalDefId,
+enum SpanLowerer {
+    Preserve,
+    RelativeTo(LocalDefId),
 }
 
 impl SpanLowerer {
     fn lower(&self, span: Span) -> Span {
-        if self.is_incremental {
-            span.with_parent(Some(self.def_id))
-        } else {
-            // Do not make spans relative when not using incremental compilation.
-            span
+        match *self {
+            SpanLowerer::Preserve => span,
+            SpanLowerer::RelativeTo(def_id) => span.with_parent(Some(def_id)),
         }
     }
 }
@@ -1017,15 +1015,18 @@ impl<'hir> LoweringContext<'_, 'hir> {
         span: Span,
         allow_internal_unstable: Option<Arc<[Symbol]>>,
     ) -> Span {
+        let span = self.lower_span(span);
         self.tcx.with_stable_hashing_context(|hcx| {
             span.mark_with_reason(allow_internal_unstable, reason, span.edition(), hcx)
         })
     }
 
     fn span_lowerer(&self) -> SpanLowerer {
-        SpanLowerer {
-            is_incremental: self.tcx.sess.opts.incremental.is_some(),
-            def_id: self.curr_owner.owner_id().def_id,
+        if self.tcx.sess.opts.incremental.is_some() || self.tcx.sess.opts.unstable_opts.rdr {
+            SpanLowerer::RelativeTo(self.curr_owner.owner_id().def_id)
+        } else {
+            // Avoid the extra span data when no output needs definition-relative positions.
+            SpanLowerer::Preserve
         }
     }
 

@@ -1,7 +1,6 @@
 //@ ignore-cross-compile
 //@ needs-symlink
 
-//@ should-fail: rmake recipe failed to complete
 use run_make_support::{path, rfs, rustc};
 
 fn main() {

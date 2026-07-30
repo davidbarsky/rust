@@ -2772,7 +2772,7 @@ pub struct FileLines {
 }
 
 rustc_index::newtype_index! {
-    /// Addresses source coordinates within one crate's metadata spans cache.
+    /// Addresses source coordinates within one crate's metadata spans artifact.
     ///
     /// The address is meaningful only with the crate number carried by [`ExternalSpanId`].
     #[encodable]

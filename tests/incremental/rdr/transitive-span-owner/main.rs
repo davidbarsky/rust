@@ -1,5 +1,5 @@
 //@ revisions: bpass1 bpass2
-//@ should-fail: auxiliary build of {{cwd}}/tests/incremental/rdr/transitive-span-owner/auxiliary/a_second.rs failed to compile:
+//@ should-fail: named source `{{build-base}}/rdr/transitive-span-owner/main/auxiliary/liba.source-bundle/a.rs` is absent from both the previous and current snapshots
 //@ aux-build: b.rs
 //@ proc-macro: ../../auxiliary/location.rs
 //@ compile-flags: -Zquery-dep-graph -Zrdr

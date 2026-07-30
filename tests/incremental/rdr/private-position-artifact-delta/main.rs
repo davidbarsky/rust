@@ -1,5 +1,5 @@
 //@ revisions: bpass1 bpass2
-//@ should-fail: failed to read spans artifact `{{build-base}}/rdr/private-position-artifact-delta/main/auxiliary/liba.spans`: No such file or directory (os error 2)
+//@ should-fail: named source `{{build-base}}/rdr/private-position-artifact-delta/main/auxiliary/liba.source-bundle/a.rs` is absent from both the previous and current snapshots
 //@ aux-build: b.rs
 //@ compile-flags: -Zrdr
 //@ [bpass2] rustc-not-invoked

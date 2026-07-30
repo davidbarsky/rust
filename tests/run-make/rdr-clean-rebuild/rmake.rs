@@ -1,7 +1,6 @@
 //@ ignore-cross-compile
 //@ needs-target-std
 
-//@ should-fail: rmake recipe failed to complete
 use run_make_support::{rfs, run, rustc};
 
 fn main() {

@@ -25,7 +25,7 @@ use rustc_attr_ir::{
 };
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::unord::UnordSet;
-use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{
     CRATE_HIR_ID, ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind, intravisit,
 };
@@ -176,7 +176,7 @@ pub(crate) fn check_clean_annotations(tcx: TyCtxt<'_>) {
         for (component, dep_node, red) in [
             (
                 "metadata hash",
-                DepNode::construct(tcx, DepKind::crate_hash, &LOCAL_CRATE),
+                DepNode::construct(tcx, DepKind::metadata_contract_hash, &()),
                 "changed",
             ),
             ("metadata", tcx.metadata_dep_node(), "rebuilt"),

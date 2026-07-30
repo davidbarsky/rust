@@ -818,14 +818,25 @@ fn resolver_for_lowering_raw<'tcx>(
     )
 }
 
-pub fn write_dep_info(tcx: TyCtxt<'_>) {
+/// Carries output paths after their directories and overwrite constraints are established.
+#[must_use]
+pub struct PreparedOutputs<'tcx> {
+    outputs: &'tcx OutputFilenames,
+    output_paths: Vec<PathBuf>,
+}
+
+/// Establishes the filesystem state required by compiler output.
+///
+/// Dependency information is written separately so metadata decoding can discover additional
+/// inputs after output paths are checked.
+pub fn prepare_outputs(tcx: TyCtxt<'_>) -> PreparedOutputs<'_> {
     // Make sure name resolution and macro expansion is run for
     // the side-effect of providing a complete set of all
     // accessed files and env vars.
     let _ = tcx.resolver_for_lowering();
 
     let sess = tcx.sess;
-    let _timer = sess.timer("write_dep_info");
+    let _timer = sess.timer("prepare_outputs");
     let crate_name = tcx.crate_name(LOCAL_CRATE);
 
     let outputs = tcx.output_filenames(());
@@ -854,8 +865,6 @@ pub fn write_dep_info(tcx: TyCtxt<'_>) {
         }
     }
 
-    write_out_deps(tcx, outputs, &output_paths);
-
     let only_dep_info = sess.opts.output_types.contains_key(&OutputType::DepInfo)
         && sess.opts.output_types.len() == 1;
 
@@ -866,6 +875,15 @@ pub fn write_dep_info(tcx: TyCtxt<'_>) {
             }
         }
     }
+
+    PreparedOutputs { outputs, output_paths }
+}
+
+/// Writes dependency information after all input-discovering compiler work has completed.
+pub fn write_dep_info(tcx: TyCtxt<'_>, prepared: PreparedOutputs<'_>) {
+    let _timer = tcx.sess.timer("write_dep_info");
+    let PreparedOutputs { outputs, output_paths } = prepared;
+    write_out_deps(tcx, outputs, &output_paths);
 }
 
 pub fn write_interface<'tcx>(tcx: TyCtxt<'tcx>) {

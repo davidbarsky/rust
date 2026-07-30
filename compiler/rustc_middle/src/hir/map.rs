@@ -1166,7 +1166,10 @@ impl<'tcx> intravisit::HirTyCtxt<'tcx> for TyCtxt<'tcx> {
 pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
     // `-Z metadata-crate-hash=no` opts back into computing the SVH from the HIR rather than
     // from the encoded crate metadata. This is a safety fallback for the metadata-based hashing.
-    if !tcx.sess.opts.unstable_opts.metadata_crate_hash {
+    if !tcx.sess.opts.unstable_opts.metadata_crate_hash
+        || (tcx.sess.opts.unstable_opts.rdr
+            && !tcx.crate_types().contains(&rustc_structures::CrateType::ProcMacro))
+    {
         return legacy_crate_hash(tcx);
     }
 
@@ -1198,10 +1201,6 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
     }
 }
 
-/// Only reached when `-Z metadata-crate-hash=no` reverts to the pre-metadata-hashing behavior.
-/// The HIR-based hashing scheme here matches the `crate_hash` query as it existed before this PR.
-/// (The resulting SVH still differs from a pre-PR compiler, because `metadata_crate_hash` is a
-/// `[TRACKED]` option and therefore contributes to the dep-tracking hash hashed in below.)
 fn legacy_crate_hash(tcx: TyCtxt<'_>) -> Svh {
     let krate = tcx.hir_crate_items(());
 

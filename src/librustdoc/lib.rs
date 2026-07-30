@@ -935,17 +935,19 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                     let (res, _incr_comp_session) =
                         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
                             let has_dep_info = render_options.dep_info().is_some();
+                            let outputs =
+                                has_dep_info.then(|| rustc_interface::passes::prepare_outputs(tcx));
                             if render_options.emit.contains(&EmitType::HtmlNonStaticFiles) {
                                 markdown::render_and_write(file, render_options, edition)?;
                             }
-                            if has_dep_info {
+                            if let Some(outputs) = outputs {
                                 // Register the loaded external files in the source map so they show up in depinfo.
                                 // We can't load them via the source map because it gets created after we process the options.
                                 for external_path in &loaded_paths {
                                     let _ =
                                         compiler.sess.source_map().load_binary_file(external_path);
                                 }
-                                rustc_interface::passes::write_dep_info(tcx);
+                                rustc_interface::passes::write_dep_info(tcx, outputs);
                             }
                             Ok(())
                         });
@@ -1023,7 +1025,8 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
             cache.crate_version = crate_version;
 
             if render_opts.dep_info().is_some() {
-                rustc_interface::passes::write_dep_info(tcx);
+                let outputs = rustc_interface::passes::prepare_outputs(tcx);
+                rustc_interface::passes::write_dep_info(tcx, outputs);
             }
 
             if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {

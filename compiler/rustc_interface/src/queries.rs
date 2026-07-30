@@ -6,7 +6,7 @@ use rustc_codegen_ssa::{CompiledModules, CrateInfo};
 use rustc_data_structures::svh::Svh;
 use rustc_errors::timings::TimingSection;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_metadata::EncodedMetadata;
+use rustc_metadata::{EncodedMetadata, EncodedMetadataArtifacts};
 use rustc_middle::dep_graph::{DepGraph, WorkProduct, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, OutputFilenames, OutputType};
@@ -94,13 +94,19 @@ impl Linker {
         sess.timings.end_section(sess.dcx(), TimingSection::Codegen);
 
         if sess.opts.incremental.is_some()
-            && let Some(path) = self.metadata.path()
+            && let Some(artifacts) = self.metadata.paths()
         {
+            let files = match artifacts {
+                EncodedMetadataArtifacts::Coarse(metadata) => vec![("rmeta", metadata)],
+                EncodedMetadataArtifacts::Rdr(artifacts) => {
+                    vec![("rmeta", artifacts.primary), ("spans", artifacts.spans)]
+                }
+            };
             let (id, product) = rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
                 sess,
                 incr_comp_session.as_ref().unwrap(),
                 WorkProduct::METADATA_WORKPRODUCT_CGU_NAME,
-                &[(OutputType::Metadata.extension(), path)],
+                &files,
             );
             work_products.insert(id, product);
         }
