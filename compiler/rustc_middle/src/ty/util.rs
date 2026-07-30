@@ -6,7 +6,7 @@ use rustc_abi::{Float, Integer, IntegerType, Size};
 use rustc_apfloat::Float as _;
 use rustc_attr_ir::find_attr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::stable_hash::{SpanHashMode, StableHash, StableHashCtxt, StableHasher};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hashes::Hash128;
 use rustc_hir as hir;
@@ -140,7 +140,9 @@ impl<'tcx> TyCtxt<'tcx> {
 
         self.with_stable_hashing_context(|mut hcx| {
             let mut hasher = StableHasher::new();
-            hcx.while_hashing_spans(false, |hcx| ty.stable_hash(hcx, &mut hasher));
+            hcx.with_span_hash_mode(SpanHashMode::Ignore, |hcx| {
+                ty.stable_hash(hcx, &mut hasher);
+            });
             hasher.finish()
         })
     }

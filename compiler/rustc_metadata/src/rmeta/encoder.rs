@@ -2017,18 +2017,16 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let mut expn_data_table: TableBuilder<_, _, _> = Default::default();
         let mut expn_hash_table: TableBuilder<_, _, _> = Default::default();
 
-        HygieneEncodeContext::encode(
+        HygieneEncodeContext::encode_pending(
             &Rc::clone(&self.hygiene_ctxt),
             &mut (&mut *self, &mut syntax_contexts, &mut expn_data_table, &mut expn_hash_table),
-            |(this, syntax_contexts, _, _), index, ctxt_data| {
-                syntax_contexts.set_some(index, this.lazy(ctxt_data));
+            |(this, syntax_contexts, _, _), context| {
+                syntax_contexts.set_some(context.index(), this.lazy(context.data()));
             },
-            |(this, _, expn_data_table, expn_hash_table), index, expn_data, hash| {
-                if let Some(index) = index.as_local() {
-                    expn_data_table
-                        .set_some(index.as_raw(), this.lazy(expn_data.expect("local expn")));
-
-                    expn_hash_table.set_some(index.as_raw(), this.lazy(hash));
+            |(this, _, expn_data_table, expn_hash_table), expansion| {
+                if let Some(index) = expansion.id().as_local() {
+                    expn_data_table.set_some(index.as_raw(), this.lazy(expansion.data()));
+                    expn_hash_table.set_some(index.as_raw(), this.lazy(expansion.hash()));
                 }
             },
         );

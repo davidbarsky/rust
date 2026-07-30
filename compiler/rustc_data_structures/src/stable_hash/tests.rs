@@ -17,6 +17,17 @@ impl StableHashCtxt for () {
     fn stable_hash_controls(&self) -> StableHashControls {
         panic!();
     }
+    fn stable_hash_expn_id(
+        &mut self,
+        _: RawExpnId,
+        _: crate::fingerprint::Fingerprint,
+        _: &mut StableHasher,
+    ) {
+        panic!();
+    }
+    fn with_span_hash_mode<R>(&mut self, _: SpanHashMode, _: impl FnOnce(&mut Self) -> R) -> R {
+        panic!();
+    }
     fn assert_default_stable_hash_controls(&self, _: &str) {
         panic!();
     }

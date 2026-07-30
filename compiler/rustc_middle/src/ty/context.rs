@@ -43,6 +43,7 @@ use rustc_macros::Diagnostic;
 use rustc_session::config::NextSolverConfig;
 use rustc_session::{IncrCompSession, Session};
 use rustc_span::def_id::{CRATE_DEF_ID, DefPathHash, StableCrateId};
+use rustc_span::hygiene::HygieneEncodeLayout;
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, bug, kw, sym};
 use rustc_structures::{CrateType, Limit};
 use rustc_type_ir::TyKind::*;
@@ -1430,6 +1431,17 @@ impl<'tcx> TyCtxt<'tcx> {
     #[inline(always)]
     pub fn with_stable_hashing_context<R>(self, f: impl FnOnce(StableHashState<'_>) -> R) -> R {
         f(StableHashState::new(self.sess, &self.untracked))
+    }
+
+    /// Hashes metadata semantics using the artifact-local hygiene identities used on the wire.
+    #[inline(always)]
+    pub fn with_metadata_stable_hashing_context<R>(
+        self,
+        layout: &HygieneEncodeLayout,
+        f: impl FnOnce(&mut StableHashState<'_>) -> R,
+    ) -> R {
+        let mut hcx = StableHashState::new(self.sess, &self.untracked);
+        hcx.with_metadata_hygiene_layout(layout, f)
     }
 
     #[inline]
