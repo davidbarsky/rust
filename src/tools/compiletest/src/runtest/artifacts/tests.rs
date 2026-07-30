@@ -550,3 +550,147 @@ fn an_artifact_observed_through_a_symlink_schedules_the_consumer() {
 
     assert_eq!(rerun, Ok(true));
 }
+
+#[test]
+fn sibling_source_leaves_change_independently() {
+    let previous = ArtifactSnapshot(FxHashMap::from_iter([
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/left.rs")),
+            b"left before".to_vec(),
+        ),
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/right.rs")),
+            b"right".to_vec(),
+        ),
+    ]));
+    let current = ArtifactSnapshot(FxHashMap::from_iter([
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/left.rs")),
+            b"left after".to_vec(),
+        ),
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/right.rs")),
+            b"right".to_vec(),
+        ),
+    ]));
+
+    assert_eq!(
+        current.changed_paths_since(&previous),
+        FxHashSet::from_iter([ArtifactPath::Source(Utf8PathBuf::from(
+            "build/liba.source-bundle/src/left.rs",
+        ))])
+    );
+}
+
+#[test]
+fn source_additions_and_removals_are_named_path_deltas() {
+    let previous = ArtifactSnapshot(FxHashMap::from_iter([
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/removed.rs")),
+            b"removed".to_vec(),
+        ),
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/stable.rs")),
+            b"stable".to_vec(),
+        ),
+    ]));
+    let current = ArtifactSnapshot(FxHashMap::from_iter([
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/added.rs")),
+            b"added".to_vec(),
+        ),
+        (
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/stable.rs")),
+            b"stable".to_vec(),
+        ),
+    ]));
+
+    assert_eq!(
+        current.changed_paths_since(&previous),
+        FxHashSet::from_iter([
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/added.rs")),
+            ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/removed.rs")),
+        ])
+    );
+}
+
+#[test]
+fn unobserved_source_child_does_not_schedule_consumer() {
+    let deltas = ProviderDeltas(FxHashMap::from_iter([(
+        ArtifactProvider {
+            source: Utf8PathBuf::from("auxiliary/a.rs"),
+            out_dir: Utf8PathBuf::from("build"),
+        },
+        ProviderDelta::Measured(FxHashSet::from_iter([ArtifactPath::Source(Utf8PathBuf::from(
+            "build/liba.source-bundle/src/unobserved.rs",
+        ))])),
+    )]));
+    let dep_info: MakeDepInfo =
+        "build/consumer.o: build/liba.source-bundle/src/observed.rs\n".parse().unwrap();
+
+    assert_eq!(should_rerun(&deltas, &dep_info), Ok(false));
+}
+
+#[test]
+fn c_observes_a_owned_transitive_spans_and_sources_without_b_observing_them() {
+    let deltas = ProviderDeltas(FxHashMap::from_iter([
+        (
+            ArtifactProvider {
+                source: Utf8PathBuf::from("auxiliary/a.rs"),
+                out_dir: Utf8PathBuf::from("build"),
+            },
+            ProviderDelta::Measured(FxHashSet::from_iter([
+                ArtifactPath::Spans(Utf8PathBuf::from("build/liba.spans")),
+                ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/a.rs")),
+            ])),
+        ),
+        (
+            ArtifactProvider {
+                source: Utf8PathBuf::from("auxiliary/b.rs"),
+                out_dir: Utf8PathBuf::from("build"),
+            },
+            ProviderDelta::Measured(FxHashSet::default()),
+        ),
+    ]));
+    let b_dep_info: MakeDepInfo = "build/libb.rmeta: build/liba.rmeta\n".parse().unwrap();
+    let c_spans_dep_info: MakeDepInfo =
+        "build/consumer.o: build/liba.spans build/libb.rmeta\n".parse().unwrap();
+    let c_source_dep_info: MakeDepInfo =
+        "build/consumer.o: build/liba.source-bundle/src/a.rs build/libb.rmeta\n".parse().unwrap();
+
+    assert_eq!(should_rerun(&deltas, &b_dep_info), Ok(false));
+    assert_eq!(should_rerun(&deltas, &c_spans_dep_info), Ok(true));
+    assert_eq!(should_rerun(&deltas, &c_source_dep_info), Ok(true));
+}
+
+#[test]
+fn source_expectations_use_strict_presence_semantics() {
+    let source = ArtifactPath::Source(Utf8PathBuf::from("build/liba.source-bundle/src/a.rs"));
+    let empty = ArtifactSnapshot::default();
+    let populated = ArtifactSnapshot(FxHashMap::from_iter([(source.clone(), b"a".to_vec())]));
+
+    for expectation in [ByteExpectation::Same, ByteExpectation::Different] {
+        assert_eq!(
+            check_byte_expectations(&[(source.clone(), expectation)], &empty, &empty),
+            Err("named source `build/liba.source-bundle/src/a.rs` is absent from both the \
+                 previous and current snapshots"
+                .to_owned())
+        );
+    }
+    for (previous, current) in [(&empty, &populated), (&populated, &empty)] {
+        assert_eq!(
+            check_byte_expectations(
+                &[(source.clone(), ByteExpectation::Different)],
+                previous,
+                current
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_byte_expectations(&[(source.clone(), ByteExpectation::Same)], previous, current),
+            Err("named source `build/liba.source-bundle/src/a.rs` must exist in both the \
+                 previous and current snapshots to be `same`"
+                .to_owned())
+        );
+    }
+}

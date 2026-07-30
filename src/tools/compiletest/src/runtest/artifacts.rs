@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::process::Command;
 use std::str::FromStr;
-use std::{fmt, fs};
+use std::{fmt, fs, io};
 
 use build_helper::dep_info::MakeDepInfo;
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
@@ -162,6 +162,8 @@ pub(crate) struct ArtifactProvider {
 pub(crate) enum ArtifactPath {
     Rmeta(Utf8PathBuf),
     Link(Utf8PathBuf),
+    Spans(Utf8PathBuf),
+    Source(Utf8PathBuf),
 }
 
 impl AsRef<Utf8Path> for ArtifactPath {
@@ -169,8 +171,31 @@ impl AsRef<Utf8Path> for ArtifactPath {
         match self {
             Self::Rmeta(path) => path,
             Self::Link(path) => path,
+            Self::Spans(path) => path,
+            Self::Source(path) => path,
         }
     }
+}
+
+pub(crate) fn source_children(
+    read_root: &Utf8Path,
+    key_root: &Utf8Path,
+) -> io::Result<FxHashMap<ArtifactPath, Vec<u8>>> {
+    let mut children = FxHashMap::default();
+    if !read_root.is_dir() {
+        return Ok(children);
+    }
+    for entry in walkdir::WalkDir::new(read_root).min_depth(1) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = <&Utf8Path>::try_from(entry.path())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let relative = path.strip_prefix(read_root).expect("walkdir yields paths under its root");
+        children.insert(ArtifactPath::Source(key_root.join(relative)), fs::read(path)?);
+    }
+    Ok(children)
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -271,12 +296,33 @@ pub(crate) fn check_byte_expectations(
 ) -> Result<(), String> {
     for (artifact, expectation) in expectations {
         let path = AsRef::<Utf8Path>::as_ref(artifact);
+        let present_before = previous.0.contains_key(artifact);
+        let present_now = current.0.contains_key(artifact);
         match artifact {
-            ArtifactPath::Rmeta(_) | ArtifactPath::Link(_) => {
-                if !previous.0.contains_key(artifact) || !current.0.contains_key(artifact) {
+            ArtifactPath::Rmeta(_) | ArtifactPath::Link(_) | ArtifactPath::Spans(_) => {
+                if !present_before || !present_now {
                     return Err(format!(
                         "artifact `{path}` must exist in both the previous and current snapshots"
                     ));
+                }
+            }
+            ArtifactPath::Source(_) => {
+                if !present_before && !present_now {
+                    return Err(format!(
+                        "named source `{path}` is absent from both the previous and current \
+                         snapshots"
+                    ));
+                }
+                match expectation {
+                    ByteExpectation::Same => {
+                        if !present_before || !present_now {
+                            return Err(format!(
+                                "named source `{path}` must exist in both the previous and \
+                                 current snapshots to be `same`"
+                            ));
+                        }
+                    }
+                    ByteExpectation::Different => {}
                 }
             }
         }
@@ -331,4 +377,12 @@ pub(crate) struct ProviderArtifacts {
     pub(crate) snapshot_rmeta: Utf8PathBuf,
     pub(crate) link: Utf8PathBuf,
     pub(crate) snapshot_link: Utf8PathBuf,
+    pub(crate) rdr: Option<RdrArtifacts>,
+}
+
+pub(crate) struct RdrArtifacts {
+    pub(crate) spans: Utf8PathBuf,
+    pub(crate) snapshot_spans: Utf8PathBuf,
+    pub(crate) source_bundle: Utf8PathBuf,
+    pub(crate) inputs_snapshot: Utf8PathBuf,
 }

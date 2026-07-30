@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use camino::Utf8PathBuf;
+
 use crate::common::{Config, PassFailMode, TestMode};
 use crate::directives::{
     ByteExpectation, DirectiveLine, NormalizeKind, NormalizeRule, TestProps, parse_and_update_aux,
@@ -161,6 +163,48 @@ fn make_directive_handlers_map() -> HashMap<&'static str, Handler> {
             if props.expect_rmeta.replace(expectation).is_some() {
                 panic!("`//@ {EXPECT_RMETA}` may only be specified once per revision");
             }
+        }),
+        handler(EXPECT_SPANS, |config, ln, props| {
+            let Some(value) = config.parse_name_value_directive(ln, EXPECT_SPANS) else {
+                return;
+            };
+            let value = value.trim();
+            let expectation = value.parse::<ByteExpectation>().unwrap_or_else(|()| {
+                panic!("`//@ {EXPECT_SPANS}` expects `same` or `different`, found `{value}`")
+            });
+            if props.expect_spans.replace(expectation).is_some() {
+                panic!("`//@ {EXPECT_SPANS}` may only be specified once per revision");
+            }
+        }),
+        handler(EXPECT_SOURCE, |config, ln, props| {
+            let Some(value) = config.parse_name_value_directive(ln, EXPECT_SOURCE) else {
+                return;
+            };
+            let value = value.trim();
+            let Some((path, expectation)) = value.rsplit_once(char::is_whitespace) else {
+                panic!(
+                    "`//@ {EXPECT_SOURCE}` expects `<logical/path> same` or \
+                     `<logical/path> different`, found `{value}`"
+                );
+            };
+            let path = path.trim();
+            if path.is_empty() {
+                panic!(
+                    "`//@ {EXPECT_SOURCE}` expects `<logical/path> same` or \
+                     `<logical/path> different`, found `{value}`"
+                );
+            }
+            let expectation = expectation.parse::<ByteExpectation>().unwrap_or_else(|()| {
+                panic!(
+                    "`//@ {EXPECT_SOURCE}` expects `<logical/path> same` or \
+                     `<logical/path> different`, found `{value}`"
+                )
+            });
+            let path = Utf8PathBuf::from(path);
+            if props.expect_sources.iter().any(|(existing, _)| *existing == path) {
+                panic!("`//@ {EXPECT_SOURCE}` names `{path}` more than once for one revision");
+            }
+            props.expect_sources.push((path, expectation));
         }),
         handler(PRETTY_MODE, |config, ln, props| {
             if let Some(m) = config.parse_name_value_directive(ln, PRETTY_MODE) {

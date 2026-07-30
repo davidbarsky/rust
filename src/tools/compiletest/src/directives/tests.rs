@@ -385,12 +385,31 @@ fn byte_expectations_are_revision_scoped() {
         r#"
 //@ [bpass1] expect-rmeta: different
 //@ [bpass2] expect-rmeta: same
+//@ [bpass1] expect-spans: same
+//@ [bpass2] expect-spans: different
+//@ [bpass1] expect-source: logical/edited.rs same
+//@ [bpass2] expect-source: logical/edited.rs different
+//@ [bpass2] expect-source: logical/untouched.rs same
 "#,
     );
 
-    for (revision, rmeta) in
-        [("bpass1", ByteExpectation::Different), ("bpass2", ByteExpectation::Same)]
-    {
+    for (revision, rmeta, spans, sources) in [
+        (
+            "bpass1",
+            ByteExpectation::Different,
+            ByteExpectation::Same,
+            vec![(Utf8PathBuf::from("logical/edited.rs"), ByteExpectation::Same)],
+        ),
+        (
+            "bpass2",
+            ByteExpectation::Same,
+            ByteExpectation::Different,
+            vec![
+                (Utf8PathBuf::from("logical/edited.rs"), ByteExpectation::Different),
+                (Utf8PathBuf::from("logical/untouched.rs"), ByteExpectation::Same),
+            ],
+        ),
+    ] {
         let mut props = TestProps::new();
         crate::directives::iter_directives(&config, &file_directives, &mut |line| {
             if line.applies_to_test_revision(Some(revision)) {
@@ -399,7 +418,25 @@ fn byte_expectations_are_revision_scoped() {
         });
 
         assert_eq!(props.expect_rmeta, Some(rmeta));
+        assert_eq!(props.expect_spans, Some(spans));
+        assert_eq!(props.expect_sources, sources);
     }
+}
+
+#[test]
+#[should_panic(expected = "names `logical/edited.rs` more than once for one revision")]
+fn duplicate_source_expectations_for_one_path_are_rejected() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] expect-source: logical/edited.rs same
+//@ [bpass1] expect-source: logical/edited.rs different
+"#,
+    );
+
+    let mut props = TestProps::new();
+    props.load_from(&file_directives, Some("bpass1"), &config);
 }
 
 #[test]

@@ -22,8 +22,8 @@ use tracing::*;
 
 use self::artifacts::{
     ArtifactPath, ArtifactProvider, ArtifactSnapshot, AuxiliaryBuild, BuildPlan, BuildRecord,
-    CommandFingerprint, ProviderArtifacts, ProviderDelta, ProviderDeltas, ReuseRequest,
-    RevisionInputs, check_byte_expectations, logical_source_layout,
+    CommandFingerprint, ProviderArtifacts, ProviderDelta, ProviderDeltas, RdrArtifacts,
+    ReuseRequest, RevisionInputs, check_byte_expectations, logical_source_layout, source_children,
 };
 use crate::common::{
     CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TestMode, TestPaths,
@@ -36,7 +36,7 @@ use crate::executor::{TestFailure, TestVariant};
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
 use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
-use crate::util::{ArgFileCommand, Utf8PathBufExt, add_dylib_path, static_regex};
+use crate::util::{ArgFileCommand, Utf8PathBufExt, add_dylib_path, copy_dir_all, static_regex};
 use crate::{json, stamp_file_path};
 
 // Helper modules that implement test running logic for each test suite.
@@ -1644,6 +1644,7 @@ impl<'test> TestCx<'test> {
                 .compile_flags
                 .iter()
                 .any(|flag| flag == "--emit" || flag.starts_with("--emit="));
+        let emits_rdr_artifacts = aux_props.compile_flags.iter().any(|flag| flag == "-Zrdr");
         let crate_name = source_path
             .rsplit_once('/')
             .map_or(source_path, |(_, tail)| tail)
@@ -1758,11 +1759,26 @@ impl<'test> TestCx<'test> {
                 let link = get_lib_name(&crate_name, aux_type, self.config.wasm_proc_macros)
                     .expect("library auxiliaries have a linked artifact");
                 let snapshot_root = self.props.incremental_dir.as_ref().unwrap();
+                let rmeta = aux_dir.join(format!("lib{crate_name}.rmeta"));
+                let rdr = match (&inputs_snapshot, emits_rdr_artifacts) {
+                    (Some(inputs_snapshot), true) => Some(RdrArtifacts {
+                        spans: rmeta.with_extension("spans"),
+                        snapshot_spans: snapshot_root
+                            .join(format!("snapshot-{build_key:016x}.spans")),
+                        source_bundle: rmeta.with_extension("source-bundle"),
+                        inputs_snapshot: inputs_snapshot.clone(),
+                    }),
+                    (None, true) => {
+                        unreachable!("incremental-mode auxiliaries always snapshot their inputs")
+                    }
+                    (Some(_), false) | (None, false) => None,
+                };
                 Some(ProviderArtifacts {
-                    rmeta: aux_dir.join(format!("lib{crate_name}.rmeta")),
+                    rmeta,
                     snapshot_rmeta: snapshot_root.join(format!("snapshot-{build_key:016x}.rmeta")),
                     link: aux_dir.join(link),
                     snapshot_link: snapshot_root.join(format!("snapshot-{build_key:016x}.link")),
+                    rdr,
                 })
             }
             (true, AuxType::Bin | AuxType::ProcMacro) | (false, _) => None,
@@ -1780,21 +1796,47 @@ impl<'test> TestCx<'test> {
             )),
             (Some(_), None) | (None, None) => {}
         }
+        let rdr_artifacts = match &provider_artifacts {
+            Some(ProviderArtifacts { rdr: Some(rdr), .. }) => Some(rdr),
+            Some(ProviderArtifacts { rdr: None, .. }) | None => None,
+        };
+        match (rdr_artifacts, aux_props.expect_spans) {
+            (Some(rdr), Some(expectation)) => {
+                expectations.push((ArtifactPath::Spans(rdr.spans.clone()), expectation));
+            }
+            (None, Some(_)) => self.fatal(&format!(
+                "`//@ expect-spans` on `{input_path}` requires an incremental-mode library \
+                 auxiliary compiled with `-Zrdr`"
+            )),
+            (Some(_), None) | (None, None) => {}
+        }
+        for (source, expectation) in &aux_props.expect_sources {
+            let Some(rdr) = rdr_artifacts else {
+                self.fatal(&format!(
+                    "`//@ expect-source` on `{input_path}` requires an incremental-mode library \
+                     auxiliary compiled with `-Zrdr`"
+                ));
+            };
+            expectations.push((ArtifactPath::Source(rdr.source_bundle.join(source)), *expectation));
+        }
 
-        let tracked = provider_artifacts.as_ref().map(|provider_artifacts| {
-            [
-                (
-                    ArtifactPath::Rmeta(provider_artifacts.rmeta.clone()),
-                    &provider_artifacts.snapshot_rmeta,
-                ),
-                (
-                    ArtifactPath::Link(provider_artifacts.link.clone()),
-                    &provider_artifacts.snapshot_link,
-                ),
-            ]
-        });
+        let mut tracked = Vec::new();
+        if let Some(provider_artifacts) = &provider_artifacts {
+            tracked.push((
+                ArtifactPath::Rmeta(provider_artifacts.rmeta.clone()),
+                &provider_artifacts.snapshot_rmeta,
+            ));
+            tracked.push((
+                ArtifactPath::Link(provider_artifacts.link.clone()),
+                &provider_artifacts.snapshot_link,
+            ));
+            if let Some(rdr) = &provider_artifacts.rdr {
+                tracked.push((ArtifactPath::Spans(rdr.spans.clone()), &rdr.snapshot_spans));
+            }
+        }
+
         let mut previous = ArtifactSnapshot::default();
-        for (artifact, snapshot) in tracked.iter().flatten() {
+        for (artifact, snapshot) in &tracked {
             match fs::read(snapshot) {
                 Ok(bytes) => {
                     previous.0.insert(artifact.clone(), bytes);
@@ -1804,6 +1846,16 @@ impl<'test> TestCx<'test> {
                     aux_cx.fatal(&format!("failed to read artifact snapshot `{snapshot}`: {err}"))
                 }
             }
+        }
+        if let Some(rdr) = rdr_artifacts {
+            let children = source_children(&rdr.inputs_snapshot, &rdr.source_bundle)
+                .unwrap_or_else(|err| {
+                    aux_cx.fatal(&format!(
+                        "failed to read input snapshot `{}`: {err}",
+                        rdr.inputs_snapshot
+                    ))
+                });
+            previous.0.extend(children);
         }
 
         let plan = if aux_props.rustc_not_invoked {
@@ -1886,15 +1938,41 @@ impl<'test> TestCx<'test> {
                     }
                 }
 
-                let own_delta = match &tracked {
-                    Some(tracked) => {
+                let own_delta = match &provider_artifacts {
+                    Some(provider_artifacts) => {
                         let mut current = ArtifactSnapshot::default();
-                        for (artifact, _) in tracked {
+                        for (artifact, _) in &tracked {
                             let path = AsRef::<Utf8Path>::as_ref(artifact);
                             let bytes = fs::read(path).unwrap_or_else(|err| {
                                 aux_cx.fatal(&format!("failed to read artifact `{path}`: {err}"))
                             });
                             current.0.insert(artifact.clone(), bytes);
+                        }
+
+                        if let Some(rdr) = &provider_artifacts.rdr {
+                            ignore_not_found(|| recursive_remove(&rdr.source_bundle))
+                                .unwrap_or_else(|err| {
+                                    aux_cx.fatal(&format!(
+                                        "failed to clear source bundle `{}`: {err}",
+                                        rdr.source_bundle
+                                    ))
+                                });
+                            copy_dir_all(&rdr.inputs_snapshot, &rdr.source_bundle).unwrap_or_else(
+                                |err| {
+                                    aux_cx.fatal(&format!(
+                                        "failed to publish source bundle `{}`: {err}",
+                                        rdr.source_bundle
+                                    ))
+                                },
+                            );
+                            let children = source_children(&rdr.source_bundle, &rdr.source_bundle)
+                                .unwrap_or_else(|err| {
+                                    aux_cx.fatal(&format!(
+                                        "failed to read source bundle `{}`: {err}",
+                                        rdr.source_bundle
+                                    ))
+                                });
+                            current.0.extend(children);
                         }
 
                         let own_delta = current.changed_paths_since(&previous);
@@ -1904,7 +1982,7 @@ impl<'test> TestCx<'test> {
                             aux_cx.fatal(&message);
                         }
 
-                        for (artifact, snapshot) in tracked {
+                        for (artifact, snapshot) in &tracked {
                             fs::write(snapshot, &current.0[artifact]).unwrap_or_else(|err| {
                                 aux_cx.fatal(&format!(
                                     "failed to write artifact snapshot `{snapshot}`: {err}"

@@ -38,6 +38,8 @@ pub(crate) const KNOWN_DIRECTIVE_NAMES: &[&str] = &[
     "exact-llvm-major-version",
     "exec-env",
     "expect-rmeta",
+    "expect-source",
+    "expect-spans",
     "failure-status",
     "filecheck-flags",
     "forbid-output",

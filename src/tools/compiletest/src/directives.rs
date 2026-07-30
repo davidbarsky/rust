@@ -203,6 +203,8 @@ pub(crate) struct TestProps {
     pub(crate) rustc_not_invoked: bool,
     pub(crate) expect_rmeta: Option<ByteExpectation>,
     pub(crate) withhold_revision_cfg: bool,
+    pub(crate) expect_spans: Option<ByteExpectation>,
+    pub(crate) expect_sources: Vec<(Utf8PathBuf, ByteExpectation)>,
     pub(crate) revision_source: Option<Utf8PathBuf>,
     pub(crate) revision_source_candidates: Vec<Utf8PathBuf>,
     // If `true`, this test is a known bug.
@@ -303,6 +305,8 @@ mod directives {
     pub(crate) const INCREMENTAL: &str = "incremental";
     pub(crate) const RUSTC_NOT_INVOKED: &str = "rustc-not-invoked";
     pub(crate) const EXPECT_RMETA: &str = "expect-rmeta";
+    pub(crate) const EXPECT_SOURCE: &str = "expect-source";
+    pub(crate) const EXPECT_SPANS: &str = "expect-spans";
     pub(crate) const REVISION_SOURCE: &str = "revision-source";
     pub(crate) const KNOWN_BUG: &str = "known-bug";
     pub(crate) const TEST_MIR_PASS: &str = "test-mir-pass";
@@ -353,6 +357,8 @@ impl TestProps {
             rustc_not_invoked: false,
             expect_rmeta: None,
             withhold_revision_cfg: false,
+            expect_spans: None,
+            expect_sources: vec![],
             revision_source: None,
             revision_source_candidates: vec![],
             known_bug: false,
@@ -422,10 +428,17 @@ impl TestProps {
         let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
         props.load_from(&file_directives, revision, config);
         props.test_revisions = props.revisions.clone();
-        if props.expect_rmeta.is_some() || !props.revision_source_candidates.is_empty() {
+        if props.expect_rmeta.is_some()
+            || props.expect_spans.is_some()
+            || !props.expect_sources.is_empty()
+            || !props.revision_source_candidates.is_empty()
+        {
             panic!(
-                "`//@ {}` and `//@ {}` apply only to auxiliary crates, but `{testfile}` uses them",
+                "`//@ {}`, `//@ {}`, `//@ {}`, and `//@ {}` apply only to auxiliary crates, but \
+                 `{testfile}` uses them",
                 directives::EXPECT_RMETA,
+                directives::EXPECT_SPANS,
+                directives::EXPECT_SOURCE,
                 directives::REVISION_SOURCE,
             );
         }
