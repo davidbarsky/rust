@@ -601,7 +601,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 let name = tcx.hir_ty_param_name(def_id);
                 let item_def_id = tcx.hir_ty_param_owner(def_id);
                 let generics = tcx.generics_of(item_def_id);
-                let index = generics.param_def_id_to_index[&def_id.to_def_id()];
+                let index = generics
+                    .own_param_index(def_id.to_def_id())
+                    .expect("lifetime parameter must be owned by its generics");
                 ty::Region::new_early_param(tcx, ty::EarlyParamRegion { index, name })
             }
 
@@ -2343,7 +2345,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             Some(rbv::ResolvedArg::EarlyBound(def_id)) => {
                 let item_def_id = tcx.hir_ty_param_owner(def_id);
                 let generics = tcx.generics_of(item_def_id);
-                let index = generics.param_def_id_to_index[&def_id.to_def_id()];
+                let index = generics
+                    .own_param_index(def_id.to_def_id())
+                    .expect("type parameter must be owned by its generics");
                 Ty::new_param(tcx, index, tcx.hir_ty_param_name(def_id))
             }
             Some(rbv::ResolvedArg::Error(guar)) => Ty::new_error(tcx, guar),
@@ -2365,7 +2369,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 // the parent item and construct a `ParamConst`.
                 let item_def_id = tcx.parent(param_def_id);
                 let generics = tcx.generics_of(item_def_id);
-                let index = generics.param_def_id_to_index[&param_def_id];
+                let index = generics
+                    .own_param_index(param_def_id)
+                    .expect("const parameter must be owned by its generics");
                 let name = tcx.item_name(param_def_id);
                 ty::Const::new_param(tcx, ty::ParamConst::new(index, name))
             }

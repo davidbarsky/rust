@@ -1387,7 +1387,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
             Res::Def(DefKind::ConstParam, def_id) => {
                 let hir_id = self.tcx.local_def_id_to_hir_id(def_id.expect_local());
                 let generics = self.tcx.generics_of(hir_id.owner);
-                let Some(&index) = generics.param_def_id_to_index.get(&def_id) else {
+                let Some(index) = generics.own_param_index(def_id) else {
                     span_bug!(
                         expr.span,
                         "Should have already errored about late bound consts: {def_id:?}"

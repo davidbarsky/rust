@@ -349,14 +349,10 @@ fn associated_type_for_impl_trait_in_impl(
             param.index = param.index + parent_count as u32 - trait_assoc_parent_count as u32;
         }
 
-        let param_def_id_to_index =
-            own_params.iter().map(|param| (param.def_id, param.index)).collect();
-
         ty::Generics {
             parent: Some(impl_local_def_id.to_def_id()),
             parent_count,
             own_params,
-            param_def_id_to_index,
             has_self: false,
             has_late_bound_regions: trait_assoc_generics.has_late_bound_regions,
         }

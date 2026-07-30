@@ -1,7 +1,6 @@
 use std::ops::ControlFlow;
 
 use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_span::{Span, Symbol, kw};
@@ -117,35 +116,14 @@ pub struct GenericParamCount {
 ///
 /// The ordering of parameters is the same as in [`ty::GenericArg`] (excluding child generics):
 /// `Self` (optionally), `Lifetime` params..., `Type` params...
-#[derive(Clone, TyEncodable, TyDecodable, StableHash)]
+#[derive(Clone, Debug, TyEncodable, TyDecodable, StableHash)]
 pub struct Generics {
     pub parent: Option<DefId>,
     pub parent_count: usize,
     pub own_params: Vec<GenericParamDef>,
 
-    /// Reverse map to the `index` field of each `GenericParamDef`.
-    #[stable_hash(ignore)]
-    pub param_def_id_to_index: FxHashMap<DefId, u32>,
-
     pub has_self: bool,
     pub has_late_bound_regions: Option<Span>,
-}
-
-impl std::fmt::Debug for Generics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        // ironically, we get this warning because of what we're trying to fix.
-        #[expect(rustc::potential_query_instability)]
-        let mut stabilized_hashmap = self.param_def_id_to_index.iter().collect::<Vec<_>>();
-        stabilized_hashmap.sort_by_key(|(_, v)| **v);
-        f.debug_struct("Generics")
-            .field("parent", &self.parent)
-            .field("parent_count", &self.parent_count)
-            .field("own_params", &self.own_params)
-            .field("param_def_id_to_index", &stabilized_hashmap)
-            .field("has_self", &self.has_self)
-            .field("has_late_bound_regions", &self.has_late_bound_regions)
-            .finish()
-    }
 }
 
 impl<'tcx> rustc_type_ir::inherent::GenericsOf<TyCtxt<'tcx>> for &'tcx Generics {
@@ -155,13 +133,14 @@ impl<'tcx> rustc_type_ir::inherent::GenericsOf<TyCtxt<'tcx>> for &'tcx Generics 
 }
 
 impl<'tcx> Generics {
-    /// Looks through the generics and all parents to find the index of the
-    /// given param def-id. This is in comparison to the `param_def_id_to_index`
-    /// struct member, which only stores information about this item's own
-    /// generics.
+    pub fn own_param_index(&self, def_id: DefId) -> Option<u32> {
+        self.own_params.iter().find(|param| param.def_id == def_id).map(|param| param.index)
+    }
+
+    /// Looks through the generics and all parents to find the index of the given parameter.
     pub fn param_def_id_to_index(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<u32> {
-        if let Some(idx) = self.param_def_id_to_index.get(&def_id) {
-            Some(*idx)
+        if let Some(index) = self.own_param_index(def_id) {
+            Some(index)
         } else if let Some(parent) = self.parent {
             let parent = tcx.generics_of(parent);
             parent.param_def_id_to_index(tcx, def_id)

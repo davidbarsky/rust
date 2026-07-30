@@ -2039,7 +2039,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                     generics: &ty::Generics,
                     tcx: TyCtxt<'_>,
                 ) -> (RevSegIdx, ArgIdx) {
-                    if let Some(&index) = generics.param_def_id_to_index.get(&param_def_id) {
+                    if let Some(index) = generics.own_param_index(param_def_id) {
                         let has_self = generics.has_own_self();
                         let index = index as usize - generics.parent_count - has_self as usize;
                         (RevSegIdx(0), ArgIdx(index))

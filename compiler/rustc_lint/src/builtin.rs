@@ -2069,7 +2069,9 @@ impl<'tcx> LateLintPass<'tcx> for ExplicitOutlivesRequirements {
                                     let Res::Def(DefKind::TyParam, def_id) = path.res else {
                                         continue;
                                     };
-                                    let index = ty_generics.param_def_id_to_index[&def_id];
+                                    let index = ty_generics
+                                        .own_param_index(def_id)
+                                        .expect("type parameter must be owned by its generics");
                                     // Removing a `T: 'r` outlives bound can silently change
                                     // the object lifetime default for `Struct<'r, dyn Trait>`
                                     // (RFC 599): the explicit bound sets the default to `'r`,

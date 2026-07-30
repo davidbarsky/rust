@@ -2113,7 +2113,9 @@ impl<'tcx> ContainerTy<'_, 'tcx> {
                     rbv::ObjectLifetimeDefault::Param(lifetime) => {
                         // The index is relative to the parent generics but since we don't have any,
                         // we don't need to translate it.
-                        let index = generics.param_def_id_to_index[&lifetime];
+                        let index = generics
+                            .own_param_index(lifetime)
+                            .expect("lifetime must be an own generic parameter");
                         let arg = args.skip_binder()[index as usize].expect_region();
                         ObjectLifetimeDefault::Arg(arg)
                     }

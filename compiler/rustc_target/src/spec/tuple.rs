@@ -4,15 +4,17 @@ use std::{fmt, io};
 
 use rustc_error_messages::into_diag_arg_using_display;
 use rustc_fs_util::try_canonicalize;
+use rustc_macros::StableHash;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 
 /// Either a target tuple string or a path to a JSON file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, StableHash)]
 pub enum TargetTuple {
     TargetTuple(String),
     TargetJson {
         /// Warning: This field may only be used by rustdoc. Using it anywhere else will lead to
         /// inconsistencies as it is discarded during serialization.
+        #[stable_hash(ignore)]
         path_for_rustdoc: PathBuf,
         tuple: String,
         contents: String,

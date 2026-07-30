@@ -585,7 +585,8 @@ pub(super) fn explicit_clauses_of<'tcx>(
                             ty::ConstKind::Param(param_const) => {
                                 let defaulted_param_idx = tcx
                                     .generics_of(parent_def_id)
-                                    .param_def_id_to_index[&defaulted_param_def_id.to_def_id()];
+                                    .own_param_index(defaulted_param_def_id.to_def_id())
+                                    .expect("const parameter must be owned by its generics");
                                 param_const.index < defaulted_param_idx
                             }
                             _ => {

@@ -291,7 +291,9 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
         let tcx = self.tcx;
         let item_def_id = tcx.hir_ty_param_owner(def_id);
         let generics = tcx.generics_of(item_def_id);
-        let index = generics.param_def_id_to_index[&def_id.to_def_id()];
+        let index = generics
+            .own_param_index(def_id.to_def_id())
+            .expect("type parameter must be owned by its generics");
         // HACK(eddyb) should get the original `Span`.
         let span = tcx.def_span(def_id);
 
