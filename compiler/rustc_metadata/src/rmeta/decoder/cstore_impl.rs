@@ -21,7 +21,7 @@ use rustc_session::StableCrateId;
 use rustc_session::cstore::{CrateStore, ExternCrate};
 use rustc_span::def_id::ModId;
 use rustc_span::hygiene::ExpnId;
-use rustc_span::{Span, Symbol, kw};
+use rustc_span::{ExternalSpanData, Span, Symbol, kw};
 
 use super::{Decodable, DecodeIterator};
 use crate::creader::{CStore, LoadedMacro};
@@ -153,7 +153,12 @@ macro_rules! provide_one {
             if DepKind::$name != DepKind::crate_hash && $tcx.dep_graph.is_fully_enabled() {
                 $tcx.ensure_ok().crate_hash($def_id.krate);
             }
-
+            if DepKind::$name != DepKind::crate_hash
+                && DepKind::$name != DepKind::metadata_decode_layout_id
+                && $tcx.dep_graph.is_fully_enabled()
+            {
+                $tcx.ensure_ok().metadata_decode_layout_id($def_id.krate);
+            }
             let cstore = CStore::from_tcx($tcx);
             let $cdata = cstore.get_crate_data($def_id.krate);
 
@@ -376,7 +381,9 @@ provide! { tcx, def_id, other, cdata,
     }
     native_libraries => { cdata.get_native_libraries(tcx).collect() }
     foreign_modules => { cdata.get_foreign_modules(tcx).map(|m| (m.def_id, m)).collect() }
-    crate_hash => { cdata.root.header.hash }
+    crate_hash => { cdata.root.header.hash.0 }
+    metadata_decode_layout_id => { cdata.root.metadata_decode_layout_id }
+    metadata_spans_id => { cdata.spans_artifact(tcx).id }
     crate_host_hash => { cdata.host_hash }
     crate_name => { cdata.root.header.name }
     num_extern_def_ids => { cdata.num_def_ids() }
@@ -454,6 +461,19 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
         native_libraries: native_libs::collect,
         foreign_modules: foreign_modules::collect,
         externally_implementable_items: eii::collect,
+        external_span_data: |tcx, id| {
+            tcx.ensure_ok().metadata_spans_id(id.cnum);
+            let cstore = CStore::from_tcx(tcx);
+            let cdata = cstore.get_crate_data(id.cnum);
+            let spans = cdata.spans_artifact(tcx);
+            let position = spans
+                .root
+                .spans
+                .get(&spans.blob, id.slot)
+                .unwrap_or_else(|| panic!("missing metadata span slot {:?}", id.slot))
+                .decode((cdata, &spans.blob, tcx));
+            ExternalSpanData { lo: position.lo, hi: position.hi }
+        },
 
         // Returns a map from a sufficiently visible external item (i.e., an
         // external item that is visible from at least one local module) to a
@@ -770,7 +790,7 @@ fn provide_cstore_hooks(providers: &mut Providers) {
     providers.hooks.import_source_files = |tcx, cnum| {
         let cstore = CStore::from_tcx(tcx);
         let cdata = cstore.get_crate_data(cnum);
-        for file_index in 0..cdata.root.source_map.size() {
+        for file_index in 0..cdata.source_map().table.size() {
             cdata.imported_source_file(tcx, file_index as u32);
         }
     };

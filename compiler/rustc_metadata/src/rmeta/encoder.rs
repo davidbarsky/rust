@@ -9,6 +9,7 @@ use rustc_abi::FIRST_VARIANT;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet, StdEntry as Entry};
 use rustc_data_structures::memmap::{Mmap, MmapMut};
+use rustc_data_structures::owned_slice::slice_owned;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{par_for_each_in, par_join};
@@ -38,6 +39,7 @@ use rustc_middle::ty::AssocContainer;
 use rustc_middle::ty::codec::TyEncoder;
 use rustc_middle::ty::fast_reject::{self, TreatParams};
 use rustc_middle::{bug, span_bug};
+use rustc_serialize::opaque::MAGIC_END_BYTES;
 use rustc_serialize::opaque::mem_encoder::MemEncoder;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder, opaque};
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
@@ -45,12 +47,12 @@ use rustc_session::config::{CrateType, OptLevel, TargetModifier};
 use rustc_span::def_id::CRATE_MOD_ID;
 use rustc_span::hygiene::{HygieneDelta, HygieneEncodeContext, HygieneEncodeLayout, HygieneTrace};
 use rustc_span::{
-    ByteSymbol, ExternalSource, FileName, SourceFile, SpanData, SpanEncoder, StableSourceFileId,
-    Symbol, SyntaxContext, sym,
+    ByteSymbol, ExternalSource, ExternalSpanSlot, FileName, SourceFile, SpanData, SpanEncoder,
+    StableSourceFileId, Symbol, SyntaxContext, sym,
 };
 use tracing::{debug, instrument, trace};
 
-use crate::diagnostics::{FailCreateFileEncoder, FailWriteFile};
+use crate::diagnostics::{FailCreateFileEncoder, FailReadFile, FailWriteFile};
 use crate::eii::EiiMapEncodedKeyValue;
 use crate::rmeta::*;
 
@@ -136,7 +138,7 @@ impl SourceFileLayout {
     }
 }
 
-enum MetadataEncoding<'a> {
+enum MetadataEncoding<'a, 'tcx> {
     CoarseFull {
         encoder: opaque::FileEncoder<'static>,
     },
@@ -157,21 +159,42 @@ enum MetadataEncoding<'a> {
         layout: &'a MetadataDefinitionLayout,
         hygiene: &'a HygieneEncodeLayout,
     },
+    RdrFull {
+        encoder: opaque::FileEncoder<'static>,
+        projections: MetadataProjectionEncoder,
+        projection: &'tcx MetadataProjection,
+        spans_path: PathBuf,
+    },
+    RdrReuse {
+        encoder: opaque::FileEncoder<'static>,
+        positions: MemEncoder,
+        reused_rmeta: ReusedRmeta,
+        spans_path: PathBuf,
+    },
+    RdrSpans {
+        encoder: opaque::FileEncoder<'static>,
+        metadata_len: usize,
+        definitions: MetadataDefinitionLayout,
+        hygiene: HygieneEncodeLayout,
+    },
 }
 
-struct MetadataEncoder<'a> {
-    encoding: MetadataEncoding<'a>,
+struct MetadataEncoder<'a, 'tcx> {
+    encoding: MetadataEncoding<'a, 'tcx>,
     records: Vec<MetadataRecordKey>,
 }
 
-impl MetadataEncoder<'_> {
+impl MetadataEncoder<'_, '_> {
     pub(crate) fn enter(&mut self, key: MetadataRecordKey, semantic: SemanticRecordMembership) {
         self.records.push(key);
         match &mut self.encoding {
-            MetadataEncoding::RdrProjection { projections, .. } => projections.enter(key, semantic),
+            MetadataEncoding::RdrProjection { projections, .. }
+            | MetadataEncoding::RdrFull { projections, .. } => projections.enter(key, semantic),
             MetadataEncoding::CoarseFull { .. }
             | MetadataEncoding::CoarseStub { .. }
-            | MetadataEncoding::RdrTrace { .. } => {}
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => {}
         }
     }
 
@@ -182,12 +205,15 @@ impl MetadataEncoder<'_> {
     pub(crate) fn record_semantic(&mut self, fingerprint: Fingerprint) {
         let key = self.active_record();
         match &mut self.encoding {
-            MetadataEncoding::RdrProjection { projections, .. } => {
+            MetadataEncoding::RdrProjection { projections, .. }
+            | MetadataEncoding::RdrFull { projections, .. } => {
                 projections.record_semantic(key, fingerprint);
             }
             MetadataEncoding::CoarseFull { .. }
             | MetadataEncoding::CoarseStub { .. }
-            | MetadataEncoding::RdrTrace { .. } => {}
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => {}
         }
     }
 
@@ -198,16 +224,24 @@ impl MetadataEncoder<'_> {
     pub(crate) fn position(&self) -> usize {
         match &self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
-            | MetadataEncoding::CoarseStub { encoder } => encoder.position(),
+            | MetadataEncoding::CoarseStub { encoder }
+            | MetadataEncoding::RdrFull { encoder, .. } => encoder.position(),
+            MetadataEncoding::RdrSpans { encoder, metadata_len, .. } => {
+                metadata_len + encoder.position()
+            }
             MetadataEncoding::RdrTrace { encoder, .. }
             | MetadataEncoding::RdrProjection { encoder, .. } => encoder.position(),
+            MetadataEncoding::RdrReuse { positions, .. } => positions.position(),
         }
     }
 
     pub(crate) fn file_handle(&self) -> &File {
         match &self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
-            | MetadataEncoding::CoarseStub { encoder } => encoder.file(),
+            | MetadataEncoding::CoarseStub { encoder }
+            | MetadataEncoding::RdrFull { encoder, .. }
+            | MetadataEncoding::RdrReuse { encoder, .. }
+            | MetadataEncoding::RdrSpans { encoder, .. } => encoder.file(),
             MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {
                 bug!("metadata projection has no output file")
             }
@@ -217,8 +251,12 @@ impl MetadataEncoder<'_> {
     pub(crate) fn flush(&mut self) {
         match &mut self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
-            | MetadataEncoding::CoarseStub { encoder } => encoder.flush(),
-            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {}
+            | MetadataEncoding::CoarseStub { encoder }
+            | MetadataEncoding::RdrFull { encoder, .. }
+            | MetadataEncoding::RdrSpans { encoder, .. } => encoder.flush(),
+            MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. }
+            | MetadataEncoding::RdrReuse { .. } => {}
         }
     }
 
@@ -232,9 +270,19 @@ impl MetadataEncoder<'_> {
                     .expect("metadata encoder operated outside a declared record");
                 projections.record_wire_bytes(key, bytes);
             }
+            MetadataEncoding::RdrFull { projections, .. } => {
+                let key = self
+                    .records
+                    .last()
+                    .copied()
+                    .expect("metadata encoder operated outside a declared record");
+                projections.record_wire_bytes(key, bytes);
+            }
             MetadataEncoding::CoarseFull { .. }
             | MetadataEncoding::CoarseStub { .. }
-            | MetadataEncoding::RdrTrace { .. } => {}
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => {}
         }
     }
 }
@@ -246,16 +294,19 @@ macro_rules! encoder_methods {
                     self.record_wire_bytes(&value.to_le_bytes());
                     match &mut self.encoding {
                         MetadataEncoding::CoarseFull { encoder, .. }
-                        | MetadataEncoding::CoarseStub { encoder } => encoder.$name(value),
+                        | MetadataEncoding::CoarseStub { encoder }
+                        | MetadataEncoding::RdrFull { encoder, .. }
+                        | MetadataEncoding::RdrSpans { encoder, .. } => encoder.$name(value),
                         MetadataEncoding::RdrTrace { encoder, .. }
                         | MetadataEncoding::RdrProjection { encoder, .. } => encoder.$name(value),
+                        MetadataEncoding::RdrReuse { positions, .. } => positions.$name(value),
                     }
                 }
             )*
         };
     }
 
-impl Encoder for MetadataEncoder<'_> {
+impl Encoder for MetadataEncoder<'_, '_> {
     encoder_methods! {
         emit_usize(usize);
         emit_u128(u128);
@@ -275,35 +326,49 @@ impl Encoder for MetadataEncoder<'_> {
         self.record_wire_bytes(bytes);
         match &mut self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
-            | MetadataEncoding::CoarseStub { encoder } => encoder.emit_raw_bytes(bytes),
+            | MetadataEncoding::CoarseStub { encoder }
+            | MetadataEncoding::RdrFull { encoder, .. }
+            | MetadataEncoding::RdrSpans { encoder, .. } => encoder.emit_raw_bytes(bytes),
             MetadataEncoding::RdrTrace { encoder, .. }
             | MetadataEncoding::RdrProjection { encoder, .. } => encoder.emit_raw_bytes(bytes),
+            MetadataEncoding::RdrReuse { positions, .. } => positions.emit_raw_bytes(bytes),
         }
     }
 }
-impl MetadataEncoding<'_> {
+impl MetadataEncoding<'_, '_> {
     fn definition_layout(&self) -> Option<&MetadataDefinitionLayout> {
         match self {
             Self::CoarseFull { .. } | Self::CoarseStub { .. } | Self::RdrTrace { .. } => None,
             Self::RdrProjection { layout, .. } => Some(layout),
+            Self::RdrFull { projection, .. } => Some(&projection.definitions),
+            Self::RdrReuse { reused_rmeta, .. } => Some(&reused_rmeta.definitions),
+            Self::RdrSpans { definitions, .. } => Some(definitions),
         }
     }
 }
 
-impl MetadataEncoder<'_> {
+impl MetadataEncoder<'_, '_> {
     fn artifact_kind(&self) -> MetadataArtifactKind {
         match &self.encoding {
             MetadataEncoding::CoarseFull { .. }
             | MetadataEncoding::RdrTrace { .. }
             | MetadataEncoding::RdrProjection { .. } => MetadataArtifactKind::Full,
+            MetadataEncoding::RdrFull { .. } => MetadataArtifactKind::RdrMetadata,
             MetadataEncoding::CoarseStub { .. } => MetadataArtifactKind::Stub,
+            MetadataEncoding::RdrReuse { .. } | MetadataEncoding::RdrSpans { .. } => {
+                MetadataArtifactKind::Spans
+            }
         }
     }
 
     fn is_rdr(&self) -> bool {
         match self.encoding {
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => false,
-            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => true,
+            MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. }
+            | MetadataEncoding::RdrFull { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => true,
         }
     }
 
@@ -312,6 +377,15 @@ impl MetadataEncoder<'_> {
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => true,
             MetadataEncoding::RdrTrace { selected, .. } => key.is_semantic(*selected),
             MetadataEncoding::RdrProjection { layout, .. } => key.is_semantic(layout.selection()),
+            MetadataEncoding::RdrFull { projection, .. } => {
+                key.is_semantic(projection.definitions.selection())
+            }
+            MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                key.is_semantic(reused_rmeta.definitions.selection())
+            }
+            MetadataEncoding::RdrSpans { definitions, .. } => {
+                key.is_semantic(definitions.selection())
+            }
         }
     }
 
@@ -322,6 +396,15 @@ impl MetadataEncoder<'_> {
                 references.selection_query(*selected, def_id)
             }
             MetadataEncoding::RdrProjection { layout, .. } => layout.selection().includes(def_id),
+            MetadataEncoding::RdrFull { projection, .. } => {
+                projection.definitions.selection().includes(def_id)
+            }
+            MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                reused_rmeta.definitions.selection().includes(def_id)
+            }
+            MetadataEncoding::RdrSpans { definitions, .. } => {
+                definitions.selection().includes(def_id)
+            }
         }
     }
 
@@ -365,15 +448,21 @@ impl MetadataEncoder<'_> {
                 index
             }
             MetadataEncoding::RdrProjection { layout, .. } => layout.encode(index),
+            MetadataEncoding::RdrFull { projection, .. } => projection.definitions.encode(index),
+            MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                reused_rmeta.definitions.encode(index)
+            }
+            MetadataEncoding::RdrSpans { definitions, .. } => definitions.encode(index),
         }
     }
 }
 
 pub(crate) struct EncodeContext<'a, 'tcx> {
-    opaque: MetadataEncoder<'a>,
+    opaque: MetadataEncoder<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
     feat: &'tcx rustc_feature::Features,
     tables: TableBuilders,
+    span_positions: Vec<MetadataSpanPosition>,
     span_layout: SpanLayout,
     span_occurrence_counts: FxHashMap<MetadataRecordKey, u32>,
     hygiene_occurrence_counts: FxHashMap<(MetadataRecordKey, HygieneReferenceKind), u32>,
@@ -409,6 +498,7 @@ enum HygieneReference {
 
 define_table_writers!();
 define_root_writers!();
+define_position_traversal!();
 
 /// If the current crate is a proc-macro, returns early with `LazyArray::default()`.
 /// This is useful for skipping the encoding of things that aren't needed
@@ -527,6 +617,23 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
         *ordinal =
             ordinal.checked_add(1).expect("cannot encode more than U32_MAX spans per record");
         match &self.opaque.encoding {
+            MetadataEncoding::RdrFull { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => {
+                let slot = self.span_layout.push(occurrence);
+                let data = span.data();
+                self.prepare_rdr_span(data);
+                debug_assert_eq!(slot.as_usize(), self.span_positions.len());
+                self.span_positions.push(MetadataSpanPosition { lo: data.lo, hi: data.hi });
+                if data.is_dummy() {
+                    RdrSpanLocation::Dummy
+                } else {
+                    RdrSpanLocation::Position(slot)
+                }
+                .encode(self);
+                data.ctxt.encode(self);
+                return;
+            }
             MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {
                 let slot = self.span_layout.push(occurrence);
                 if span.is_dummy() {
@@ -591,7 +698,10 @@ impl EncodeContext<'_, '_> {
             MetadataEncoding::CoarseFull { .. }
             | MetadataEncoding::CoarseStub { .. }
             | MetadataEncoding::RdrTrace { .. }
-            | MetadataEncoding::RdrProjection { .. } => None,
+            | MetadataEncoding::RdrProjection { .. }
+            | MetadataEncoding::RdrFull { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => None,
         };
         let Some(trace) = trace else {
             return;
@@ -770,6 +880,13 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for SpanData {
     }
 }
 
+impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for MetadataSpanPosition {
+    fn encode(&self, encoder: &mut EncodeContext<'a, 'tcx>) {
+        self.lo.encode(encoder);
+        self.hi.encode(encoder);
+    }
+}
+
 impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for [u8] {
     fn encode(&self, e: &mut EncodeContext<'a, 'tcx>) {
         Encoder::emit_usize(e, self.len());
@@ -826,18 +943,51 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     }
 
     fn visits(&self, record: PersistedRecord) -> bool {
-        self.opaque.artifact_kind().contains(record)
+        match &self.opaque.encoding {
+            MetadataEncoding::RdrReuse { .. } => {
+                record.projections().contains(PersistedProjection::Position)
+            }
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. }
+            | MetadataEncoding::RdrFull { .. }
+            | MetadataEncoding::RdrSpans { .. } => self.opaque.artifact_kind().contains(record),
+        }
     }
 
     fn encode_preamble(&mut self) {
         self.with_record(
             PersistedRecord::Artifact(PersistedArtifactRecord::metadata_header),
-            |encoder| encoder.emit_raw_bytes(METADATA_HEADER),
+            |encoder| {
+                let format = match encoder.opaque.encoding {
+                    MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
+                        MetadataFormatKind::Coarse
+                    }
+                    MetadataEncoding::RdrTrace { .. }
+                    | MetadataEncoding::RdrProjection { .. }
+                    | MetadataEncoding::RdrFull { .. }
+                    | MetadataEncoding::RdrReuse { .. }
+                    | MetadataEncoding::RdrSpans { .. } => MetadataFormatKind::RdrV1,
+                };
+                encoder.emit_raw_bytes(&format.header());
+            },
         );
         self.with_record(
             PersistedRecord::Artifact(PersistedArtifactRecord::root_position),
-            |encoder| encoder.emit_raw_bytes(&0u64.to_le_bytes()),
+            |encoder| {
+                encoder.emit_raw_bytes(&0u64.to_le_bytes());
+                if encoder.opaque.is_rdr() {
+                    encoder.emit_raw_bytes(&0u64.to_le_bytes());
+                }
+            },
         );
+    }
+
+    fn prepare_rdr_span(&mut self, data: SpanData) {
+        let ctxt = if self.is_proc_macro() { SyntaxContext::root() } else { data.ctxt };
+        let mut sink = MemEncoder::new();
+        rustc_span::hygiene::raw_encode_syntax_context(ctxt, &self.hygiene_ctxt, &mut sink);
     }
 
     pub(crate) fn project_semantic<T: MetadataSemanticValue + StableHash + ?Sized>(
@@ -845,10 +995,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         value: &T,
     ) {
         match &self.opaque.encoding {
-            MetadataEncoding::RdrProjection { .. } => {}
+            MetadataEncoding::RdrProjection { .. } | MetadataEncoding::RdrFull { .. } => {}
             MetadataEncoding::CoarseFull { .. }
             | MetadataEncoding::CoarseStub { .. }
-            | MetadataEncoding::RdrTrace { .. } => return,
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrReuse { .. }
+            | MetadataEncoding::RdrSpans { .. } => return,
         }
         let key = self.opaque.active_record();
         if !key.record.projections().contains(PersistedProjection::Semantic)
@@ -1320,12 +1472,22 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     }
 
     fn encode_crate_root(&mut self) -> (LazyValue<CrateRoot>, HygieneDelta) {
-        let contract_hash = match &self.opaque.encoding {
-            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
-                self.tcx.crate_hash(LOCAL_CRATE)
+        let (contract_hash, metadata_decode_layout_id) = match &self.opaque.encoding {
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => (
+                self.tcx.metadata_contract_hash(()),
+                self.tcx.metadata_decode_layout_id(LOCAL_CRATE),
+            ),
+            MetadataEncoding::RdrFull { projection, .. } => {
+                (projection.contract, projection.decode_layout)
+            }
+            MetadataEncoding::RdrReuse { .. } | MetadataEncoding::RdrSpans { .. } => {
+                bug!("spans encoding cannot encode a crate root")
             }
             MetadataEncoding::RdrTrace { .. } => bug!("definition trace encoded a crate root"),
-            MetadataEncoding::RdrProjection { .. } => Svh::new(Fingerprint::ZERO),
+            MetadataEncoding::RdrProjection { .. } => (
+                MetadataContractHash(Svh::new(Fingerprint::ZERO)),
+                MetadataDecodeLayoutId(Fingerprint::ZERO),
+            ),
         };
 
         let tcx = self.tcx;
@@ -1454,6 +1616,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             );
             let extra_filename =
                 self.extra_filename(tcx.sess.opts.cg.extra_filename.clone(), |_, value| value);
+            let metadata_decode_layout_id =
+                self.metadata_decode_layout_id(metadata_decode_layout_id, |_, value| value);
             let stable_crate_id =
                 self.stable_crate_id(tcx.stable_crate_id(LOCAL_CRATE), |_, value| value);
             let required_panic_strategy = self
@@ -1498,6 +1662,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             );
             self.lazy(CrateRoot {
                 header,
+                metadata_decode_layout_id,
                 extra_filename,
                 stable_crate_id,
                 required_panic_strategy,
@@ -1555,8 +1720,13 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         assert_eq!(total_bytes, computed_total_bytes);
 
         let emitted_artifact = match &self.opaque.encoding {
-            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => true,
-            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => false,
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrFull { .. }
+            | MetadataEncoding::RdrSpans { .. } => true,
+            MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. }
+            | MetadataEncoding::RdrReuse { .. } => false,
         };
         if tcx.sess.opts.unstable_opts.meta_stats && emitted_artifact {
             use std::fmt::Write;
@@ -1641,6 +1811,13 @@ fn analyze_attr(attr: &hir::Attribute, state: &mut AnalyzeAttrState) -> bool {
         && p.encode_cross_crate() == EncodeCrossCrate::No
     {
         // Attributes not marked encode-cross-crate don't need to be encoded for downstream crates.
+    } else if let hir::Attribute::Parsed(
+        AttributeKind::CfgTrace(_) | AttributeKind::CfgAttrTrace(_),
+    ) = attr
+    {
+        // Configuration has already selected the HIR that metadata describes.
+    } else if attr.has_name(sym::cfg) || attr.has_name(sym::cfg_attr) {
+        // Configuration has already selected the HIR that metadata describes.
     } else if let Some(name) = attr.name()
         && [sym::warn, sym::allow, sym::expect, sym::forbid, sym::deny].contains(&name)
     {
@@ -2008,6 +2185,7 @@ fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
         |encoder| rustc_version(tcx.sess.cfg_version).encode(encoder),
     );
     let (_, encoded_hygiene) = encoder.encode_crate_root();
+    encoder.with_record(PersistedRecord::Artifact(PersistedArtifactRecord::spans), |_| {});
     let span_layout = encoder.span_layout.metadata_layout();
     let MetadataEncoder {
         encoding: MetadataEncoding::RdrProjection { projections, .. },
@@ -2337,6 +2515,11 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let tcx = self.tcx;
         let definitions: Vec<_> = match &self.opaque.encoding {
             MetadataEncoding::RdrProjection { layout, .. } => layout.iter().collect(),
+            MetadataEncoding::RdrFull { projection, .. } => projection.definitions.iter().collect(),
+            MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                reused_rmeta.definitions.iter().collect()
+            }
+            MetadataEncoding::RdrSpans { definitions, .. } => definitions.iter().collect(),
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
                 tcx.iter_local_def_id().collect()
             }
@@ -2392,7 +2575,18 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
 
         let definition_spans = if should_encode_span(def_kind) {
-            Some(tcx.metadata_definition_spans(local_id).0)
+            Some(match &self.opaque.encoding {
+                MetadataEncoding::RdrReuse { .. } => MetadataDefinitionSpans {
+                    span: tcx.def_span(local_id),
+                    ident: tcx.def_ident_span(def_id),
+                },
+                MetadataEncoding::CoarseFull { .. }
+                | MetadataEncoding::CoarseStub { .. }
+                | MetadataEncoding::RdrTrace { .. }
+                | MetadataEncoding::RdrProjection { .. }
+                | MetadataEncoding::RdrFull { .. }
+                | MetadataEncoding::RdrSpans { .. } => tcx.metadata_definition_spans(local_id).0,
+            })
         } else {
             None
         };
@@ -3691,71 +3885,194 @@ fn prefetch_mir(tcx: TyCtxt<'_>) {
 // generated regardless of trailing bytes that end up in it.
 
 pub struct EncodedMetadata {
-    // The declaration order matters because `full_metadata` should be dropped
-    // before `_temp_dir`.
-    full_metadata: Option<Mmap>,
-    // This is an optional stub metadata containing only the crate header.
-    // The header should be very small, so we load it directly into memory.
-    stub_metadata: Option<Vec<u8>>,
-    // The path containing the metadata, to record as work product.
-    path: Option<Box<Path>>,
-    // We need to carry MaybeTempDir to avoid deleting the temporary
-    // directory while accessing the Mmap.
-    _temp_dir: Option<MaybeTempDir>,
+    body: Option<EncodedMetadataBody>,
+}
+
+/// Keeps the primary artifact and spans artifact selected by one RDR output inseparable.
+#[derive(Clone, Copy, Debug)]
+pub struct RdrArtifactPair<P, S = P> {
+    pub primary: P,
+    pub spans: S,
+}
+
+/// Carries the complete artifact set selected by the encoded metadata format.
+///
+/// Keeping the format and its files in one value prevents consumers from reconstructing the
+/// artifact shape from session flags.
+#[derive(Clone, Copy, Debug)]
+pub enum EncodedMetadataArtifacts<T> {
+    Coarse(T),
+    Rdr(RdrArtifactPair<T>),
+}
+
+impl<T> EncodedMetadataArtifacts<T> {
+    #[inline]
+    pub fn as_ref(&self) -> EncodedMetadataArtifacts<&T> {
+        match self {
+            Self::Coarse(metadata) => EncodedMetadataArtifacts::Coarse(metadata),
+            Self::Rdr(artifacts) => EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                primary: &artifacts.primary,
+                spans: &artifacts.spans,
+            }),
+        }
+    }
+
+    #[inline]
+    pub fn map<U>(self, mut map: impl FnMut(T) -> U) -> EncodedMetadataArtifacts<U> {
+        match self {
+            Self::Coarse(metadata) => EncodedMetadataArtifacts::Coarse(map(metadata)),
+            Self::Rdr(artifacts) => EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                primary: map(artifacts.primary),
+                spans: map(artifacts.spans),
+            }),
+        }
+    }
+
+    /// Selects the rmeta artifact without changing its ownership form.
+    #[inline]
+    pub fn metadata(self) -> T {
+        match self {
+            Self::Coarse(metadata) => metadata,
+            Self::Rdr(artifacts) => artifacts.primary,
+        }
+    }
+}
+
+pub(crate) struct EncodedMetadataFiles<T> {
+    pub(crate) artifacts: EncodedMetadataArtifacts<T>,
+    pub(crate) temp_dir: Option<MaybeTempDir>,
+}
+
+struct EncodedMetadataBody {
+    storage: EncodedMetadataStorage,
+    stub: Option<Vec<u8>>,
+}
+
+enum EncodedMetadataStorage {
+    Memory(EncodedMetadataArtifacts<Mmap>),
+    Files(EncodedMetadataFiles<EncodedMetadataFile>),
+}
+
+struct EncodedMetadataFile {
+    bytes: Mmap,
+    path: Box<Path>,
+}
+
+impl EncodedMetadataStorage {
+    fn bytes(&self) -> EncodedMetadataArtifacts<&[u8]> {
+        match self {
+            Self::Memory(artifacts) => artifacts.as_ref().map(|metadata| &metadata[..]),
+            Self::Files(files) => files.artifacts.as_ref().map(|file| &file.bytes[..]),
+        }
+    }
+
+    fn paths(&self) -> Option<EncodedMetadataArtifacts<&Path>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Files(files) => Some(files.artifacts.as_ref().map(|file| file.path.as_ref())),
+        }
+    }
 }
 
 impl EncodedMetadata {
     #[inline]
-    pub fn from_path(
-        path: PathBuf,
+    pub(crate) fn from_path(
+        source: EncodedMetadataFiles<PathBuf>,
         stub_path: Option<PathBuf>,
-        temp_dir: Option<MaybeTempDir>,
     ) -> std::io::Result<Self> {
+        let EncodedMetadataFiles { artifacts, temp_dir } = source;
+        let path = artifacts.as_ref().metadata();
         let file = std::fs::File::open(&path)?;
         let file_metadata = file.metadata()?;
         if file_metadata.len() == 0 {
-            return Ok(Self {
-                full_metadata: None,
-                stub_metadata: None,
-                path: None,
-                _temp_dir: None,
-            });
+            return Ok(Self { body: None });
         }
-        let full_mmap = unsafe { Some(Mmap::map(file)?) };
-
+        let metadata = unsafe { Mmap::map(file)? };
         let stub =
             if let Some(stub_path) = stub_path { Some(std::fs::read(stub_path)?) } else { None };
-
+        let artifacts = match artifacts {
+            EncodedMetadataArtifacts::Coarse(path) => {
+                EncodedMetadataArtifacts::Coarse(EncodedMetadataFile {
+                    bytes: metadata,
+                    path: path.into(),
+                })
+            }
+            EncodedMetadataArtifacts::Rdr(artifacts) => {
+                let spans = unsafe { Mmap::map(std::fs::File::open(&artifacts.spans)?)? };
+                EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                    primary: EncodedMetadataFile {
+                        bytes: metadata,
+                        path: artifacts.primary.into(),
+                    },
+                    spans: EncodedMetadataFile { bytes: spans, path: artifacts.spans.into() },
+                })
+            }
+        };
         Ok(Self {
-            full_metadata: full_mmap,
-            stub_metadata: stub,
-            path: Some(path.into()),
-            _temp_dir: temp_dir,
+            body: Some(EncodedMetadataBody {
+                storage: EncodedMetadataStorage::Files(EncodedMetadataFiles {
+                    artifacts,
+                    temp_dir,
+                }),
+                stub,
+            }),
         })
     }
 
     #[inline]
-    pub fn full(&self) -> &[u8] {
-        &self.full_metadata.as_deref().unwrap_or_default()
+    pub fn stub_or_full(&self) -> EncodedMetadataArtifacts<&[u8]> {
+        let Some(body) = &self.body else {
+            return EncodedMetadataArtifacts::Coarse(&[]);
+        };
+        if let Some(stub) = &body.stub {
+            return EncodedMetadataArtifacts::Coarse(stub);
+        }
+        body.storage.bytes()
     }
 
     #[inline]
-    pub fn stub_or_full(&self) -> &[u8] {
-        self.stub_metadata.as_deref().unwrap_or(self.full())
-    }
-
-    #[inline]
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+    pub fn paths(&self) -> Option<EncodedMetadataArtifacts<&Path>> {
+        self.body.as_ref().and_then(|body| body.storage.paths())
     }
 }
 
 impl<S: Encoder> Encodable<S> for EncodedMetadata {
     fn encode(&self, s: &mut S) {
-        self.stub_metadata.encode(s);
+        self.body.as_ref().and_then(|body| body.stub.as_ref()).encode(s);
+        match self.body.as_ref().map(|body| body.storage.bytes()) {
+            None => {
+                (&[] as &[u8]).encode(s);
+                Option::<&[u8]>::None.encode(s);
+            }
+            Some(EncodedMetadataArtifacts::Coarse(metadata)) => {
+                metadata.encode(s);
+                Option::<&[u8]>::None.encode(s);
+            }
+            Some(EncodedMetadataArtifacts::Rdr(artifacts)) => {
+                artifacts.primary.encode(s);
+                Some(artifacts.spans).encode(s);
+            }
+        }
+    }
+}
 
-        let slice = self.full();
-        slice.encode(s)
+fn parse_encoded_metadata_artifacts(
+    metadata: Mmap,
+    spans: Option<Mmap>,
+) -> EncodedMetadataArtifacts<Mmap> {
+    let envelope = parse_metadata_envelope(metadata)
+        .unwrap_or_else(|err| panic!("invalid internally encoded metadata envelope: {err:?}"));
+    match (envelope.format, spans) {
+        (MetadataFormatKind::Coarse, None) => EncodedMetadataArtifacts::Coarse(envelope.bytes),
+        (MetadataFormatKind::RdrV1, Some(spans)) => {
+            EncodedMetadataArtifacts::Rdr(RdrArtifactPair { primary: envelope.bytes, spans })
+        }
+        (MetadataFormatKind::Coarse, Some(_)) => {
+            panic!("coarse metadata cannot include RDR spans")
+        }
+        (MetadataFormatKind::RdrV1, None) => {
+            panic!("RDR metadata must include its spans")
+        }
     }
 }
 
@@ -3764,7 +4081,7 @@ impl<D: Decoder> Decodable<D> for EncodedMetadata {
         let stub = <Option<Vec<u8>>>::decode(d);
 
         let len = d.read_usize();
-        let full_metadata = if len > 0 {
+        let metadata = if len > 0 {
             let mut mmap = MmapMut::map_anon(len).unwrap();
             mmap.copy_from_slice(d.read_raw_bytes(len));
             Some(mmap.make_read_only().unwrap())
@@ -3772,12 +4089,58 @@ impl<D: Decoder> Decodable<D> for EncodedMetadata {
             None
         };
 
-        Self { full_metadata, stub_metadata: stub, path: None, _temp_dir: None }
+        let spans = <Option<Vec<u8>>>::decode(d);
+        let spans = spans.map(|spans| {
+            let mut mmap = MmapMut::map_anon(spans.len()).unwrap();
+            mmap.copy_from_slice(&spans);
+            mmap.make_read_only().unwrap()
+        });
+
+        let body = match (metadata, spans, stub) {
+            (None, None, None) => None,
+            (Some(metadata), spans, stub) => Some(EncodedMetadataBody {
+                storage: EncodedMetadataStorage::Memory(parse_encoded_metadata_artifacts(
+                    metadata, spans,
+                )),
+                stub,
+            }),
+            (None, Some(_), _) | (None, None, Some(_)) => {
+                panic!("encoded metadata has auxiliary data without full metadata")
+            }
+        };
+        Self { body }
     }
 }
 
+#[cfg(test)]
+#[test]
+#[should_panic(expected = "coarse metadata cannot include RDR spans")]
+fn parsed_coarse_metadata_rejects_spans() {
+    let mut metadata = MmapMut::map_anon(METADATA_ENVELOPE_LEN).unwrap();
+    metadata.copy_from_slice(&MetadataFormatKind::Coarse.header());
+    let metadata = metadata.make_read_only().unwrap();
+    let spans = MmapMut::map_anon(1).unwrap().make_read_only().unwrap();
+
+    parse_encoded_metadata_artifacts(metadata, Some(spans));
+}
+
+#[cfg(test)]
+#[test]
+#[should_panic(expected = "RDR metadata must include its spans")]
+fn parsed_rdr_metadata_requires_spans() {
+    let mut metadata = MmapMut::map_anon(METADATA_ENVELOPE_LEN).unwrap();
+    metadata.copy_from_slice(&MetadataFormatKind::RdrV1.header());
+    let metadata = metadata.make_read_only().unwrap();
+
+    parse_encoded_metadata_artifacts(metadata, None);
+}
+
 #[instrument(level = "trace", skip(tcx))]
-pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
+pub(crate) fn encode_metadata(
+    tcx: TyCtxt<'_>,
+    output: EncodedMetadataArtifacts<&Path>,
+    ref_path: Option<&Path>,
+) {
     // Since encoding metadata is not in a query, and nothing is cached,
     // there's no need to do dep-graph tracking for any of it.
     tcx.dep_graph.assert_ignored();
@@ -3794,7 +4157,7 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
                     encoder.lazy(CrateHeader {
                         name: tcx.crate_name(LOCAL_CRATE),
                         triple: tcx.sess.opts.target_triple.clone(),
-                        hash: tcx.crate_hash(LOCAL_CRATE),
+                        hash: tcx.metadata_contract_hash(()),
                         is_proc_macro_crate: false,
                         is_stub: true,
                     })
@@ -3805,9 +4168,10 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
     }
 
     let dep_node = tcx.metadata_dep_node();
+    let path = output.metadata();
 
-    // If the metadata dep-node is green, we can copy the saved work product.
-    if tcx.dep_graph.is_fully_enabled()
+    // If the metadata dep-node is green, try to reuse the saved work product.
+    let reused_rmeta = if tcx.dep_graph.is_fully_enabled()
         && let work_product_id = WorkProductId::from_cgu_name("metadata")
         && let Some(work_product) = tcx.dep_graph.previous_work_product(&work_product_id)
         && tcx.dep_graph.try_mark_green(tcx, &dep_node).is_some()
@@ -3815,15 +4179,57 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
         let saved_path = &work_product.saved_files["rmeta"];
         let incr_comp_session_dir = tcx.sess.incr_comp_session_dir();
         let source_file_in_incr_dir = &incr_comp_session_dir.join(saved_path);
-        debug!("copying preexisting metadata from {source_file_in_incr_dir:?} to {path:?}");
-        match rustc_fs_util::link_or_copy(&source_file_in_incr_dir, path) {
-            Ok(_) => {}
-            Err(err) => tcx.dcx().emit_fatal(FailCreateFileEncoder { err }),
+        match output {
+            EncodedMetadataArtifacts::Rdr(artifacts) => {
+                let mut rmeta = std::fs::read(source_file_in_incr_dir).unwrap_or_else(|err| {
+                    tcx.dcx().emit_fatal(FailReadFile { path: source_file_in_incr_dir, err })
+                });
+                let saved_spans_path =
+                    &incr_comp_session_dir.join(&work_product.saved_files["spans"]);
+                let spans = std::fs::read(saved_spans_path).unwrap_or_else(|err| {
+                    tcx.dcx().emit_fatal(FailReadFile { path: saved_spans_path, err })
+                });
+                let envelope = parse_metadata_envelope(slice_owned(rmeta.clone(), Vec::as_slice))
+                    .unwrap_or_else(|err| panic!("invalid saved RDR metadata: {err:?}"));
+                let ParsedMetadataEnvelope { bytes, format } = envelope;
+                let MetadataFormatKind::RdrV1 = format else {
+                    panic!("saved RDR metadata has a coarse envelope")
+                };
+                let blob = LoadedMetadata::new(MetadataInput::Rdr(RdrArtifactPair {
+                    primary: bytes,
+                    spans: SpansArtifactSource::in_memory(slice_owned(spans, Vec::as_slice)),
+                }))
+                .unwrap_or_else(|err| panic!("invalid saved RDR metadata: {err:?}"));
+                let definitions = blob.definition_layout(tcx);
+                rmeta.truncate(
+                    rmeta
+                        .len()
+                        .checked_sub(MAGIC_END_BYTES.len())
+                        .expect("saved RDR metadata omitted its end marker"),
+                );
+                Some((
+                    ReusedRmeta {
+                        prefix: rmeta,
+                        definitions,
+                        hygiene: tcx.metadata_projection(()).hygiene.clone(),
+                    },
+                    artifacts.spans,
+                ))
+            }
+            EncodedMetadataArtifacts::Coarse(_) => {
+                debug!("copying preexisting metadata from {source_file_in_incr_dir:?} to {path:?}");
+                match rustc_fs_util::link_or_copy(&source_file_in_incr_dir, path) {
+                    Ok(_) => {}
+                    Err(err) => tcx.dcx().emit_fatal(FailCreateFileEncoder { err }),
+                };
+                return;
+            }
         }
-        return;
-    }
+    } else {
+        None
+    };
 
-    if tcx.sess.opts.jobs.frontend.is_some() {
+    if reused_rmeta.is_none() && tcx.sess.opts.jobs.frontend.is_some() {
         // Prefetch some queries used by metadata encoding.
         // This is not necessary for correctness, but is only done for performance reasons.
         // It can be removed if it turns out to cause trouble or be detrimental to performance.
@@ -3836,14 +4242,44 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
         );
     }
 
-    let _prof_timer = tcx.prof.verbose_generic_activity("generate_crate_metadata");
-    let encoder = opaque::FileEncoder::new(path)
-        .unwrap_or_else(|err| tcx.dcx().emit_fatal(FailCreateFileEncoder { err }));
-    let encode = || {
-        with_encode_metadata_header(tcx, MetadataEncoding::CoarseFull { encoder }, |ecx| {
+    let reusing_rmeta = reused_rmeta.is_some();
+    let encode = move || {
+        let _prof_timer = if reusing_rmeta {
+            None
+        } else {
+            Some(tcx.prof.verbose_generic_activity("generate_crate_metadata"))
+        };
+        let mut encoder = opaque::FileEncoder::new(path)
+            .unwrap_or_else(|err| tcx.dcx().emit_fatal(FailCreateFileEncoder { err }));
+        let encoding = match reused_rmeta {
+            Some((reused_rmeta, spans_path)) => {
+                encoder.emit_raw_bytes(&reused_rmeta.prefix);
+                let mut positions = MemEncoder::new();
+                positions.emit_u8(0);
+                MetadataEncoding::RdrReuse {
+                    encoder,
+                    positions,
+                    reused_rmeta,
+                    spans_path: spans_path.to_path_buf(),
+                }
+            }
+            None => match output {
+                EncodedMetadataArtifacts::Rdr(artifacts) => MetadataEncoding::RdrFull {
+                    encoder,
+                    projections: MetadataProjectionEncoder::new(),
+                    projection: tcx.metadata_projection(()),
+                    spans_path: artifacts.spans.to_path_buf(),
+                },
+                EncodedMetadataArtifacts::Coarse(_) => MetadataEncoding::CoarseFull { encoder },
+            },
+        };
+        with_encode_metadata_header(tcx, encoding, |ecx| {
             // Encode all the entries and extra information in the crate,
             // culminating in the `CrateRoot` which points to all of it.
-            let (root, _) = ecx.encode_crate_root();
+            let (root, encoded_hygiene) = ecx.encode_crate_root();
+            if let MetadataEncoding::RdrFull { projection, .. } = &ecx.opaque.encoding {
+                projection.hygiene.assert_reached(encoded_hygiene);
+            }
 
             // Flush buffer to ensure backing file has the correct size.
             ecx.opaque.flush();
@@ -3858,17 +4294,49 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
         });
     };
 
+    if reusing_rmeta {
+        tcx.dep_graph.with_ignore(encode);
+        return;
+    }
+
     // Perform metadata encoding inside a task, so the dep-graph can check if any encoded
     // information changes, and maybe reuse the work product.
-    tcx.dep_graph.with_task(dep_node, tcx, encode, None);
+    tcx.dep_graph.with_task(
+        dep_node,
+        tcx,
+        || match output {
+            EncodedMetadataArtifacts::Coarse(_) => encode(),
+            EncodedMetadataArtifacts::Rdr(_) => {
+                let _ = tcx.metadata_contract_hash(());
+                let _ = tcx.metadata_projection(());
+                tcx.dep_graph.with_ignore(encode)
+            }
+        },
+        None,
+    );
+}
+
+struct ReusedRmeta {
+    prefix: Vec<u8>,
+    definitions: MetadataDefinitionLayout,
+    hygiene: HygieneEncodeLayout,
 }
 
 impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, encoding: MetadataEncoding<'a>) -> Self {
+    fn new(tcx: TyCtxt<'tcx>, encoding: MetadataEncoding<'a, 'tcx>) -> Self {
         let hygiene_ctxt = match &encoding {
             MetadataEncoding::RdrTrace { hygiene_ctxt, .. } => Arc::clone(hygiene_ctxt),
             MetadataEncoding::RdrProjection { hygiene, .. } => {
                 Arc::new(HygieneEncodeContext::with_layout((*hygiene).clone()))
+            }
+            MetadataEncoding::RdrFull { projection, .. } => {
+                Arc::new(HygieneEncodeContext::with_layout(projection.hygiene.clone()))
+            }
+            MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                Arc::new(HygieneEncodeContext::with_layout(reused_rmeta.hygiene.clone()))
+            }
+            MetadataEncoding::RdrSpans { hygiene, .. } => {
+                Arc::new(HygieneEncodeContext::with_layout(hygiene.clone()))
             }
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
                 Arc::new(HygieneEncodeContext::default())
@@ -3885,6 +4353,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             tcx,
             feat: tcx.features(),
             tables: Default::default(),
+            span_positions: Vec::new(),
             span_layout: SpanLayout::default(),
             span_occurrence_counts: FxHashMap::default(),
             hygiene_occurrence_counts: FxHashMap::default(),
@@ -3903,6 +4372,79 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 }
 
 impl EncodeContext<'_, '_> {
+    fn finish_position_traversal(mut self) -> Self {
+        assert_eq!(self.lazy_state, LazyState::NoNode);
+        let MetadataEncoder { encoding, records } = self.opaque;
+        let MetadataEncoding::RdrReuse { mut encoder, positions: _, reused_rmeta, spans_path } =
+            encoding
+        else {
+            bug!("position traversal finished outside RDR reuse")
+        };
+        let metadata_len = encoder.position();
+        encoder.finish().unwrap_or_else(|(path, err)| {
+            self.tcx.dcx().emit_fatal(FailWriteFile { path: &path, err })
+        });
+        let encoder = opaque::FileEncoder::new(&spans_path)
+            .unwrap_or_else(|err| self.tcx.dcx().emit_fatal(FailCreateFileEncoder { err }));
+        self.opaque = MetadataEncoder {
+            encoding: MetadataEncoding::RdrSpans {
+                encoder,
+                metadata_len,
+                definitions: reused_rmeta.definitions,
+                hygiene: reused_rmeta.hygiene,
+            },
+            records,
+        };
+        self.begin_spans_artifact();
+        self
+    }
+
+    fn finish_rdr_primary(mut self, root_position: usize) -> Self {
+        self.verify_record_coverage();
+        let MetadataEncoder { encoding, records } = self.opaque;
+        let MetadataEncoding::RdrFull { mut encoder, projections: _, projection, spans_path } =
+            encoding
+        else {
+            bug!("RDR primary finalization started outside full encoding")
+        };
+        let metadata_len = encoder.position();
+        let definitions = projection.definitions.clone();
+        let hygiene = projection.hygiene.clone();
+        encoder.finish().unwrap_or_else(|(path, err)| {
+            self.tcx.dcx().emit_fatal(FailWriteFile { path: &path, err })
+        });
+        let result = (|| {
+            let mut file = encoder.file();
+            let position_before_seek = file.stream_position()?;
+            file.seek(std::io::SeekFrom::Start(METADATA_ROOT_POSITION_OFFSET as u64))?;
+            file.write_all(&root_position.to_le_bytes())?;
+            file.seek(std::io::SeekFrom::Start(RDR_METADATA_LENGTH_OFFSET as u64))?;
+            file.write_all(&(metadata_len as u64).to_le_bytes())?;
+            file.seek(std::io::SeekFrom::Start(position_before_seek))?;
+            Ok::<(), std::io::Error>(())
+        })();
+        if let Err(err) = result {
+            self.tcx.dcx().emit_fatal(FailWriteFile { path: encoder.path(), err });
+        }
+        let encoder = opaque::FileEncoder::new(&spans_path)
+            .unwrap_or_else(|err| self.tcx.dcx().emit_fatal(FailCreateFileEncoder { err }));
+        self.opaque = MetadataEncoder {
+            encoding: MetadataEncoding::RdrSpans { encoder, metadata_len, definitions, hygiene },
+            records,
+        };
+        self.begin_spans_artifact();
+        self
+    }
+
+    fn begin_spans_artifact(&mut self) {
+        self.recorded_records.clear();
+        self.span_shorthands.clear();
+        self.type_shorthands.clear();
+        self.predicate_shorthands.clear();
+        self.interpret_allocs.clear();
+        self.symbol_index_table.clear();
+    }
+
     fn verify_record_coverage(&self) {
         let missing_records: Vec<_> = PersistedRecord::ALL
             .iter()
@@ -3932,40 +4474,106 @@ impl EncodeContext<'_, '_> {
 
 fn with_encode_metadata_header<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
-    encoding: MetadataEncoding<'a>,
+    encoding: MetadataEncoding<'a, 'tcx>,
     f: impl FnOnce(&mut EncodeContext<'a, 'tcx>) -> usize,
 ) {
     let mut ecx = EncodeContext::new(tcx, encoding);
-    ecx.encode_preamble();
-    ecx.with_record(PersistedRecord::Artifact(PersistedArtifactRecord::rustc_version), |encoder| {
-        rustc_version(tcx.sess.cfg_version).encode(encoder)
-    });
-    let root_position = f(&mut ecx);
-    ecx.verify_record_coverage();
+    let root_position = match &ecx.opaque.encoding {
+        MetadataEncoding::RdrReuse { .. } => {
+            debug!("collecting RDR span positions without emitting rmeta");
+            ecx.encode_position_records();
+            ecx = ecx.finish_position_traversal();
+            None
+        }
+        MetadataEncoding::CoarseFull { .. }
+        | MetadataEncoding::CoarseStub { .. }
+        | MetadataEncoding::RdrFull { .. } => {
+            ecx.encode_preamble();
+            ecx.with_record(
+                PersistedRecord::Artifact(PersistedArtifactRecord::rustc_version),
+                |encoder| rustc_version(tcx.sess.cfg_version).encode(encoder),
+            );
+            Some(f(&mut ecx))
+        }
+        MetadataEncoding::RdrTrace { .. }
+        | MetadataEncoding::RdrProjection { .. }
+        | MetadataEncoding::RdrSpans { .. } => {
+            bug!("metadata projection reached file encoding")
+        }
+    };
+    if ecx.opaque.is_rdr() {
+        if matches!(&ecx.opaque.encoding, MetadataEncoding::RdrFull { .. }) {
+            let Some(root_position) = root_position else {
+                bug!("full RDR metadata omitted its crate root")
+            };
+            ecx = ecx.finish_rdr_primary(root_position);
+        }
+        let spans = std::mem::take(&mut ecx.span_positions);
+        ecx.with_record(PersistedRecord::Artifact(PersistedArtifactRecord::spans), |encoder| {
+            let mut encoded_spans = TableBuilder::default();
+            for (slot, span) in spans.into_iter().enumerate() {
+                let span = encoder.lazy(span);
+                encoded_spans.set_some(ExternalSpanSlot::from_usize(slot), span);
+            }
+            let spans =
+                encoded_spans.encode(encoder.position(), |bytes| encoder.emit_raw_bytes(bytes));
+            let root: LazyValue<SpansArtifactRoot> = encoder.lazy(SpansArtifactRoot { spans });
+            encoder
+                .emit_raw_bytes(&SpansArtifactHeader { root_position: root.position }.to_bytes());
+        });
+        ecx.verify_record_coverage();
 
+        let MetadataEncoder { encoding, records: _ } = ecx.opaque;
+        let mut encoder = match encoding {
+            MetadataEncoding::RdrSpans { encoder, .. } => encoder,
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. }
+            | MetadataEncoding::RdrFull { .. }
+            | MetadataEncoding::RdrReuse { .. } => {
+                bug!("RDR position artifact was not initialized")
+            }
+        };
+        encoder
+            .finish()
+            .unwrap_or_else(|(path, err)| tcx.dcx().emit_fatal(FailWriteFile { path: &path, err }));
+        return;
+    }
+
+    let record = PersistedRecord::Artifact(PersistedArtifactRecord::spans);
+    if ecx.opaque.artifact_kind().contains(record) {
+        ecx.with_record(record, |_| {});
+    }
+    ecx.verify_record_coverage();
     let MetadataEncoder { encoding, records: _ } = ecx.opaque;
     let mut encoder = match encoding {
         MetadataEncoding::CoarseFull { encoder } | MetadataEncoding::CoarseStub { encoder } => {
             encoder
         }
-        MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {
-            bug!("metadata projection reached file encoding")
+        MetadataEncoding::RdrProjection { .. }
+        | MetadataEncoding::RdrTrace { .. }
+        | MetadataEncoding::RdrFull { .. }
+        | MetadataEncoding::RdrReuse { .. }
+        | MetadataEncoding::RdrSpans { .. } => {
+            bug!("RDR encoding reached coarse file finalization")
         }
     };
     encoder
         .finish()
         .unwrap_or_else(|(path, err)| tcx.dcx().emit_fatal(FailWriteFile { path: &path, err }));
-    if let Err(err) = encode_root_position(encoder.file(), root_position) {
+    let Some(root_position) = root_position else { bug!("coarse metadata omitted its crate root") };
+    let result = (|| {
+        let mut file = encoder.file();
+        let position_before_seek = file.stream_position()?;
+        file.seek(std::io::SeekFrom::Start(METADATA_ROOT_POSITION_OFFSET as u64))?;
+        file.write_all(&root_position.to_le_bytes())?;
+        file.seek(std::io::SeekFrom::Start(position_before_seek))?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if let Err(err) = result {
         tcx.dcx().emit_fatal(FailWriteFile { path: encoder.path(), err });
     }
-}
-
-fn encode_root_position(mut file: &File, position: usize) -> Result<(), std::io::Error> {
-    let position_before_seek = file.stream_position()?;
-    file.seek(std::io::SeekFrom::Start(METADATA_HEADER.len() as u64))?;
-    file.write_all(&position.to_le_bytes())?;
-    file.seek(std::io::SeekFrom::Start(position_before_seek))?;
-    Ok(())
 }
 
 pub(crate) fn provide(providers: &mut Providers) {

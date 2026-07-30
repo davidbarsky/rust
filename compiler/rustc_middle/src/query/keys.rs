@@ -10,7 +10,7 @@ use rustc_data_structures::stable_hash::StableHash;
 use rustc_hir::OwnerId;
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModId};
 use rustc_span::def_id::ModId;
-use rustc_span::{DUMMY_SP, Ident, LocalExpnId, Span, Symbol};
+use rustc_span::{DUMMY_SP, ExternalSpanId, Ident, LocalExpnId, Span, Symbol};
 
 use crate::dep_graph::DepNodeIndex;
 use crate::infer::canonical::CanonicalQueryInput;
@@ -112,6 +112,12 @@ impl QueryKey for CrateNum {
     #[inline(always)]
     fn as_local_key(&self) -> Option<Self::LocalQueryKey> {
         (*self == LOCAL_CRATE).then_some(LocalCrate)
+    }
+}
+
+impl QueryKey for ExternalSpanId {
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
     }
 }
 

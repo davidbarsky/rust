@@ -34,7 +34,7 @@ impl NativeLib {
 }
 
 /// A path that has been canonicalized along with its original, non-canonicalized form
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CanonicalizedPath {
     // Optional since canonicalization can sometimes fail
     canonicalized: Option<PathBuf>,

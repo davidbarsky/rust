@@ -1,7 +1,6 @@
 //@ revisions: bpass1 bpass2
 //@ aux-build: a.rs
 //@ compile-flags: -Zrdr
-//@ should-fail: failed to read RDR spans artifact `{{build-base}}/rdr/add-private-item/main/auxiliary/liba.spans`: No such file or directory (os error 2)
 //@ [bpass2] rustc-not-invoked
 
 #![crate_type = "rlib"]

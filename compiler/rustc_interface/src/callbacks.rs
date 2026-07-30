@@ -14,7 +14,7 @@ use std::fmt;
 use rustc_errors::DiagInner;
 use rustc_middle::dep_graph::{DepNodeIndex, QuerySideEffect, TaskDepsRef};
 use rustc_middle::ty::tls;
-use rustc_span::Symbol;
+use rustc_span::{ExternalSpanData, ExternalSpanId, Symbol};
 
 fn track_span_parent(def_id: rustc_span::def_id::LocalDefId) {
     tls::with_context_opt(|icx| {
@@ -88,6 +88,16 @@ fn def_id_debug(def_id: rustc_hir::def_id::DefId, f: &mut fmt::Formatter<'_>) ->
 /// TyCtxt in.
 pub fn setup_callbacks() {
     rustc_span::SPAN_TRACK.swap(&(track_span_parent as fn(_)));
+    rustc_span::EXTERNAL_SPAN_DATA.swap(
+        &((|id: ExternalSpanId| {
+            tls::with_opt(|tcx| {
+                let tcx = tcx.unwrap_or_else(|| {
+                    panic!("external span {id:?} resolved without a compiler context")
+                });
+                *tcx.external_span_data(id)
+            })
+        }) as fn(_) -> ExternalSpanData),
+    );
     rustc_hir::def_id::DEF_ID_DEBUG.swap(&(def_id_debug as fn(_, &mut fmt::Formatter<'_>) -> _));
     rustc_errors::TRACK_DIAGNOSTIC.swap(&(track_diagnostic as _));
     rustc_feature::TRACK_FEATURE.swap(&(track_feature as _));

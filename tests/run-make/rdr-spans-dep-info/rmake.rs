@@ -1,6 +1,5 @@
 //@ needs-target-std
 
-//@ should-fail: rmake recipe failed to complete
 use run_make_support::{rfs, rust_lib_name, rustc};
 
 fn main() {

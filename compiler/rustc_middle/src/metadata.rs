@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::hash::Hasher;
 
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet, IndexEntry};
@@ -645,6 +646,22 @@ impl crate::query::erase::Erasable for MetadataDecodeLayoutId {
 pub struct MetadataSpanLayout {
     pub id: Fingerprint,
     pub slot_count: u32,
+}
+
+/// Keeps position-artifact invalidation separate from semantic metadata identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, StableHash)]
+pub struct MetadataSpansId(Fingerprint);
+
+impl MetadataSpansId {
+    pub fn from_observed_artifact(bytes: &[u8]) -> Self {
+        let mut hasher = StableHasher::new();
+        hasher.write(bytes);
+        Self(hasher.finish())
+    }
+}
+
+impl crate::query::erase::Erasable for MetadataSpansId {
+    type Storage = [u8; size_of::<Self>()];
 }
 
 /// A simplified version of `ImportKind` from resolve.

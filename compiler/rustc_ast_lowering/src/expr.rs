@@ -1737,8 +1737,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
     ) -> hir::Expr<'hir> {
         let head = self.lower_expr_mut(head);
         let pat = self.lower_pat(pat);
-        let for_span =
-            self.mark_span_with_reason(DesugaringKind::ForLoop, self.lower_span(e.span), None);
+        let for_span = self.mark_span_with_reason(DesugaringKind::ForLoop, e.span, None);
         let for_ctxt = for_span.ctxt();
 
         // Try to point both the head and pat spans to their position in the for loop

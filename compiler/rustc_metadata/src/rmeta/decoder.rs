@@ -10,7 +10,7 @@ pub(super) use cstore_impl::provide;
 use rustc_ast as ast;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::owned_slice::OwnedSlice;
+use rustc_data_structures::owned_slice::{OwnedSlice, slice_owned};
 use rustc_data_structures::sync::Lock;
 use rustc_data_structures::unhash::UnhashMap;
 use rustc_expand::base::{SyntaxExtension, SyntaxExtensionKind};
@@ -18,17 +18,18 @@ use rustc_expand::proc_macro::{AttrProcMacro, BangProcMacro, DeriveProcMacro};
 use rustc_hir::Safety;
 use rustc_hir::attrs::CanonicalSymbols;
 use rustc_hir::def::Res;
-use rustc_hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE};
+use rustc_hir::def_id::{CRATE_DEF_ID, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_hir::definitions::{DefPath, DefPathData};
 use rustc_hir::diagnostic_items::DiagnosticItems;
 use rustc_index::Idx;
+use rustc_middle::metadata::{MetadataDefinitionLayout, MetadataSpansId};
 use rustc_middle::middle::lib_features::LibFeatures;
 use rustc_middle::mir::interpret::{AllocDecodingSession, AllocDecodingState};
 use rustc_middle::ty::codec::TyDecoder;
 use rustc_middle::ty::{RestrictionKind, Visibility};
 use rustc_middle::{bug, implement_ty_decoder};
 use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
-use rustc_serialize::opaque::MemDecoder;
+use rustc_serialize::opaque::{MAGIC_END_BYTES, MemDecoder};
 use rustc_serialize::{Decodable, Decoder};
 use rustc_session::config::TargetModifier;
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
@@ -48,30 +49,178 @@ use crate::rmeta::*;
 
 mod cstore_impl;
 
-/// A reference to the raw binary version of crate metadata.
-/// This struct applies [`MemDecoder`]'s validation when constructed
-/// so that later constructions are guaranteed to succeed.
-pub(crate) struct MetadataBlob(OwnedSlice);
+/// A parsed region of crate metadata.
+///
+/// Construction parses the first position used from the region so later
+/// decoders can be created there infallibly.
+pub(crate) struct MetadataBlob {
+    bytes: OwnedSlice,
+}
+
+pub(crate) struct LoadedMetadata {
+    blob: MetadataBlob,
+    positions: MetadataPositions,
+}
+
+pub(crate) struct SpansArtifactSource {
+    bytes: OwnedSlice,
+    origin: SpansArtifactOrigin,
+}
+
+pub(crate) enum MetadataInput {
+    Coarse(OwnedSlice),
+    Rdr(RdrArtifactPair<OwnedSlice, SpansArtifactSource>),
+}
+
+enum SpansArtifactOrigin {
+    InMemory,
+    File { spans: PathBuf, container: PathBuf },
+}
+
+struct ParsedSpansArtifact {
+    blob: MetadataBlob,
+    root: SpansArtifactRoot,
+    id: MetadataSpansId,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub(crate) enum MetadataBlobError {
+    InvalidEncoding,
+}
 
 impl std::ops::Deref for MetadataBlob {
     type Target = [u8];
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        &self.0[..]
+        &self.bytes[..]
+    }
+}
+
+impl std::ops::Deref for LoadedMetadata {
+    type Target = MetadataBlob;
+
+    fn deref(&self) -> &MetadataBlob {
+        &self.blob
+    }
+}
+
+impl LoadedMetadata {
+    pub(crate) fn new(input: MetadataInput) -> Result<Self, MetadataBlobError> {
+        match input {
+            MetadataInput::Coarse(bytes) => {
+                if bytes.get(..MetadataFormatKind::Coarse.payload_offset()).is_none()
+                    || MemDecoder::new(&bytes, 0).is_err()
+                {
+                    return Err(MetadataBlobError::InvalidEncoding);
+                }
+                Ok(Self { blob: MetadataBlob { bytes }, positions: MetadataPositions::Coarse })
+            }
+            MetadataInput::Rdr(RdrArtifactPair { primary: bytes, spans: source }) => {
+                let Some(metadata_length) = bytes
+                    .get(RDR_METADATA_LENGTH_OFFSET..RDR_METADATA_LENGTH_OFFSET + size_of::<u64>())
+                else {
+                    return Err(MetadataBlobError::InvalidEncoding);
+                };
+                let metadata_len = u64::from_le_bytes(metadata_length.try_into().unwrap()) as usize;
+                if metadata_len
+                    .checked_add(MAGIC_END_BYTES.len())
+                    .is_none_or(|encoded_len| encoded_len != bytes.len())
+                {
+                    return Err(MetadataBlobError::InvalidEncoding);
+                }
+                if bytes.get(..MetadataFormatKind::RdrV1.payload_offset()).is_none()
+                    || MemDecoder::new(&bytes, 0).is_err()
+                {
+                    return Err(MetadataBlobError::InvalidEncoding);
+                }
+                let blob = MetadataBlob { bytes };
+                Ok(Self {
+                    blob,
+                    positions: MetadataPositions::Rdr {
+                        metadata_len,
+                        source,
+                        parsed: OnceLock::new(),
+                    },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn check_compatibility(&self, cfg_version: &'static str) -> Result<(), String> {
+        let payload_offset = match &self.positions {
+            MetadataPositions::Coarse => MetadataFormatKind::Coarse.payload_offset(),
+            MetadataPositions::Rdr { .. } => MetadataFormatKind::RdrV1.payload_offset(),
+        };
+        let found_version =
+            LazyValue::<String>::from_position(NonZero::new(payload_offset).unwrap())
+                .decode(&self.blob);
+        if rustc_version(cfg_version) != found_version {
+            return Err(found_version);
+        }
+
+        Ok(())
+    }
+}
+
+impl SpansArtifactSource {
+    pub(crate) fn in_memory(bytes: OwnedSlice) -> Self {
+        Self { bytes, origin: SpansArtifactOrigin::InMemory }
+    }
+
+    pub(crate) fn from_file(bytes: OwnedSlice, spans: PathBuf, container: PathBuf) -> Self {
+        Self { bytes, origin: SpansArtifactOrigin::File { spans, container } }
+    }
+
+    fn record_dependency(&self, tcx: TyCtxt<'_>) {
+        if let SpansArtifactOrigin::File { spans, container: _ } = &self.origin {
+            let working_dir = tcx
+                .sess
+                .source_map()
+                .working_dir()
+                .local_path()
+                .expect("the current session's working directory must have a local path");
+            let spans = spans.strip_prefix(working_dir).unwrap_or(spans);
+            tcx.sess.file_depinfo.borrow_mut().insert(Symbol::intern(&spans.to_string_lossy()));
+        }
+    }
+
+    fn container(&self) -> Option<&Path> {
+        match &self.origin {
+            SpansArtifactOrigin::InMemory => None,
+            SpansArtifactOrigin::File { spans: _, container } => Some(container),
+        }
+    }
+
+    fn parse(
+        &self,
+        metadata: &MetadataBlob,
+        metadata_len: usize,
+    ) -> Result<ParsedSpansArtifact, MetadataBlobError> {
+        let Some(header) = SpansArtifactHeader::parse(metadata_len, &self.bytes) else {
+            return Err(MetadataBlobError::InvalidEncoding);
+        };
+        let mut bytes = Vec::with_capacity(metadata_len + self.bytes.len());
+        bytes.extend_from_slice(&metadata[..metadata_len]);
+        bytes.extend_from_slice(&self.bytes);
+        let blob = MetadataBlob { bytes: slice_owned(bytes, Vec::as_slice) };
+        if MemDecoder::new(&blob, header.root_position.get()).is_err() {
+            return Err(MetadataBlobError::InvalidEncoding);
+        }
+        let root =
+            LazyValue::<SpansArtifactRoot>::from_position(header.root_position).decode(&blob);
+        Ok(ParsedSpansArtifact {
+            blob,
+            root,
+            id: MetadataSpansId::from_observed_artifact(&self.bytes),
+        })
     }
 }
 
 impl MetadataBlob {
-    /// Runs the [`MemDecoder`] validation and if it passes, constructs a new [`MetadataBlob`].
-    pub(crate) fn new(slice: OwnedSlice) -> Result<Self, ()> {
-        if MemDecoder::new(&slice, 0).is_ok() { Ok(Self(slice)) } else { Err(()) }
-    }
-
-    /// Since this has passed the validation of [`MetadataBlob::new`], this returns bytes which are
-    /// known to pass the [`MemDecoder`] validation.
+    /// The constructor parsed these bytes before making the blob available.
     pub(crate) fn bytes(&self) -> &OwnedSlice {
-        &self.0
+        &self.bytes
     }
 }
 
@@ -90,11 +239,21 @@ pub(crate) type TargetModifiers = Vec<TargetModifier>;
 /// crate.
 pub(crate) type DeniedPartialMitigations = Vec<DeniedPartialMitigation>;
 
+enum MetadataPositions {
+    Coarse,
+    Rdr {
+        metadata_len: usize,
+        source: SpansArtifactSource,
+        parsed: OnceLock<Result<ParsedSpansArtifact, MetadataBlobError>>,
+    },
+}
+
 pub(crate) struct CrateMetadata {
     /// The primary crate data - binary metadata blob.
     blob: MetadataBlob,
 
     // --- Some data pre-decoded from the metadata blob, usually for performance ---
+    positions: MetadataPositions,
     /// Data about the top-level items in a crate, as well as various crate-level metadata.
     root: CrateRoot,
     /// Trait impl data.
@@ -161,6 +320,11 @@ struct ImportedSourceFile {
     original_end_pos: rustc_span::BytePos,
     /// The imported SourceFile's representation within the local source_map
     translated_source_file: Arc<rustc_span::SourceFile>,
+}
+
+struct EncodedSourceMap<'a> {
+    table: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>,
+    blob: &'a MetadataBlob,
 }
 
 /// Decode context used when we just have a blob of metadata from which we have to decode a header
@@ -307,6 +471,19 @@ impl<'a, 'tcx> MetaDecoder for (&'a CrateMetadata, TyCtxt<'tcx>) {
             blob_decoder: self.0.blob().decoder(pos),
             cdata: self.0,
             tcx: self.1,
+            alloc_decoding_session: self.0.alloc_decoding_state.new_decoding_session(),
+        }
+    }
+}
+
+impl<'a, 'tcx> MetaDecoder for (&'a CrateMetadata, &'a MetadataBlob, TyCtxt<'tcx>) {
+    type Context = MetadataDecodeContext<'a, 'tcx>;
+
+    fn decoder(self, pos: usize) -> MetadataDecodeContext<'a, 'tcx> {
+        MetadataDecodeContext {
+            blob_decoder: self.1.decoder(pos),
+            cdata: self.0,
+            tcx: self.2,
             alloc_decoding_session: self.0.alloc_decoding_state.new_decoding_session(),
         }
     }
@@ -510,6 +687,20 @@ impl<'a, 'tcx> SpanDecoder for MetadataDecodeContext<'a, 'tcx> {
     }
 
     fn decode_span(&mut self) -> Span {
+        match &self.cdata.positions {
+            MetadataPositions::Coarse => {}
+            MetadataPositions::Rdr { .. } => {
+                let location = RdrSpanLocation::decode(self);
+                let ctxt = SyntaxContext::decode(self);
+                return match location {
+                    RdrSpanLocation::Dummy => Span::new(BytePos(0), BytePos(0), ctxt, None),
+                    RdrSpanLocation::Position(slot) => Span::new_external(
+                        rustc_span::ExternalSpanId { cnum: self.cdata.cnum, slot },
+                        ctxt,
+                    ),
+                };
+            }
+        }
         let start = self.position();
         let tag = SpanTag(self.peek_byte());
         let data = if tag.kind() == SpanKind::Indirect {
@@ -667,6 +858,12 @@ impl<'a, 'tcx> Decodable<MetadataDecodeContext<'a, 'tcx>> for SpanData {
     }
 }
 
+impl<'a, 'tcx> Decodable<MetadataDecodeContext<'a, 'tcx>> for MetadataSpanPosition {
+    fn decode(decoder: &mut MetadataDecodeContext<'a, 'tcx>) -> Self {
+        Self { lo: BytePos::decode(decoder), hi: BytePos::decode(decoder) }
+    }
+}
+
 impl<'a, 'tcx> Decodable<MetadataDecodeContext<'a, 'tcx>> for &'tcx [(ty::Clause<'tcx>, Span)] {
     fn decode(d: &mut MetadataDecodeContext<'a, 'tcx>) -> Self {
         ty::codec::RefDecodable::decode(d)
@@ -705,29 +902,8 @@ mod blob {
 }
 
 impl MetadataBlob {
-    pub(crate) fn check_compatibility(
-        &self,
-        cfg_version: &'static str,
-    ) -> Result<(), Option<String>> {
-        if !self.starts_with(METADATA_HEADER) {
-            if self.starts_with(b"rust") {
-                return Err(Some("<unknown rustc version>".to_owned()));
-            }
-            return Err(None);
-        }
-
-        let found_version =
-            LazyValue::<String>::from_position(NonZero::new(METADATA_HEADER.len() + 8).unwrap())
-                .decode(self);
-        if rustc_version(cfg_version) != found_version {
-            return Err(Some(found_version));
-        }
-
-        Ok(())
-    }
-
     fn root_pos(&self) -> NonZero<usize> {
-        let offset = METADATA_HEADER.len();
+        let offset = METADATA_ROOT_POSITION_OFFSET;
         let pos_bytes = self[offset..][..8].try_into().unwrap();
         let pos = u64::from_le_bytes(pos_bytes);
         NonZero::new(pos as usize).unwrap()
@@ -741,6 +917,26 @@ impl MetadataBlob {
     pub(crate) fn get_root(&self) -> CrateRoot {
         let pos = self.root_pos();
         LazyValue::<CrateRoot>::from_position(pos).decode(self)
+    }
+
+    pub(crate) fn definition_layout(&self, tcx: TyCtxt<'_>) -> MetadataDefinitionLayout {
+        let root = self.get_root();
+        let definition_table = tcx.untracked().definitions.freeze();
+        let crate_hash = definition_table.def_path_hash(CRATE_DEF_ID);
+
+        MetadataDefinitionLayout::from_artifact((0..root.tables.def_path_hashes.size()).map(
+            |artifact_index| {
+                let artifact_index = DefIndex::from_usize(artifact_index);
+                let local_hash = root.tables.def_path_hashes.get(self, artifact_index);
+                let hash = DefPathHash(Fingerprint::new(crate_hash.0.split().0, local_hash));
+                let def_id =
+                    definition_table.local_def_path_hash_to_def_id(hash).unwrap_or_else(|| {
+                        panic!("reused RDR metadata references a missing definition {hash:?}")
+                    });
+                (def_id, hash, tcx.opt_local_parent(def_id))
+            },
+        ))
+        .unwrap_or_else(|err| panic!("invalid definition layout in reused RDR metadata: {err:?}"))
     }
 
     pub(crate) fn list_crate_metadata(
@@ -976,7 +1172,7 @@ impl CrateRoot {
     }
 
     pub(crate) fn hash(&self) -> Svh {
-        self.header.hash
+        self.header.hash.0
     }
 
     pub(crate) fn stable_crate_id(&self) -> StableCrateId {
@@ -1699,6 +1895,10 @@ impl CrateMetadata {
     ///
     /// Proc macro crates don't currently export spans, so this function does not have
     /// to work for them.
+    fn source_map(&self) -> EncodedSourceMap<'_> {
+        EncodedSourceMap { table: self.root.source_map, blob: &self.blob }
+    }
+
     fn imported_source_file(&self, tcx: TyCtxt<'_>, source_file_index: u32) -> ImportedSourceFile {
         fn filter<'a>(
             tcx: TyCtxt<'_>,
@@ -1804,12 +2004,12 @@ impl CrateMetadata {
         }
         import_info[source_file_index as usize]
             .get_or_insert_with(|| {
-                let source_file_to_import = self
-                    .root
-                    .source_map
-                    .get(self, source_file_index)
+                let source_map = self.source_map();
+                let source_file_to_import = source_map
+                    .table
+                    .get(source_map.blob, source_file_index)
                     .expect("missing source file")
-                    .decode((self, tcx));
+                    .decode((self, source_map.blob, tcx));
 
                 // We can't reuse an existing SourceFile, so allocate a new one
                 // containing the information we need.
@@ -1940,9 +2140,25 @@ impl CrateMetadata {
 }
 
 impl CrateMetadata {
+    fn spans_artifact(&self, tcx: TyCtxt<'_>) -> &ParsedSpansArtifact {
+        let MetadataPositions::Rdr { metadata_len, source, parsed } = &self.positions else {
+            bug!("coarse metadata has no spans artifact");
+        };
+        source.record_dependency(tcx);
+        parsed.get_or_init(|| source.parse(&self.blob, *metadata_len)).as_ref().unwrap_or_else(
+            |_| {
+                let container = source
+                    .container()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<in-memory metadata>".to_owned());
+                tcx.dcx().fatal(format!("corrupt metadata encountered in {container}"))
+            },
+        )
+    }
+
     pub(crate) fn new(
         tcx: TyCtxt<'_>,
-        blob: MetadataBlob,
+        metadata: LoadedMetadata,
         root: CrateRoot,
         raw_proc_macros: Option<&'static [ProcMacroClient]>,
         cnum: CrateNum,
@@ -1952,6 +2168,7 @@ impl CrateMetadata {
         private_dep: bool,
         host_hash: Option<Svh>,
     ) -> CrateMetadata {
+        let LoadedMetadata { blob, positions } = metadata;
         let trait_impls = root
             .impls
             .decode(&blob)
@@ -1971,6 +2188,7 @@ impl CrateMetadata {
 
         let mut cdata = CrateMetadata {
             blob,
+            positions,
             root,
             trait_impls,
             incoherent_impls: Default::default(),
@@ -2113,7 +2331,7 @@ impl CrateMetadata {
     }
 
     pub(crate) fn hash(&self) -> Svh {
-        self.root.header.hash
+        self.root.header.hash.0
     }
 
     pub(crate) fn has_async_drops(&self) -> bool {

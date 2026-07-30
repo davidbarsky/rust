@@ -25,7 +25,7 @@ use rustc_hir::attrs::{
     AttributeKind, IncrementalStateAssertion, MetadataHashExpectation, RmetaExpectation,
     RustcCleanAttribute,
 };
-use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{
     Attribute, CRATE_HIR_ID, ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind,
     find_attr, intravisit,
@@ -150,7 +150,7 @@ pub(crate) fn check_clean_annotations(tcx: TyCtxt<'_>) {
             continue;
         }
 
-        let dep_node = DepNode::construct(tcx, DepKind::crate_hash, &LOCAL_CRATE);
+        let dep_node = DepNode::construct(tcx, DepKind::metadata_contract_hash, &());
         let is_green = tcx.dep_graph.is_green(&dep_node);
         let is_red = tcx.dep_graph.is_red(&dep_node);
         let matches = match metadata_hash {

@@ -12,10 +12,34 @@ use crate::diagnostics::{
     BinaryOutputToTty, FailedCopyToStdout, FailedCreateEncodedMetadata, FailedCreateFile,
     FailedCreateTempdir, FailedWriteError,
 };
-use crate::{EncodedMetadata, encode_metadata};
+use crate::rmeta::{EncodedMetadataFiles, encode_metadata};
+use crate::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair};
 
 // FIXME(eddyb) maybe include the crate name in this?
 pub const METADATA_FILENAME: &str = "lib.rmeta";
+pub const METADATA_SPANS_FILENAME: &str = "lib.spans";
+
+pub(crate) fn metadata_spans_path(path: &Path) -> PathBuf {
+    path.with_extension("spans")
+}
+
+impl RdrArtifactPair<PathBuf> {
+    /// Publishes the primary artifact only after its matching spans artifact is in place.
+    ///
+    /// The primary path is the commit point: readers that discover the new primary cannot observe
+    /// an absent spans artifact, though concurrent replacement of an existing pair is not atomic.
+    pub fn publish(&mut self, sess: &Session, primary: &Path) {
+        let spans = metadata_spans_path(primary);
+        if let Err(err) = non_durable_rename(&self.spans, &spans) {
+            sess.dcx().emit_fatal(FailedWriteError { filename: spans.clone(), err });
+        }
+        if let Err(err) = non_durable_rename(&self.primary, primary) {
+            sess.dcx().emit_fatal(FailedWriteError { filename: primary.to_path_buf(), err });
+        }
+        self.primary = primary.to_path_buf();
+        self.spans = spans;
+    }
+}
 
 /// We use a temp directory here to avoid races between concurrent rustc processes,
 /// such as builds in the same directory using the same filename for metadata while
@@ -45,7 +69,18 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
         .tempdir_in(out_filename.parent().unwrap_or_else(|| Path::new("")))
         .unwrap_or_else(|err| tcx.dcx().emit_fatal(FailedCreateTempdir { err }));
     let metadata_tmpdir = MaybeTempDir::new(metadata_tmpdir, tcx.sess.opts.cg.save_temps);
-    let metadata_filename = metadata_tmpdir.as_ref().join("full.rmeta");
+    let needs_metadata = tcx.needs_metadata();
+    let mut artifacts = if needs_metadata
+        && tcx.sess.opts.unstable_opts.rdr
+        && !tcx.crate_types().contains(&CrateType::ProcMacro)
+    {
+        EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+            primary: metadata_tmpdir.as_ref().join("full.rmeta"),
+            spans: metadata_tmpdir.as_ref().join("full.spans"),
+        })
+    } else {
+        EncodedMetadataArtifacts::Coarse(metadata_tmpdir.as_ref().join("full.rmeta"))
+    };
     let metadata_stub_filename = if !tcx.sess.opts.unstable_opts.embed_metadata
         && !tcx.crate_types().contains(&CrateType::ProcMacro)
     {
@@ -54,13 +89,18 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
         None
     };
 
-    if tcx.needs_metadata() {
-        encode_metadata(tcx, &metadata_filename, metadata_stub_filename.as_deref());
+    if needs_metadata {
+        encode_metadata(
+            tcx,
+            artifacts.as_ref().map(PathBuf::as_path),
+            metadata_stub_filename.as_deref(),
+        );
     } else {
-        // Always create a file at `metadata_filename`, even if we have nothing to write to it.
+        let metadata = artifacts.as_ref().metadata();
+        // Always create a metadata file, even if we have nothing to write to it.
         // This simplifies the creation of the output `out_filename` when requested.
-        std::fs::File::create(&metadata_filename).unwrap_or_else(|err| {
-            tcx.dcx().emit_fatal(FailedCreateFile { filename: &metadata_filename, err });
+        std::fs::File::create(metadata).unwrap_or_else(|err| {
+            tcx.dcx().emit_fatal(FailedCreateFile { filename: metadata, err });
         });
         if let Some(metadata_stub_filename) = &metadata_stub_filename {
             std::fs::File::create(metadata_stub_filename).unwrap_or_else(|err| {
@@ -71,42 +111,55 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
 
     let _prof_timer = tcx.sess.prof.generic_activity("write_crate_metadata");
 
-    // If the user requests metadata as output, rename `metadata_filename`
-    // to the expected output `out_filename`. The match above should ensure
-    // this file always exists.
+    // If the user requests metadata as output, rename it to the expected output.
     let need_metadata_file = tcx.sess.opts.output_types.contains_key(&OutputType::Metadata);
-    let (metadata_filename, metadata_tmpdir) = if need_metadata_file {
-        let filename = match out_filename {
-            OutFileName::Real(ref path) => {
-                if let Err(err) = non_durable_rename(&metadata_filename, path) {
+    let metadata_tmpdir = if need_metadata_file {
+        match (&mut artifacts, &out_filename) {
+            (EncodedMetadataArtifacts::Coarse(metadata), OutFileName::Real(path)) => {
+                if let Err(err) = non_durable_rename(metadata, path) {
                     tcx.dcx().emit_fatal(FailedWriteError { filename: path.to_path_buf(), err });
                 }
-                path.clone()
+                *metadata = path.clone();
             }
-            OutFileName::Stdout => {
+            (EncodedMetadataArtifacts::Rdr(artifacts), OutFileName::Real(path)) => {
+                artifacts.publish(tcx.sess, path);
+            }
+            (EncodedMetadataArtifacts::Coarse(metadata), OutFileName::Stdout) => {
                 if out_filename.is_tty() {
                     tcx.dcx().emit_err(BinaryOutputToTty);
-                } else if let Err(err) = copy_to_stdout(&metadata_filename) {
-                    tcx.dcx()
-                        .emit_err(FailedCopyToStdout { filename: metadata_filename.clone(), err });
+                } else if let Err(err) = copy_to_stdout(metadata) {
+                    tcx.dcx().emit_err(FailedCopyToStdout { filename: metadata.clone(), err });
                 }
-                metadata_filename
             }
-        };
+            (EncodedMetadataArtifacts::Rdr(_), OutFileName::Stdout) => {
+                tcx.dcx().fatal(
+                    "cannot write `-Zrdr` metadata to stdout because its spans artifact requires a \
+                     filesystem path",
+                );
+            }
+        }
         if tcx.sess.opts.json_artifact_notifications {
             tcx.dcx().emit_artifact_notification(out_filename.as_path(), "metadata");
+            match &artifacts {
+                EncodedMetadataArtifacts::Coarse(_) => {}
+                EncodedMetadataArtifacts::Rdr(artifacts) => {
+                    tcx.dcx().emit_artifact_notification(&artifacts.spans, "spans");
+                }
+            }
         }
-        (filename, None)
+        None
     } else {
-        (metadata_filename, Some(metadata_tmpdir))
+        Some(metadata_tmpdir)
     };
 
     // Load metadata back to memory: codegen may need to include it in object files.
-    let metadata =
-        EncodedMetadata::from_path(metadata_filename, metadata_stub_filename, metadata_tmpdir)
-            .unwrap_or_else(|err| {
-                tcx.dcx().emit_fatal(FailedCreateEncodedMetadata { err });
-            });
+    let metadata = EncodedMetadata::from_path(
+        EncodedMetadataFiles { artifacts, temp_dir: metadata_tmpdir },
+        metadata_stub_filename,
+    )
+    .unwrap_or_else(|err| {
+        tcx.dcx().emit_fatal(FailedCreateEncodedMetadata { err });
+    });
 
     metadata
 }

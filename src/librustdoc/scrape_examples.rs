@@ -327,13 +327,15 @@ pub(crate) fn run(
             }
         }
 
+        let outputs = emit_dep_info.then(|| rustc_interface::passes::prepare_outputs(tcx));
+
         // Save output to provided path
         let mut encoder = FileEncoder::new(options.output_path).map_err(|e| e.to_string())?;
         calls.encode(&mut encoder);
         encoder.finish().map_err(|(_path, e)| e.to_string())?;
 
-        if emit_dep_info {
-            rustc_interface::passes::write_dep_info(tcx);
+        if let Some(outputs) = outputs {
+            rustc_interface::passes::write_dep_info(tcx, outputs);
         }
 
         Ok(())

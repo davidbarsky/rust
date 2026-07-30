@@ -1,7 +1,6 @@
 //@ ignore-cross-compile
 //@ needs-dynamic-linking
 //@ needs-target-std
-//@ should-fail: rmake recipe failed to complete
 
 use run_make_support::{dynamic_lib_name, is_darwin, path, rust_lib_name, rustc};
 

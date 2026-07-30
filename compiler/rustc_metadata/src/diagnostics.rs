@@ -156,6 +156,13 @@ pub(crate) struct FailCreateFileEncoder {
 }
 
 #[derive(Diagnostic)]
+#[diag("failed to read `{$path}`: {$err}")]
+pub(crate) struct FailReadFile<'a> {
+    pub path: &'a Path,
+    pub err: Error,
+}
+
+#[derive(Diagnostic)]
 #[diag("failed to write to `{$path}`: {$err}")]
 pub(crate) struct FailWriteFile<'a> {
     pub path: &'a Path,

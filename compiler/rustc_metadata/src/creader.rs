@@ -39,7 +39,7 @@ use tracing::{debug, info, trace};
 use crate::diagnostics;
 use crate::locator::{CrateError, CrateLocator, CratePaths, CrateRejections};
 use crate::rmeta::{
-    CrateDep, CrateMetadata, CrateNumMap, CrateRoot, MetadataBlob, TargetModifiers,
+    CrateDep, CrateMetadata, CrateNumMap, CrateRoot, LoadedMetadata, MetadataBlob, TargetModifiers,
 };
 
 /// The backend's way to give the crate store access to the metadata in a library.
@@ -100,7 +100,7 @@ pub enum LoadedMacro {
 
 pub(crate) struct Library {
     pub source: CrateSource,
-    pub metadata: MetadataBlob,
+    pub metadata: LoadedMetadata,
 }
 
 enum LoadResult {

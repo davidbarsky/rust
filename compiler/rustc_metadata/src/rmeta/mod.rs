@@ -3,13 +3,19 @@ use std::marker::PhantomData;
 use std::num::NonZero;
 
 use decoder::LazyDecoder;
-pub(crate) use decoder::{CrateMetadata, CrateNumMap, MetadataBlob, TargetModifiers};
+pub(crate) use decoder::{
+    CrateMetadata, CrateNumMap, LoadedMetadata, MetadataBlob, MetadataBlobError, MetadataInput,
+    SpansArtifactSource, TargetModifiers,
+};
 use def_path_hash_map::DefPathHashMapRef;
 use encoder::EncodeContext;
-pub use encoder::{EncodedMetadata, encode_metadata, rendered_const};
+pub use encoder::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair, rendered_const};
+pub(crate) use encoder::{EncodedMetadataFiles, encode_metadata};
 pub(crate) use parameterized::ParameterizedOverTcx;
 use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
 use rustc_ast as ast;
+#[cfg(test)]
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::stable_hash::{
     StableCompare, StableHash as StableHashTrait, StableHashCtxt, StableHasher,
@@ -31,7 +37,8 @@ use rustc_macros::{
     TyEncodable,
 };
 use rustc_middle::metadata::{
-    AmbigModChild, DefinitionState, MetadataSpanLayout, ModChild, SelectedDefinitions,
+    AmbigModChild, DefinitionState, MetadataContractHash, MetadataDecodeLayoutId,
+    MetadataSpanLayout, ModChild, SelectedDefinitions,
 };
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
@@ -45,6 +52,7 @@ use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::util::Providers;
 use rustc_serialize::Encodable;
+use rustc_serialize::opaque::MAGIC_END_BYTES;
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
 use rustc_session::config::{SymbolManglingVersion, TargetModifier};
 use rustc_session::cstore::{CrateDepKind, ForeignModule, LinkagePreference, NativeLib};
@@ -70,12 +78,83 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
 /// the rustc version can't be found to compare with `rustc_version()`.
 const METADATA_VERSION: u8 = 10;
 
-/// Metadata header which includes `METADATA_VERSION`.
+const METADATA_ENVELOPE_VERSION: u8 = 0;
+const METADATA_ENVELOPE_LEN: usize = 8;
+pub(crate) const METADATA_ROOT_POSITION_OFFSET: usize = METADATA_ENVELOPE_LEN;
+const COARSE_METADATA_PAYLOAD_OFFSET: usize = METADATA_ENVELOPE_LEN + 8;
+const RDR_METADATA_LENGTH_OFFSET: usize = METADATA_ENVELOPE_LEN + 8;
+const RDR_METADATA_PAYLOAD_OFFSET: usize = METADATA_ENVELOPE_LEN + 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum MetadataFormatKind {
+    Coarse = 0,
+    RdrV1 = 1,
+}
+
+impl MetadataFormatKind {
+    pub(crate) const fn payload_offset(self) -> usize {
+        match self {
+            Self::Coarse => COARSE_METADATA_PAYLOAD_OFFSET,
+            Self::RdrV1 => RDR_METADATA_PAYLOAD_OFFSET,
+        }
+    }
+
+    const fn header(self) -> [u8; METADATA_ENVELOPE_LEN] {
+        [b'r', b'u', b's', b't', METADATA_ENVELOPE_VERSION, self as u8, 0, METADATA_VERSION]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataEnvelopeError {
+    Truncated,
+    InvalidMagic,
+    UnsupportedEnvelopeVersion(u8),
+    UnsupportedFormat(u8),
+    UnsupportedMetadataVersion(u8),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ParsedMetadataEnvelope<T> {
+    pub(crate) bytes: T,
+    pub(crate) format: MetadataFormatKind,
+}
+
+pub(crate) fn parse_metadata_envelope<T>(
+    bytes: T,
+) -> Result<ParsedMetadataEnvelope<T>, MetadataEnvelopeError>
+where
+    T: std::ops::Deref,
+    T::Target: AsRef<[u8]>,
+{
+    let bytes_ref = std::ops::Deref::deref(&bytes).as_ref();
+    let Some(header) = bytes_ref.get(..METADATA_ENVELOPE_LEN) else {
+        return Err(MetadataEnvelopeError::Truncated);
+    };
+    if &header[..4] != b"rust" {
+        return Err(MetadataEnvelopeError::InvalidMagic);
+    }
+    if header[4] != METADATA_ENVELOPE_VERSION {
+        return Err(MetadataEnvelopeError::UnsupportedEnvelopeVersion(header[4]));
+    }
+    let format = match header[5] {
+        0 => MetadataFormatKind::Coarse,
+        1 => MetadataFormatKind::RdrV1,
+        format => return Err(MetadataEnvelopeError::UnsupportedFormat(format)),
+    };
+    if header[7] != METADATA_VERSION {
+        return Err(MetadataEnvelopeError::UnsupportedMetadataVersion(header[7]));
+    }
+
+    Ok(ParsedMetadataEnvelope { bytes, format })
+}
+
+/// Header emitted for coarse metadata.
 ///
-/// This header is followed by the length of the compressed data, then
-/// the position of the `CrateRoot`, which is encoded as a 64-bit little-endian
-/// unsigned integer, and further followed by the rustc version string.
-pub const METADATA_HEADER: &[u8] = &[b'r', b'u', b's', b't', 0, 0, 0, METADATA_VERSION];
+/// Standalone metadata and embedded wrappers interpret the following word
+/// differently, but share this envelope so both paths use the same format
+/// dispatch.
+pub const METADATA_HEADER: &[u8] = &MetadataFormatKind::Coarse.header();
 
 /// A value of type T referred to by its absolute position
 /// in the metadata, and which can be decoded lazily.
@@ -368,6 +447,61 @@ pub enum ProcMacroKind {
     Bang { name: String },
 }
 
+#[derive(Clone, Copy, MetadataEncodable, LazyDecodable)]
+struct SpansArtifactRoot {
+    spans: LazyTable<ExternalSpanSlot, Option<LazyValue<MetadataSpanPosition>>>,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataSpanPosition {
+    lo: rustc_span::BytePos,
+    hi: rustc_span::BytePos,
+}
+
+#[derive(Clone, Copy)]
+struct SpansArtifactHeader {
+    root_position: NonZero<usize>,
+}
+
+impl SpansArtifactHeader {
+    const FORMAT: [u8; 4] = *b"RSP1";
+    const FORMAT_END: usize = Self::FORMAT.len();
+    const ROOT_POSITION_END: usize = Self::FORMAT_END + size_of::<u64>();
+    const ENCODED_LEN: usize = Self::ROOT_POSITION_END;
+
+    fn parse(metadata_len: usize, spans: &[u8]) -> Option<Self> {
+        if !spans.ends_with(MAGIC_END_BYTES) {
+            return None;
+        }
+        let encoded_len = spans.len().checked_sub(MAGIC_END_BYTES.len())?;
+        let header_start = encoded_len.checked_sub(Self::ENCODED_LEN)?;
+        let header = spans.get(header_start..encoded_len)?;
+        if header[..Self::FORMAT_END] != Self::FORMAT {
+            return None;
+        }
+        let root_position = usize::try_from(u64::from_le_bytes(
+            header[Self::FORMAT_END..Self::ROOT_POSITION_END].try_into().unwrap(),
+        ))
+        .ok()?;
+        let payload_end = metadata_len.checked_add(header_start)?;
+        if root_position < metadata_len || root_position >= payload_end {
+            return None;
+        }
+        Some(Self { root_position: NonZero::new(root_position)? })
+    }
+
+    fn to_bytes(self) -> [u8; Self::ENCODED_LEN] {
+        let mut bytes = [0; Self::ENCODED_LEN];
+        bytes[..Self::FORMAT_END].copy_from_slice(&Self::FORMAT);
+        bytes[Self::FORMAT_END..].copy_from_slice(
+            &u64::try_from(self.root_position.get())
+                .expect("metadata spans root position exceeds u64")
+                .to_le_bytes(),
+        );
+        bytes
+    }
+}
+
 /// Serialized crate metadata.
 ///
 /// This contains just enough information to determine if we should load the `CrateRoot` or not.
@@ -378,7 +512,7 @@ pub enum ProcMacroKind {
 #[derive(MetadataEncodable, BlobDecodable)]
 pub(crate) struct CrateHeader {
     pub(crate) triple: TargetTuple,
-    pub(crate) hash: Svh,
+    pub(crate) hash: MetadataContractHash,
     pub(crate) name: Symbol,
     /// Whether this is the header for a proc-macro crate.
     ///
@@ -397,7 +531,7 @@ pub(crate) struct CrateHeader {
 struct CrateHeaderRecord {
     triple: TargetTuple,
     #[stable_hash(ignore)]
-    hash: Svh,
+    hash: MetadataContractHash,
     name: Symbol,
     is_proc_macro_crate: bool,
     is_stub: bool,
@@ -498,6 +632,8 @@ impl MetadataSemanticValue for DocLinkResolutionsRecord {}
 enum PersistedProjection {
     Semantic,
     DecodeLayout,
+    Position,
+    SelfIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,7 +739,7 @@ macro_rules! define_crate_root {
             $(
                 $(#[$field_attr:meta])*
                 $field_visibility:vis $field:ident: $field_type:ty
-                    => [$($projection:ident),+],
+                    => [$($projection:ident),+] position_by $position_owner:ident,
             )+
         }
     ) => {
@@ -749,18 +885,21 @@ macro_rules! define_tables {
             - defaulted:
                 $(
                     $definition_defaulted:ident: Table<DefIndex, $definition_defaulted_value:ty>
-                        => [$($definition_defaulted_projection:ident),+],
+                        => [$($definition_defaulted_projection:ident),+]
+                            position_by $definition_defaulted_position_owner:ident,
                 )+
             - optional:
                 $(
                     $definition_optional:ident: Table<DefIndex, $definition_optional_value:ty>
-                        => [$($definition_optional_projection:ident),+],
+                        => [$($definition_optional_projection:ident),+]
+                            position_by $definition_optional_position_owner:ident,
                 )+
         - ordinal:
             - optional:
                 $(
                     $ordinal_optional:ident: Table<$ordinal_index:ty, $ordinal_optional_value:ty>
-                        => [$($ordinal_optional_projection:ident),+],
+                        => [$($ordinal_optional_projection:ident),+]
+                            position_by $ordinal_optional_position_owner:ident,
                 )+
     ) => {
         #[allow(non_camel_case_types)]
@@ -963,13 +1102,16 @@ macro_rules! define_metadata_schema {
                 $artifact:ident in [$($artifact_kind:ident),+]
                     => [$($artifact_projection:ident),+],
             )+
+        - position-passes:
+            $($position_pass:ident,)+
         - root:
             $(#[$root_attr:meta])*
             $root_visibility:vis struct $root:ident {
                 $(
                     $(#[$field_attr:meta])*
                     $field_visibility:vis $field:ident: $field_type:ty
-                        => [$($field_projection:ident),+],
+                        => [$($field_projection:ident),+]
+                            position_by $field_position_owner:ident,
                 )+
             }
         - tables:
@@ -978,20 +1120,23 @@ macro_rules! define_metadata_schema {
                     $(
                         $definition_defaulted:ident:
                             Table<DefIndex, $definition_defaulted_value:ty>
-                            => [$($definition_defaulted_projection:ident),+],
+                            => [$($definition_defaulted_projection:ident),+]
+                                position_by $definition_defaulted_position_owner:ident,
                     )+
                 - optional:
                     $(
                         $definition_optional:ident:
                             Table<DefIndex, $definition_optional_value:ty>
-                            => [$($definition_optional_projection:ident),+],
+                            => [$($definition_optional_projection:ident),+]
+                                position_by $definition_optional_position_owner:ident,
                     )+
             - ordinal:
                 - optional:
                     $(
                         $ordinal_optional:ident:
                             Table<$ordinal_index:ty, $ordinal_optional_value:ty>
-                            => [$($ordinal_optional_projection:ident),+],
+                            => [$($ordinal_optional_projection:ident),+]
+                                position_by $ordinal_optional_position_owner:ident,
                     )+
     ) => {
         define_artifact_records! {
@@ -1007,7 +1152,8 @@ macro_rules! define_metadata_schema {
                 $(
                     $(#[$field_attr])*
                     $field_visibility $field: $field_type
-                        => [$($field_projection),+],
+                        => [$($field_projection),+]
+                            position_by $field_position_owner,
                 )+
             }
         }
@@ -1017,18 +1163,21 @@ macro_rules! define_metadata_schema {
                 - defaulted:
                     $(
                         $definition_defaulted: Table<DefIndex, $definition_defaulted_value>
-                            => [$($definition_defaulted_projection),+],
+                            => [$($definition_defaulted_projection),+]
+                                position_by $definition_defaulted_position_owner,
                     )+
                 - optional:
                     $(
                         $definition_optional: Table<DefIndex, $definition_optional_value>
-                            => [$($definition_optional_projection),+],
+                            => [$($definition_optional_projection),+]
+                                position_by $definition_optional_position_owner,
                     )+
             - ordinal:
                 - optional:
                     $(
                         $ordinal_optional: Table<$ordinal_index, $ordinal_optional_value>
-                            => [$($ordinal_optional_projection),+],
+                            => [$($ordinal_optional_projection),+]
+                                position_by $ordinal_optional_position_owner,
                     )+
         }
 
@@ -1037,6 +1186,15 @@ macro_rules! define_metadata_schema {
             Artifact(PersistedArtifactRecord),
             CrateRoot(PersistedCrateRootField),
             Table(PersistedTable),
+        }
+
+        macro_rules! projections_for_position_owner {
+            (none, $projections:expr) => {
+                $projections
+            };
+            ($owner:ident, $projections:expr) => {
+                $projections.with(PersistedProjection::Position)
+            };
         }
 
         impl PersistedRecord {
@@ -1052,33 +1210,109 @@ macro_rules! define_metadata_schema {
                 match self {
                     Self::Artifact(record) => record.projections(),
                     $(
-                        Self::CrateRoot(PersistedCrateRootField::$field) =>
-                            persisted_projections!($($field_projection),+),
+                        Self::CrateRoot(PersistedCrateRootField::$field) => {
+                            projections_for_position_owner!(
+                                $field_position_owner,
+                                persisted_projections!($($field_projection),+)
+                            )
+                        },
                     )+
                     $(
-                        Self::Table(PersistedTable::$definition_defaulted) =>
-                            persisted_projections!($($definition_defaulted_projection),+),
+                        Self::Table(PersistedTable::$definition_defaulted) => {
+                            projections_for_position_owner!(
+                                $definition_defaulted_position_owner,
+                                persisted_projections!(
+                                    $($definition_defaulted_projection),+
+                                )
+                            )
+                        },
                     )+
                     $(
-                        Self::Table(PersistedTable::$definition_optional) =>
-                            persisted_projections!($($definition_optional_projection),+),
+                        Self::Table(PersistedTable::$definition_optional) => {
+                            projections_for_position_owner!(
+                                $definition_optional_position_owner,
+                                persisted_projections!(
+                                    $($definition_optional_projection),+
+                                )
+                            )
+                        },
                     )+
                     $(
-                        Self::Table(PersistedTable::$ordinal_optional) =>
-                            persisted_projections!($($ordinal_optional_projection),+),
+                        Self::Table(PersistedTable::$ordinal_optional) => {
+                            projections_for_position_owner!(
+                                $ordinal_optional_position_owner,
+                                persisted_projections!(
+                                    $($ordinal_optional_projection),+
+                                )
+                            )
+                        },
                     )+
                 }
             }
         }
+
+        #[allow(non_camel_case_types)]
+        #[repr(u8)]
+        enum PositionPass {
+            $($position_pass,)+
+        }
+
+        macro_rules! position_pass {
+            (none) => {
+                Option::<PositionPass>::None
+            };
+            ($owner:ident) => {
+                Some(PositionPass::$owner)
+            };
+        }
+
+        const _: () = {
+            let mut used = [false; [$(PositionPass::$position_pass,)+].len()];
+            $(
+                if let Some(pass) = position_pass!($field_position_owner) {
+                    used[pass as usize] = true;
+                }
+            )+
+            $(
+                if let Some(pass) = position_pass!($definition_defaulted_position_owner) {
+                    used[pass as usize] = true;
+                }
+            )+
+            $(
+                if let Some(pass) = position_pass!($definition_optional_position_owner) {
+                    used[pass as usize] = true;
+                }
+            )+
+            $(
+                if let Some(pass) = position_pass!($ordinal_optional_position_owner) {
+                    used[pass as usize] = true;
+                }
+            )+
+            let mut index = 0;
+            while index < used.len() {
+                assert!(used[index], "metadata position pass owns no records");
+                index += 1;
+            }
+        };
 
         impl MetadataArtifactKind {
             fn contains(self, record: PersistedRecord) -> bool {
                 match record {
                     PersistedRecord::Artifact(record) => record.artifacts().contains(&self),
                     PersistedRecord::CrateRoot(_) | PersistedRecord::Table(_) => match self {
-                        Self::Full => true,
-                        Self::Stub => false,
+                        Self::Full | Self::RdrMetadata => true,
+                        Self::Spans | Self::Stub => false,
                     },
+                }
+            }
+        }
+
+        macro_rules! define_position_traversal {
+            () => {
+                impl EncodeContext<'_, '_> {
+                    fn encode_position_records(&mut self) {
+                        $(let _ = self.$position_pass();)+
+                    }
                 }
             }
         }
@@ -1087,10 +1321,18 @@ macro_rules! define_metadata_schema {
 
 define_metadata_schema! {
 - artifacts:
-    metadata_header in [Full, Stub] => [DecodeLayout],
-    root_position in [Full, Stub] => [DecodeLayout],
-    rustc_version in [Full, Stub] => [DecodeLayout],
+    metadata_header in [Full, RdrMetadata, Stub] => [DecodeLayout],
+    root_position in [Full, RdrMetadata, Stub] => [DecodeLayout],
+    rustc_version in [Full, RdrMetadata, Stub] => [DecodeLayout],
+    spans in [Full, Spans] => [Position],
     stub_crate_header in [Stub] => [Semantic, DecodeLayout],
+- position-passes:
+    encode_externally_implementable_items,
+    encode_stripped_cfg_items,
+    encode_native_libraries,
+    encode_def_ids,
+    encode_hygiene,
+    encode_proc_macros,
 - root:
 /// Serialized `.rmeta` data for a crate.
 ///
@@ -1112,255 +1354,258 @@ define_metadata_schema! {
 #[derive(LazyDecodable)]
 pub(crate) struct CrateRoot {
     /// A header used to detect if this is the right crate to load.
-    header: CrateHeader => [Semantic],
+    header: CrateHeader => [Semantic] position_by none,
+    metadata_decode_layout_id: MetadataDecodeLayoutId => [SelfIdentity] position_by none,
 
-    extra_filename: String => [DecodeLayout],
-    stable_crate_id: StableCrateId => [Semantic, DecodeLayout],
-    required_panic_strategy: Option<PanicStrategy> => [Semantic],
-    panic_in_drop_strategy: PanicStrategy => [Semantic],
-    edition: Edition => [Semantic],
-    has_global_allocator: bool => [Semantic],
-    has_alloc_error_handler: bool => [Semantic],
-    has_panic_handler: bool => [Semantic],
-    has_default_lib_allocator: bool => [Semantic],
+    extra_filename: String => [DecodeLayout] position_by none,
+    stable_crate_id: StableCrateId => [Semantic, DecodeLayout] position_by none,
+    required_panic_strategy: Option<PanicStrategy> => [Semantic] position_by none,
+    panic_in_drop_strategy: PanicStrategy => [Semantic] position_by none,
+    edition: Edition => [Semantic] position_by none,
+    has_global_allocator: bool => [Semantic] position_by none,
+    has_alloc_error_handler: bool => [Semantic] position_by none,
+    has_panic_handler: bool => [Semantic] position_by none,
+    has_default_lib_allocator: bool => [Semantic] position_by none,
     externally_implementable_items: LazyArray<EiiMapEncodedKeyValue>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_externally_implementable_items,
 
-    crate_deps: LazyArray<CrateDep> => [Semantic, DecodeLayout],
-    dylib_dependency_formats: LazyArray<Option<LinkagePreference>> => [Semantic, DecodeLayout],
-    lib_features: LazyArray<(Symbol, FeatureStability)> => [Semantic, DecodeLayout],
-    stability_implications: LazyArray<(Symbol, Symbol)> => [Semantic, DecodeLayout],
-    lang_items: LazyArray<(DefIndex, LangItem)> => [Semantic, DecodeLayout],
-    lang_items_missing: LazyArray<LangItem> => [Semantic, DecodeLayout],
+    crate_deps: LazyArray<CrateDep> => [Semantic, DecodeLayout] position_by none,
+    dylib_dependency_formats: LazyArray<Option<LinkagePreference>> => [Semantic, DecodeLayout] position_by none,
+    lib_features: LazyArray<(Symbol, FeatureStability)> => [Semantic, DecodeLayout] position_by none,
+    stability_implications: LazyArray<(Symbol, Symbol)> => [Semantic, DecodeLayout] position_by none,
+    lang_items: LazyArray<(DefIndex, LangItem)> => [Semantic, DecodeLayout] position_by none,
+    lang_items_missing: LazyArray<LangItem> => [Semantic, DecodeLayout] position_by none,
     stripped_cfg_items: LazyArray<StrippedCfgItem<DefIndex>>
-        => [Semantic, DecodeLayout],
-    diagnostic_items: LazyArray<(Symbol, DefIndex)> => [Semantic, DecodeLayout],
-    canonical_symbols: LazyArray<(Symbol, DefIndex)> => [Semantic, DecodeLayout],
-    native_libraries: LazyArray<NativeLib> => [Semantic, DecodeLayout],
-    foreign_modules: LazyArray<ForeignModule> => [Semantic, DecodeLayout],
-    traits: LazyArray<DefIndex> => [Semantic, DecodeLayout],
-    impls: LazyArray<TraitImpls> => [Semantic, DecodeLayout],
-    incoherent_impls: LazyArray<IncoherentImpls> => [Semantic, DecodeLayout],
-    interpret_alloc_index: LazyArray<u64> => [DecodeLayout],
-    proc_macro_data: Option<ProcMacroData> => [DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_stripped_cfg_items,
+    diagnostic_items: LazyArray<(Symbol, DefIndex)> => [Semantic, DecodeLayout] position_by none,
+    canonical_symbols: LazyArray<(Symbol, DefIndex)> => [Semantic, DecodeLayout] position_by none,
+    native_libraries: LazyArray<NativeLib>
+        => [Semantic, DecodeLayout] position_by encode_native_libraries,
+    foreign_modules: LazyArray<ForeignModule> => [Semantic, DecodeLayout] position_by none,
+    traits: LazyArray<DefIndex> => [Semantic, DecodeLayout] position_by none,
+    impls: LazyArray<TraitImpls> => [Semantic, DecodeLayout] position_by none,
+    incoherent_impls: LazyArray<IncoherentImpls> => [Semantic, DecodeLayout] position_by none,
+    interpret_alloc_index: LazyArray<u64> => [DecodeLayout] position_by none,
+    proc_macro_data: Option<ProcMacroData> => [DecodeLayout] position_by none,
 
-    tables: LazyTables => [DecodeLayout],
-    debugger_visualizers: LazyArray<DebuggerVisualizerFile> => [Semantic, DecodeLayout],
+    tables: LazyTables => [DecodeLayout] position_by none,
+    debugger_visualizers: LazyArray<DebuggerVisualizerFile> => [Semantic, DecodeLayout] position_by none,
 
-    exportable_items: LazyArray<DefIndex> => [Semantic, DecodeLayout],
-    stable_order_of_exportable_impls: LazyArray<(DefIndex, usize)> => [Semantic, DecodeLayout],
+    exportable_items: LazyArray<DefIndex> => [Semantic, DecodeLayout] position_by none,
+    stable_order_of_exportable_impls: LazyArray<(DefIndex, usize)> => [Semantic, DecodeLayout] position_by none,
     exported_non_generic_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     exported_generic_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
 
-    syntax_contexts: SyntaxContextTable => [Semantic, DecodeLayout],
-    expn_data: ExpnDataTable => [Semantic, DecodeLayout],
-    expn_hashes: ExpnHashTable => [Semantic, DecodeLayout],
+    syntax_contexts: SyntaxContextTable
+        => [Semantic, DecodeLayout] position_by encode_hygiene,
+    expn_data: ExpnDataTable => [Semantic, DecodeLayout] position_by encode_hygiene,
+    expn_hashes: ExpnHashTable => [Semantic, DecodeLayout] position_by none,
 
-    def_path_hash_map: LazyValue<DefPathHashMapRef<'static>> => [DecodeLayout],
+    def_path_hash_map: LazyValue<DefPathHashMapRef<'static>> => [DecodeLayout] position_by none,
 
-    source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>> => [DecodeLayout],
-    target_modifiers: LazyArray<TargetModifier> => [Semantic, DecodeLayout],
-    denied_partial_mitigations: LazyArray<DeniedPartialMitigation> => [Semantic, DecodeLayout],
+    source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>> => [DecodeLayout] position_by none,
+    target_modifiers: LazyArray<TargetModifier> => [Semantic, DecodeLayout] position_by none,
+    denied_partial_mitigations: LazyArray<DeniedPartialMitigation> => [Semantic, DecodeLayout] position_by none,
 
-    compiler_builtins: bool => [Semantic],
-    needs_allocator: bool => [Semantic],
-    needs_panic_runtime: bool => [Semantic],
-    no_builtins: bool => [Semantic],
-    panic_runtime: bool => [Semantic],
-    profiler_runtime: bool => [Semantic],
-    symbol_mangling_version: SymbolManglingVersion => [Semantic],
+    compiler_builtins: bool => [Semantic] position_by none,
+    needs_allocator: bool => [Semantic] position_by none,
+    needs_panic_runtime: bool => [Semantic] position_by none,
+    no_builtins: bool => [Semantic] position_by none,
+    panic_runtime: bool => [Semantic] position_by none,
+    profiler_runtime: bool => [Semantic] position_by none,
+    symbol_mangling_version: SymbolManglingVersion => [Semantic] position_by none,
 
-    specialization_enabled_in: bool => [Semantic],
+    specialization_enabled_in: bool => [Semantic] position_by none,
 }
 - tables:
 - definition:
 - defaulted:
     intrinsic: Table<DefIndex, Option<LazyValue<ty::IntrinsicDef>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     is_macro_rules: Table<DefIndex, bool>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     type_alias_is_checked: Table<DefIndex, bool>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     attr_flags: Table<DefIndex, AttrFlags>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     // The u64 is the crate-local part of the DefPathHash. All hashes in this crate have the same
     // StableCrateId, so we omit encoding those into the table.
     //
     // Note also that this table is fully populated (no gaps) as every DefIndex should have a
     // corresponding DefPathHash.
     def_path_hashes: Table<DefIndex, u64>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     explicit_item_bounds: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     explicit_item_self_bounds: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     inferred_outlives_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     explicit_super_clauses_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     explicit_implied_clauses_of: Table<DefIndex, LazyArray<(ty::Clause<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     explicit_implied_const_bounds: Table<DefIndex, LazyArray<(ty::PolyTraitRef<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     inherent_impls: Table<DefIndex, LazyArray<DefIndex>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     opt_rpitit_info: Table<DefIndex, Option<LazyValue<ty::ImplTraitInTraitData>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     // Reexported names are not associated with individual `DefId`s,
     // e.g. a glob import can introduce a lot of names, all with the same `DefId`.
     // That's why the encoded list needs to contain `ModChild` structures describing all the names
     // individually instead of `DefId`s.
     module_children_reexports: Table<DefIndex, LazyArray<ModChild>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     ambig_module_children: Table<DefIndex, LazyArray<AmbigModChild>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     cross_crate_inlinable: Table<DefIndex, bool>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     asyncness: Table<DefIndex, ty::Asyncness>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     constness: Table<DefIndex, hir::Constness>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     safety: Table<DefIndex, hir::Safety>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     defaultness: Table<DefIndex, hir::Defaultness>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     impl_is_fully_generic_for_reflection: Table<DefIndex, bool>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
 
 - optional:
     attributes: Table<DefIndex, LazyArray<hir::Attribute>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     // For non-reexported names in a module every name is associated with a separate `DefId`,
     // so we can take their names, visibilities etc from other encoded tables.
     module_children_non_reexports: Table<DefIndex, LazyArray<DefIndex>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     associated_item_or_field_def_ids: Table<DefIndex, LazyArray<DefIndex>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     def_kind: Table<DefIndex, DefKind>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     visibility: Table<DefIndex, LazyValue<ty::Visibility<DefIndex>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     def_span: Table<DefIndex, LazyValue<Span>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     def_ident_span: Table<DefIndex, LazyValue<Span>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     lookup_stability: Table<DefIndex, LazyValue<hir::Stability>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     lookup_const_stability: Table<DefIndex, LazyValue<hir::ConstStability>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     lookup_default_body_stability: Table<DefIndex, LazyValue<hir::DefaultBodyStability>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     lookup_deprecation_entry: Table<DefIndex, LazyValue<attrs::Deprecation>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     explicit_clauses_of: Table<DefIndex, LazyValue<ty::GenericClauses<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     generics_of: Table<DefIndex, LazyValue<ty::Generics>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     type_of: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, Ty<'static>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     variances_of: Table<DefIndex, LazyArray<ty::Variance>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     fn_sig: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::PolyFnSig<'static>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     codegen_fn_attrs: Table<DefIndex, LazyValue<CodegenFnAttrs>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     impl_trait_header: Table<DefIndex, LazyValue<ty::ImplTraitHeader<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     const_param_default: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, rustc_middle::ty::Const<'static>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     object_lifetime_default: Table<DefIndex, LazyValue<ObjectLifetimeDefault>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     optimized_mir: Table<DefIndex, LazyValue<mir::Body<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     mir_for_ctfe: Table<DefIndex, LazyValue<mir::Body<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     trivial_const: Table<DefIndex, LazyValue<(ConstValue, Ty<'static>)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     closure_saved_names_of_captured_variables: Table<DefIndex, LazyValue<IndexVec<FieldIdx, Symbol>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     mir_coroutine_witnesses: Table<DefIndex, LazyValue<mir::CoroutineLayout<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     promoted_mir: Table<DefIndex, LazyValue<IndexVec<mir::Promoted, mir::Body<'static>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     thir_abstract_const: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     impl_parent: Table<DefIndex, RawDefId>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     const_conditions: Table<DefIndex, LazyValue<ty::ConstConditions<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     // FIXME(eddyb) perhaps compute this on the fly if cheap enough?
     coerce_unsized_info: Table<DefIndex, LazyValue<ty::adjustment::CoerceUnsizedInfo>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     mir_const_qualif: Table<DefIndex, LazyValue<mir::ConstQualifs>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     rendered_const: Table<DefIndex, LazyValue<String>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     rendered_precise_capturing_args: Table<DefIndex, LazyArray<PreciseCapturingArgKind<Symbol, Symbol>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     fn_arg_idents: Table<DefIndex, LazyArray<Option<Ident>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     coroutine_kind: Table<DefIndex, hir::CoroutineKind>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     coroutine_for_closure: Table<DefIndex, RawDefId>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     adt_destructor: Table<DefIndex, LazyValue<ty::Destructor>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     adt_async_destructor: Table<DefIndex, LazyValue<ty::AsyncDestructor>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     coroutine_by_move_body_def_id: Table<DefIndex, RawDefId>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     eval_static_initializer: Table<DefIndex, LazyValue<mir::interpret::ConstAllocation<'static>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     trait_def: Table<DefIndex, LazyValue<ty::TraitDef>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     expn_that_defined: Table<DefIndex, LazyValue<ExpnId>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     default_fields: Table<DefIndex, LazyValue<DefId>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     params_in_repr: Table<DefIndex, LazyValue<DenseBitSet<u32>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     repr_options: Table<DefIndex, LazyValue<ReprOptions>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     // `def_keys` and `def_path_hashes` represent a lazy version of a
     // `DefPathTable`. This allows us to avoid deserializing an entire
     // `DefPathTable` up front, since we may only ever use a few
     // definitions from any given crate.
     def_keys: Table<DefIndex, LazyValue<DefKey>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     variant_data: Table<DefIndex, LazyValue<VariantData>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     assoc_container: Table<DefIndex, LazyValue<ty::AssocContainer>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     macro_definition: Table<DefIndex, LazyValue<ast::DelimArgs>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     deduced_param_attrs: Table<DefIndex, LazyArray<DeducedParamAttrs>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     collect_return_position_impl_trait_in_trait_tys: Table<DefIndex, LazyValue<DefIdMap<ty::EarlyBinder<'static, Ty<'static>>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     doc_link_resolutions: Table<DefIndex, LazyValue<DocLinkResMap>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     doc_link_traits_in_scope: Table<DefIndex, LazyArray<DefId>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     assumed_wf_types_for_rpitit: Table<DefIndex, LazyArray<(Ty<'static>, Span)>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_def_ids,
     opaque_ty_origin: Table<DefIndex, LazyValue<hir::OpaqueTyOrigin<DefId>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     anon_const_kind: Table<DefIndex, LazyValue<ty::AnonConstKind>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     const_of_item: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     associated_types_for_impl_traits_in_trait_or_impl: Table<DefIndex, LazyValue<DefIdMap<Vec<DefId>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     args_known_to_outlive_alias_params: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, Vec<(ty::Region<'static>, Vec<ty::GenericArg<'static>>)>>>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
     mut_restriction: Table<DefIndex, LazyValue<ty::RestrictionKind>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by none,
 - ordinal:
 - optional:
     proc_macro_quoted_spans: Table<usize, LazyValue<Span>>
-        => [Semantic, DecodeLayout],
+        => [Semantic, DecodeLayout] position_by encode_proc_macros,
 }
 
 mod encoder;
@@ -1436,6 +1681,8 @@ impl SpanLayout {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MetadataArtifactKind {
     Full,
+    RdrMetadata,
+    Spans,
     Stub,
 }
 
@@ -1446,7 +1693,7 @@ impl PersistedRecord {
             Self::CrateRoot(field) => field.name(),
             Self::Table(table) => table.name(),
         }
-}
+    }
 }
 
 #[derive(TyEncodable, TyDecodable)]
@@ -1561,7 +1808,7 @@ pub fn provide(providers: &mut Providers) {
 }
 
 #[cfg(test)]
-use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::owned_slice::slice_owned;
 #[cfg(test)]
 use rustc_hir::def_id::CRATE_DEF_ID;
 #[cfg(test)]
@@ -1581,6 +1828,157 @@ macro_rules! assert_not_metadata_semantic_value {
 
         let _ = <$ty as AmbiguousIfSemantic<_>>::assert;
     }};
+}
+
+#[test]
+fn parses_coarse_metadata_envelope() {
+    let bytes = [
+        b'r',
+        b'u',
+        b's',
+        b't',
+        METADATA_ENVELOPE_VERSION,
+        MetadataFormatKind::Coarse as u8,
+        0,
+        METADATA_VERSION,
+    ];
+
+    assert_eq!(parse_metadata_envelope(&bytes).unwrap().format, MetadataFormatKind::Coarse);
+    assert_eq!(METADATA_ROOT_POSITION_OFFSET, bytes.len());
+    assert_eq!(MetadataFormatKind::Coarse.payload_offset(), bytes.len() + 8);
+}
+
+#[test]
+fn parses_rdr_metadata_envelope_without_payload() {
+    let bytes = [
+        b'r',
+        b'u',
+        b's',
+        b't',
+        METADATA_ENVELOPE_VERSION,
+        MetadataFormatKind::RdrV1 as u8,
+        0,
+        METADATA_VERSION,
+    ];
+
+    assert_eq!(parse_metadata_envelope(&bytes).unwrap().format, MetadataFormatKind::RdrV1);
+}
+
+#[test]
+fn rejects_truncated_rdr_spans_artifact() {
+    let spans = vec![0; SpansArtifactHeader::ENCODED_LEN + MAGIC_END_BYTES.len() - 1];
+
+    assert!(SpansArtifactHeader::parse(24, &spans).is_none());
+}
+
+#[test]
+fn rejects_unrecognized_rdr_spans_artifact_format() {
+    let mut spans = vec![0; SpansArtifactHeader::ENCODED_LEN];
+    spans[..SpansArtifactHeader::FORMAT_END].copy_from_slice(b"RSP0");
+    spans.extend_from_slice(MAGIC_END_BYTES);
+
+    assert!(SpansArtifactHeader::parse(24, &spans).is_none());
+}
+
+#[test]
+fn rejects_rdr_spans_artifact_without_end_marker() {
+    let spans = SpansArtifactHeader { root_position: NonZero::new(25).unwrap() }.to_bytes();
+
+    assert!(SpansArtifactHeader::parse(24, &spans).is_none());
+}
+
+#[test]
+fn rejects_out_of_bounds_rdr_spans_artifact_root() {
+    let mut spans = SpansArtifactHeader { root_position: NonZero::new(usize::MAX).unwrap() }
+        .to_bytes()
+        .to_vec();
+    spans.extend_from_slice(MAGIC_END_BYTES);
+
+    assert!(SpansArtifactHeader::parse(24, &spans).is_none());
+}
+
+#[test]
+fn parses_rdr_spans_artifact_header() {
+    let mut spans = vec![0; 8];
+    spans.extend_from_slice(
+        &SpansArtifactHeader { root_position: NonZero::new(28).unwrap() }.to_bytes(),
+    );
+    spans.extend_from_slice(MAGIC_END_BYTES);
+
+    assert_eq!(SpansArtifactHeader::parse(24, &spans).unwrap().root_position.get(), 28);
+}
+
+#[test]
+fn rejects_rdr_metadata_with_an_out_of_bounds_metadata_length() {
+    let mut primary = MetadataFormatKind::RdrV1.header().to_vec();
+    primary.extend_from_slice(&0u64.to_le_bytes());
+    primary.extend_from_slice(&u64::MAX.to_le_bytes());
+    primary.extend_from_slice(MAGIC_END_BYTES);
+    let input = MetadataInput::Rdr(RdrArtifactPair {
+        primary: slice_owned(primary, Vec::as_slice),
+        spans: SpansArtifactSource::in_memory(slice_owned(Vec::new(), Vec::as_slice)),
+    });
+
+    assert!(matches!(LoadedMetadata::new(input), Err(MetadataBlobError::InvalidEncoding)));
+}
+
+#[test]
+fn rejects_unknown_metadata_format() {
+    let bytes = [b'r', b'u', b's', b't', METADATA_ENVELOPE_VERSION, 17, 0, METADATA_VERSION];
+
+    assert_eq!(parse_metadata_envelope(&bytes), Err(MetadataEnvelopeError::UnsupportedFormat(17)));
+}
+
+#[test]
+fn rejects_unknown_metadata_envelope_version() {
+    let bytes = [
+        b'r',
+        b'u',
+        b's',
+        b't',
+        METADATA_ENVELOPE_VERSION + 1,
+        MetadataFormatKind::Coarse as u8,
+        0,
+        METADATA_VERSION,
+    ];
+
+    assert_eq!(
+        parse_metadata_envelope(&bytes),
+        Err(MetadataEnvelopeError::UnsupportedEnvelopeVersion(METADATA_ENVELOPE_VERSION + 1))
+    );
+}
+
+#[test]
+fn rejects_truncated_metadata_envelope() {
+    assert_eq!(parse_metadata_envelope(b"rust"), Err(MetadataEnvelopeError::Truncated));
+}
+
+#[test]
+fn table_inventory_distinguishes_identity_from_position_data() {
+    let def_path_hashes = PersistedRecord::Table(PersistedTable::def_path_hashes).projections();
+    assert!(def_path_hashes.contains(PersistedProjection::Semantic));
+    assert!(def_path_hashes.contains(PersistedProjection::DecodeLayout));
+    assert!(!def_path_hashes.contains(PersistedProjection::Position));
+
+    let def_span = PersistedRecord::Table(PersistedTable::def_span).projections();
+    assert!(def_span.contains(PersistedProjection::Semantic));
+    assert!(def_span.contains(PersistedProjection::DecodeLayout));
+    assert!(def_span.contains(PersistedProjection::Position));
+}
+
+#[test]
+fn identity_fields_are_explicitly_excluded_from_their_own_projection() {
+    let header = PersistedRecord::CrateRoot(PersistedCrateRootField::header).projections();
+    assert!(header.contains(PersistedProjection::Semantic));
+    assert!(!header.contains(PersistedProjection::DecodeLayout));
+    assert!(!header.contains(PersistedProjection::SelfIdentity));
+
+    let decode_layout_id =
+        PersistedRecord::CrateRoot(PersistedCrateRootField::metadata_decode_layout_id)
+            .projections();
+    assert!(!decode_layout_id.contains(PersistedProjection::Semantic));
+    assert!(!decode_layout_id.contains(PersistedProjection::DecodeLayout));
+    assert!(decode_layout_id.contains(PersistedProjection::SelfIdentity));
 }
 
 #[test]
@@ -1626,6 +2024,54 @@ fn wire_bytes_do_not_enter_the_semantic_projection() {
 
     assert_eq!(original_contract, moved_contract);
     assert_ne!(original_decode_layout, moved_decode_layout);
+}
+
+#[test]
+fn spans_wire_bytes_do_not_enter_metadata_identity() {
+    let key = MetadataRecordKey {
+        record: PersistedRecord::Artifact(PersistedArtifactRecord::spans),
+        owner: None,
+    };
+    let mut original = MetadataProjectionEncoder::new();
+    original.enter(key, SemanticRecordMembership::Included);
+    original.record_wire_bytes(key, b"1:1");
+    let (original_contract, original_decode_layout) = original.finish();
+    let mut moved = MetadataProjectionEncoder::new();
+    moved.enter(key, SemanticRecordMembership::Included);
+    moved.record_wire_bytes(key, b"20:4");
+    let (moved_contract, moved_decode_layout) = moved.finish();
+
+    assert_eq!(original_contract, moved_contract);
+    assert_eq!(original_decode_layout, moved_decode_layout);
+}
+
+#[test]
+fn emitted_identity_values_do_not_hash_themselves() {
+    let header = MetadataRecordKey {
+        record: PersistedRecord::CrateRoot(PersistedCrateRootField::header),
+        owner: None,
+    };
+    let decode_layout = MetadataRecordKey {
+        record: PersistedRecord::CrateRoot(PersistedCrateRootField::metadata_decode_layout_id),
+        owner: None,
+    };
+    let mut projected = MetadataProjectionEncoder::new();
+    projected.enter(header, SemanticRecordMembership::Included);
+    projected.record_semantic(header, Fingerprint::new(1, 2));
+    projected.record_wire_bytes(header, b"placeholder contract");
+    projected.enter(decode_layout, SemanticRecordMembership::Included);
+    projected.record_wire_bytes(decode_layout, b"placeholder layout");
+    let (projected_contract, projected_decode_layout) = projected.finish();
+    let mut emitted = MetadataProjectionEncoder::new();
+    emitted.enter(header, SemanticRecordMembership::Included);
+    emitted.record_semantic(header, Fingerprint::new(1, 2));
+    emitted.record_wire_bytes(header, b"converged contract");
+    emitted.enter(decode_layout, SemanticRecordMembership::Included);
+    emitted.record_wire_bytes(decode_layout, b"converged layout");
+    let (emitted_contract, emitted_decode_layout) = emitted.finish();
+
+    assert_eq!(projected_contract, emitted_contract);
+    assert_eq!(projected_decode_layout, emitted_decode_layout);
 }
 
 #[test]

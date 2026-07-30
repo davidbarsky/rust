@@ -1,5 +1,5 @@
 //@ revisions: bpass1 bpass2
-//@ should-fail: auxiliary build of {{cwd}}/tests/incremental/rdr/transitive-span-owner/auxiliary/a_second.rs failed to compile:
+//@ should-fail: expected RDR artifact bytes to change: `{{build-base}}/rdr/transitive-span-owner/main/auxiliary/liba.source-bundle/a.rs`
 //@ aux-build: b.rs
 //@ proc-macro: ../../auxiliary/location.rs
 //@ compile-flags: -Zquery-dep-graph -Zrdr

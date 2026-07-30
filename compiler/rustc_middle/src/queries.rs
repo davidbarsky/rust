@@ -2036,13 +2036,13 @@ rustc_queries! {
 
     /// Hashes the cross-crate semantic contract emitted in metadata.
     ///
-    /// Unlike [`Self::crate_hash`], this remains stable when an edit changes no metadata visible to
-    /// downstream crates. Artifact-local addressing has a separate decode-layout identity.
+    /// This differs from [`Self::crate_hash`] under RDR because local artifact identity must still
+    /// change for implementation-only edits that downstream metadata does not expose.
     query metadata_contract_hash(_: ()) -> crate::metadata::MetadataContractHash {
         desc { "computing the metadata contract hash" }
     }
 
-    /// Computes closed metadata membership, compact addresses, and coordinate-free identities.
+    /// Projects metadata membership, compact addresses, and identities on one encoder pass.
     query metadata_projection(_: ()) -> &'tcx crate::metadata::MetadataProjection {
         arena_cache
         desc { "projecting the metadata schema" }
@@ -2068,6 +2068,20 @@ rustc_queries! {
         eval_always
         desc { "computing the metadata decode-layout identity" }
         separate_provide_extern
+    }
+
+    /// Gives external-span decoding its own incremental dependency.
+    query metadata_spans_id(_: CrateNum) -> crate::metadata::MetadataSpansId {
+        eval_always
+        desc { "looking up the metadata spans identity" }
+        separate_provide_extern
+    }
+
+    /// Loads source coordinates after an external span's position is observed.
+    query external_span_data(id: rustc_span::ExternalSpanId) -> &'tcx rustc_span::ExternalSpanData {
+        arena_cache
+        no_hash
+        desc { "loading source coordinates for an external span" }
     }
 
     /// Gets the hash for the host proc macro. Used to support -Z dual-proc-macro.

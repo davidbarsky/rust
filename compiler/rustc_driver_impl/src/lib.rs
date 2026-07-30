@@ -271,8 +271,9 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
             if pp_mode.needs_ast_map() {
                 create_and_enter_global_ctxt(compiler, krate, |tcx| {
                     tcx.ensure_ok().early_lint_checks(());
+                    let outputs = passes::prepare_outputs(tcx);
                     pretty::print(sess, pp_mode, pretty::PrintExtra::NeedsAstMap { tcx });
-                    passes::write_dep_info(tcx);
+                    passes::write_dep_info(tcx, outputs);
                 });
             } else {
                 pretty::print(sess, pp_mode, pretty::PrintExtra::AfterParsing { krate: &krate });
@@ -297,41 +298,37 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send)) 
                 return None;
             }
 
-            passes::write_dep_info(tcx);
-
+            let outputs = passes::prepare_outputs(tcx);
             passes::write_interface(tcx);
 
-            if sess.opts.output_types.contains_key(&OutputType::DepInfo)
-                && sess.opts.output_types.len() == 1
-            {
-                return None;
-            }
+            let only_dep_info = sess.opts.output_types.contains_key(&OutputType::DepInfo)
+                && sess.opts.output_types.len() == 1;
+            let linker = if only_dep_info || sess.opts.unstable_opts.no_analysis {
+                None
+            } else {
+                tcx.ensure_ok().analysis(());
 
-            if sess.opts.unstable_opts.no_analysis {
-                return None;
-            }
-
-            tcx.ensure_ok().analysis(());
-
-            if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
-                dump_feature_usage_metrics(tcx, metrics_dir);
-            }
-
-            if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
-                return None;
-            }
-
-            if sess.opts.output_types.contains_key(&OutputType::Mir) {
-                if let Err(error) = pretty::emit_mir(tcx) {
-                    tcx.dcx().emit_fatal(CantEmitMIR { error });
+                if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
+                    dump_feature_usage_metrics(tcx, metrics_dir);
                 }
-            }
 
-            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+                if callbacks.after_analysis(compiler, tcx) == Compilation::Stop {
+                    None
+                } else {
+                    if sess.opts.output_types.contains_key(&OutputType::Mir) {
+                        if let Err(error) = pretty::emit_mir(tcx) {
+                            tcx.dcx().emit_fatal(CantEmitMIR { error });
+                        }
+                    }
 
-            tcx.report_unused_features();
+                    let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+                    tcx.report_unused_features();
+                    Some(linker)
+                }
+            };
 
-            Some(linker)
+            passes::write_dep_info(tcx, outputs);
+            linker
         });
 
         // Linking is done outside the `compiler.enter()` so that the

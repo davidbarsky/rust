@@ -25,8 +25,11 @@ use rustc_hir::attrs::NativeLibKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_lint_defs::builtin::LINKER_INFO;
 use rustc_macros::Diagnostic;
-use rustc_metadata::EncodedMetadata;
-use rustc_metadata::fs::{METADATA_FILENAME, copy_to_stdout, emit_wrapper_file};
+use rustc_metadata::fs::{
+    METADATA_FILENAME, METADATA_SPANS_FILENAME, copy_to_stdout, emit_wrapper_file,
+    non_durable_rename,
+};
+use rustc_metadata::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair};
 use rustc_middle::bug;
 use rustc_middle::error::DuplicateEiiImpls;
 use rustc_middle::lint::emit_lint_base;
@@ -359,10 +362,32 @@ pub fn link_binary(
 
             let crate_name = format!("{}", crate_info.local_crate_name);
             let out_filename = output.file_for_writing(outputs, OutputType::Exe, &crate_name);
+            let rdr_spans = if crate_type == CrateType::Rlib || crate_type == CrateType::Dylib {
+                match metadata.stub_or_full() {
+                    EncodedMetadataArtifacts::Coarse(_) => None,
+                    EncodedMetadataArtifacts::Rdr(artifacts) => Some(artifacts.spans),
+                }
+            } else {
+                None
+            };
+            if rdr_spans.is_some() && output.is_stdout() {
+                sess.dcx().fatal(
+                    "cannot write an RDR crate container to stdout because its spans artifact \
+                     requires a filesystem path",
+                );
+            }
+            let link_output =
+                if rdr_spans.is_some() {
+                    path.as_ref().join(out_filename.file_name().unwrap_or_else(|| {
+                        bug!("RDR output path has no file name: {out_filename:?}")
+                    }))
+                } else {
+                    out_filename.clone()
+                };
             match crate_type {
                 CrateType::Rlib => {
                     let _timer = sess.timer("link_rlib");
-                    info!("preparing rlib to {:?}", out_filename);
+                    info!("preparing rlib to {:?}", link_output);
                     link_rlib(
                         sess,
                         archive_builder_builder,
@@ -372,7 +397,7 @@ pub fn link_binary(
                         RlibFlavor::Normal,
                         &path,
                     )
-                    .build(&out_filename, None);
+                    .build(&link_output, None);
                 }
                 CrateType::StaticLib => {
                     link_staticlib(
@@ -382,7 +407,7 @@ pub fn link_binary(
                         &compiled_modules,
                         &crate_info,
                         &metadata,
-                        &out_filename,
+                        &link_output,
                         &path,
                     );
                 }
@@ -392,13 +417,34 @@ pub fn link_binary(
                         archive_builder_builder,
                         &mut rmeta_link_cache,
                         crate_type,
-                        &out_filename,
+                        LinkOutputPaths { linker: &link_output, artifact: &out_filename },
                         &compiled_modules,
                         &crate_info,
                         &metadata,
                         path.as_ref(),
                         codegen_backend,
                     );
+                }
+            }
+            if let Some(spans) = rdr_spans {
+                if sess.target.is_like_msvc {
+                    let staged_pdb = link_output.with_extension("pdb");
+                    if staged_pdb.exists() {
+                        let pdb = out_filename.with_extension("pdb");
+                        if let Err(error) = non_durable_rename(&staged_pdb, &pdb) {
+                            sess.dcx().fatal(format!(
+                                "failed to publish `{}` to `{}`: {error}",
+                                staged_pdb.display(),
+                                pdb.display(),
+                            ));
+                        }
+                    }
+                }
+                let spans = emit_wrapper_file(sess, spans, path.as_ref(), METADATA_SPANS_FILENAME);
+                let mut artifacts = RdrArtifactPair { primary: link_output, spans };
+                artifacts.publish(sess, &out_filename);
+                if sess.opts.json_artifact_notifications {
+                    sess.dcx().emit_artifact_notification(&artifacts.spans, "spans");
                 }
             }
             if sess.opts.json_artifact_notifications {
@@ -587,8 +633,9 @@ fn link_rlib<'a>(
 
     let trailing_metadata = match flavor {
         RlibFlavor::Normal => {
+            let metadata = metadata.stub_or_full().metadata();
             let (metadata, metadata_position) =
-                create_wrapper_file(sess, ".rmeta".to_string(), metadata.stub_or_full());
+                create_wrapper_file(sess, ".rmeta".to_string(), metadata);
             let metadata = emit_wrapper_file(sess, &metadata, tmpdir.as_ref(), METADATA_FILENAME);
             match metadata_position {
                 MetadataPosition::First => {
@@ -1199,6 +1246,12 @@ fn report_linker_output(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LinkOutputPaths<'a> {
+    linker: &'a Path,
+    artifact: &'a Path,
+}
+
 /// Create a dynamic library or executable.
 ///
 /// This will invoke the system linker/cc to create the resulting file. This links to all upstream
@@ -1208,14 +1261,14 @@ fn link_natively(
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     rmeta_link_cache: &mut RmetaLinkCache,
     crate_type: CrateType,
-    out_filename: &Path,
+    outputs: LinkOutputPaths<'_>,
     compiled_modules: &CompiledModules,
     crate_info: &CrateInfo,
     metadata: &EncodedMetadata,
     tmpdir: &Path,
     codegen_backend: &'static str,
 ) {
-    info!("preparing {:?} to {:?}", crate_type, out_filename);
+    info!("preparing {:?} to {:?}", crate_type, outputs.linker);
     let (linker_path, flavor) = linker_and_flavor(sess);
     let self_contained_components = self_contained_components(sess, crate_type, &linker_path);
 
@@ -1224,9 +1277,13 @@ fn link_natively(
     // dynamic library. So we link to a temporary .so file to be archived
     // at the final out_filename location
     let should_archive = crate_type != CrateType::Executable && sess.target.is_like_aix;
-    let archive_member =
-        should_archive.then(|| tmpdir.join(out_filename.file_name().unwrap()).with_extension("so"));
-    let temp_filename = archive_member.as_deref().unwrap_or(out_filename);
+    let archive_member = should_archive
+        .then(|| tmpdir.join(outputs.linker.file_name().unwrap()).with_extension("so"));
+    let temp_filename = archive_member.as_deref().unwrap_or(outputs.linker);
+    let linker_outputs = LinkOutputPaths {
+        linker: temp_filename,
+        artifact: if should_archive { temp_filename } else { outputs.artifact },
+    };
 
     let (mut cmd, jobserver_tokens) = linker_with_args(
         &linker_path,
@@ -1236,7 +1293,7 @@ fn link_natively(
         rmeta_link_cache,
         crate_type,
         tmpdir,
-        temp_filename,
+        linker_outputs,
         compiled_modules,
         crate_info,
         metadata,
@@ -1269,7 +1326,7 @@ fn link_natively(
         Regex::new(r"(unknown|unrecognized) (command line )?(option|argument)").unwrap();
     let mut prog;
     loop {
-        prog = sess.time("run_linker", || exec_linker(sess, &cmd, out_filename, flavor, tmpdir));
+        prog = sess.time("run_linker", || exec_linker(sess, &cmd, outputs.linker, flavor, tmpdir));
         let Ok(ref output) = prog else {
             break;
         };
@@ -1479,7 +1536,10 @@ fn link_natively(
         // debug information. Note that this will read debug information from
         // the objects on the filesystem which we'll clean up later.
         SplitDebuginfo::Packed if sess.target.is_like_darwin => {
-            let prog = Command::new("dsymutil").arg(out_filename).output();
+            let mut dsym_filename = outputs.artifact.as_os_str().to_owned();
+            dsym_filename.push(".dSYM");
+            let prog =
+                Command::new("dsymutil").arg(outputs.linker).arg("-o").arg(dsym_filename).output();
             match prog {
                 Ok(prog) => {
                     if !prog.status.success() {
@@ -1505,7 +1565,7 @@ fn link_natively(
         // remapped by --remap-path-prefix and therefore invalid, so we need to provide
         // the .o/.dwo paths explicitly.
         SplitDebuginfo::Packed => {
-            link_dwarf_object(sess, compiled_modules, crate_info, out_filename)
+            link_dwarf_object(sess, compiled_modules, crate_info, outputs.artifact)
         }
     }
 
@@ -1515,16 +1575,16 @@ fn link_natively(
         let stripcmd = "rust-objcopy";
         match (strip, crate_type) {
             (Strip::Debuginfo, _) => {
-                strip_with_external_utility(sess, stripcmd, out_filename, &["--strip-debug"])
+                strip_with_external_utility(sess, stripcmd, outputs.linker, &["--strip-debug"])
             }
 
             // Per the manpage, --discard-all is the maximum safe strip level for dynamic libraries. (#93988)
             (
                 Strip::Symbols,
                 CrateType::Dylib | CrateType::Cdylib | CrateType::ProcMacro | CrateType::Sdylib,
-            ) => strip_with_external_utility(sess, stripcmd, out_filename, &["--discard-all"]),
+            ) => strip_with_external_utility(sess, stripcmd, outputs.linker, &["--discard-all"]),
             (Strip::Symbols, _) => {
-                strip_with_external_utility(sess, stripcmd, out_filename, &["--strip-all"])
+                strip_with_external_utility(sess, stripcmd, outputs.linker, &["--strip-all"])
             }
             (Strip::None, _) => {}
         }
@@ -1540,7 +1600,9 @@ fn link_natively(
         let stripcmd = if !sess.host.is_like_solaris { "rust-objcopy" } else { "/usr/bin/strip" };
         match strip {
             // Always preserve the symbol table (-x).
-            Strip::Debuginfo => strip_with_external_utility(sess, stripcmd, out_filename, &["-x"]),
+            Strip::Debuginfo => {
+                strip_with_external_utility(sess, stripcmd, outputs.linker, &["-x"])
+            }
             // Strip::Symbols is handled via the --strip-all linker option.
             Strip::Symbols => {}
             Strip::None => {}
@@ -1569,7 +1631,7 @@ fn link_natively(
     if should_archive {
         let mut ab = archive_builder_builder.new_archive_builder(sess);
         ab.add_file(temp_filename, ArchiveEntryKind::Other);
-        ab.build(out_filename, None);
+        ab.build(outputs.linker, None);
     }
 }
 
@@ -2885,7 +2947,7 @@ fn linker_with_args(
     rmeta_link_cache: &mut RmetaLinkCache,
     crate_type: CrateType,
     tmpdir: &Path,
-    out_filename: &Path,
+    outputs: LinkOutputPaths<'_>,
     compiled_modules: &CompiledModules,
     crate_info: &CrateInfo,
     metadata: &EncodedMetadata,
@@ -3138,7 +3200,7 @@ fn linker_with_args(
         flavor,
         crate_type,
         crate_info,
-        out_filename,
+        outputs,
         tmpdir,
     );
 
@@ -3209,7 +3271,7 @@ fn add_order_independent_options(
     flavor: LinkerFlavor,
     crate_type: CrateType,
     crate_info: &CrateInfo,
-    out_filename: &Path,
+    outputs: LinkOutputPaths<'_>,
     tmpdir: &Path,
 ) {
     // Take care of the flavors and CLI options requesting the `lld` linker.
@@ -3266,7 +3328,7 @@ fn add_order_independent_options(
 
     add_library_search_dirs(cmd, sess, self_contained_components, apple_sdk_root.as_deref());
 
-    cmd.output_filename(out_filename);
+    cmd.output_filename(outputs.linker);
 
     if crate_type == CrateType::Executable
         && sess.target.is_like_windows
@@ -3287,7 +3349,7 @@ fn add_order_independent_options(
         cmd.gc_sections(keep_metadata);
     }
 
-    cmd.set_output_kind(link_output_kind, crate_type, out_filename);
+    cmd.set_output_kind(link_output_kind, crate_type, outputs.artifact);
 
     add_relro_args(cmd, sess);
 
@@ -3328,7 +3390,7 @@ fn add_order_independent_options(
         cmd.ehcont_guard();
     }
 
-    add_rpath_args(cmd, sess, crate_info, out_filename);
+    add_rpath_args(cmd, sess, crate_info, outputs.artifact);
 }
 
 // Write the NatVis debugger visualizer files for each crate to the temp directory and gather the file paths.
