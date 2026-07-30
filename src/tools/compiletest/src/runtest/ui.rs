@@ -247,6 +247,7 @@ impl TestCx<'_> {
             let mut rustc = self.make_compile_args(
                 self.compiler_kind_for_non_aux(),
                 &self.expected_output_path(UI_FIXED),
+                None,
                 TargetLocation::ThisFile(self.make_exe_name()),
                 emit_metadata,
                 AllowUnused::No,

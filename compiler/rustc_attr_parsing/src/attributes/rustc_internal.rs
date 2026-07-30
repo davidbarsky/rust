@@ -6,7 +6,8 @@ use rustc_feature::AttributeStability;
 use rustc_hir::LangItem;
 use rustc_hir::attrs::{
     BorrowckGraphvizFormatKind, CguFields, CguKind, DivergingBlockBehavior,
-    DivergingFallbackBehavior, RustcCleanAttribute, RustcCleanQueries, RustcMirKind,
+    DivergingFallbackBehavior, IncrementalStateAssertion, MetadataHashExpectation,
+    RmetaExpectation, RustcCleanAttribute, RustcCleanQueries, RustcMirKind,
 };
 use rustc_hir::target::GenericParamKind;
 use rustc_span::Symbol;
@@ -339,6 +340,143 @@ impl AttributeParser for RustcCguTestAttributeParser {
 
     fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         Some(AttributeKind::RustcCguTestAttr(self.items))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RustcIncrementalStateAssertionParser {
+    items: ThinVec<(Span, IncrementalStateAssertion)>,
+}
+
+impl AttributeParser for RustcIncrementalStateAssertionParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(
+        &[sym::rustc_expected_metadata_state],
+        template!(List: &[r#"cfg = "...", metadata_hash = "reused|changed", rmeta(reused|rebuilt)"#]),
+        unstable!(rustc_attrs),
+        |this, cx, args| {
+            if !cx.cx.sess.opts.unstable_opts.query_dep_graph {
+                cx.emit_err(AttributeRequiresOpt { span: cx.attr_span, opt: "-Z query-dep-graph" });
+            }
+            let Some(list) = cx.expect_list(args, cx.attr_span) else {
+                return;
+            };
+
+            let mut cfg = None;
+            let mut metadata_hash = None;
+            let mut rmeta = None;
+            for item in list.mixed() {
+                let Some(meta) = item.meta_item() else {
+                    cx.adcx().expected_specific_argument(
+                        item.span(),
+                        &[sym::cfg, sym::metadata_hash, sym::rmeta],
+                    );
+                    continue;
+                };
+                let Some(ident) = meta.ident() else {
+                    cx.adcx().expected_identifier(meta.span());
+                    continue;
+                };
+                if ident.name == sym::cfg {
+                    let Some(value) =
+                        cx.expect_name_value(meta.args(), item.span(), Some(sym::cfg))
+                    else {
+                        continue;
+                    };
+                    let Some(value) = cx.expect_string_literal(value) else {
+                        continue;
+                    };
+                    if cfg.replace(value).is_some() {
+                        cx.adcx().duplicate_key(item.span(), sym::cfg);
+                    }
+                } else if ident.name == sym::metadata_hash {
+                    let Some(value) =
+                        cx.expect_name_value(meta.args(), item.span(), Some(sym::metadata_hash))
+                    else {
+                        continue;
+                    };
+                    let value_span = value.value_span;
+                    let Some(value) = cx.expect_string_literal(value) else {
+                        continue;
+                    };
+                    let value = if value == sym::reused {
+                        MetadataHashExpectation::Reused
+                    } else if value == sym::changed {
+                        MetadataHashExpectation::Changed
+                    } else {
+                        cx.adcx().expected_specific_argument_strings(
+                            value_span,
+                            &[sym::reused, sym::changed],
+                        );
+                        continue;
+                    };
+                    if metadata_hash.replace(value).is_some() {
+                        cx.adcx().duplicate_key(item.span(), sym::metadata_hash);
+                    }
+                } else if ident.name == sym::rmeta {
+                    let Some(value) = cx.expect_single_element_list(meta.args(), meta.span())
+                    else {
+                        continue;
+                    };
+                    let Some(value) = value.meta_item_no_args().and_then(|value| value.ident())
+                    else {
+                        cx.adcx()
+                            .expected_specific_argument(value.span(), &[sym::reused, sym::rebuilt]);
+                        continue;
+                    };
+                    let value = if value.name == sym::reused {
+                        RmetaExpectation::Reused
+                    } else if value.name == sym::rebuilt {
+                        RmetaExpectation::Rebuilt
+                    } else {
+                        cx.adcx()
+                            .expected_specific_argument(value.span, &[sym::reused, sym::rebuilt]);
+                        continue;
+                    };
+                    if rmeta.replace(value).is_some() {
+                        cx.adcx().duplicate_key(item.span(), sym::rmeta);
+                    }
+                } else {
+                    meta.ignore_args();
+                    cx.adcx().expected_specific_argument(
+                        ident.span,
+                        &[sym::cfg, sym::metadata_hash, sym::rmeta],
+                    );
+                }
+            }
+
+            let Some(cfg) = cfg else {
+                cx.emit_err(CguFieldsMissing {
+                    span: list.span,
+                    name: &cx.attr_path,
+                    field: sym::cfg,
+                });
+                return;
+            };
+            let Some(metadata_hash) = metadata_hash else {
+                cx.emit_err(CguFieldsMissing {
+                    span: list.span,
+                    name: &cx.attr_path,
+                    field: sym::metadata_hash,
+                });
+                return;
+            };
+            let Some(rmeta) = rmeta else {
+                cx.emit_err(CguFieldsMissing {
+                    span: list.span,
+                    name: &cx.attr_path,
+                    field: sym::rmeta,
+                });
+                return;
+            };
+            this.items
+                .push((cx.attr_span, IncrementalStateAssertion { cfg, metadata_hash, rmeta }));
+        },
+    )];
+
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
+
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
+        Some(AttributeKind::RustcIncrementalStateAssertion(self.items))
     }
 }
 

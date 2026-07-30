@@ -1996,6 +1996,7 @@ impl Step for Sysroot {
             let filtered_extensions = [
                 OsStr::new("rmeta"),
                 OsStr::new("rlib"),
+                OsStr::new("spans"),
                 // FIXME: this is wrong when compiler.host != build, but we don't support that today
                 OsStr::new(std::env::consts::DLL_EXTENSION),
             ];
@@ -2665,6 +2666,7 @@ pub fn run_cargo(
             // Skip files like executables
             let keep = if filename.ends_with(".lib")
                 || filename.ends_with(".a")
+                || filename.ends_with(".spans")
                 || is_debug_info(&filename)
                 || is_dylib(Path::new(&*filename))
             {
@@ -2780,7 +2782,16 @@ pub fn run_cargo(
     }
 
     deps.extend(additional_target_deps);
+    let spans = deps
+        .iter()
+        .filter_map(|(artifact, dependency_type)| {
+            let spans = artifact.with_extension("spans");
+            spans.exists().then_some((spans, *dependency_type))
+        })
+        .collect::<Vec<_>>();
+    deps.extend(spans);
     deps.sort();
+    deps.dedup();
     let mut new_contents = Vec::new();
     for (dep, dependency_type) in deps.iter() {
         new_contents.extend(match *dependency_type {

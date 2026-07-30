@@ -404,6 +404,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::rustc_partition_reused,
     sym::rustc_partition_codegened,
     sym::rustc_expected_cgu_reuse,
+    sym::rustc_expected_metadata_state,
     sym::rustc_dump_symbol_name,
     sym::rustc_dump_def_path,
     sym::rustc_mir,

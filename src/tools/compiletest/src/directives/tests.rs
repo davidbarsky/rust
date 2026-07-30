@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
 
 use crate::common::{Config, Debugger, TestMode};
 use crate::directives::{
     self, AuxProps, DIRECTIVE_HANDLERS_MAP, DirectivesCache, EarlyProps, Edition, EditionRange,
-    FileDirectives, KNOWN_DIRECTIVE_NAMES_SET, LineNumber, TestProps, extract_llvm_version,
-    extract_version_range, line_directive, parse_edition, parse_normalize_rule,
+    FileDirectives, KNOWN_DIRECTIVE_NAMES_SET, LineNumber, RdrByteExpectation, TestProps,
+    extract_llvm_version, extract_version_range, line_directive, parse_edition,
+    parse_normalize_rule,
 };
 use crate::executor::{CollectedTestDesc, ShouldFail, TestVariant};
 
@@ -340,6 +341,77 @@ fn rustc_not_invoked() {
     DIRECTIVE_HANDLERS_MAP["rustc-not-invoked"].handle(&config, &line, &mut props);
 
     assert!(props.rustc_not_invoked);
+}
+
+#[test]
+fn rdr_byte_expectations_are_revision_scoped() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] rdr-rmeta: different
+//@ [bpass2] rdr-rmeta: same
+//@ [bpass1] rdr-spans: same
+//@ [bpass2] rdr-spans: different
+//@ [bpass1] rdr-source: logical/edited.rs same
+//@ [bpass2] rdr-source: logical/edited.rs different
+//@ [bpass2] rdr-source: logical/untouched.rs same
+"#,
+    );
+
+    for (revision, rmeta, spans, sources) in [
+        (
+            "bpass1",
+            RdrByteExpectation::Different,
+            RdrByteExpectation::Same,
+            vec![(Utf8PathBuf::from("logical/edited.rs"), RdrByteExpectation::Same)],
+        ),
+        (
+            "bpass2",
+            RdrByteExpectation::Same,
+            RdrByteExpectation::Different,
+            vec![
+                (Utf8PathBuf::from("logical/edited.rs"), RdrByteExpectation::Different),
+                (Utf8PathBuf::from("logical/untouched.rs"), RdrByteExpectation::Same),
+            ],
+        ),
+    ] {
+        let mut props = TestProps::new();
+        super::iter_directives(&config, &file_directives, &mut |line| {
+            if line.applies_to_test_revision(Some(revision)) {
+                DIRECTIVE_HANDLERS_MAP[line.name].handle(&config, line, &mut props);
+            }
+        });
+
+        assert_eq!(props.rdr_rmeta, Some(rmeta));
+        assert_eq!(props.rdr_spans, Some(spans));
+        assert_eq!(props.rdr_sources, sources);
+    }
+}
+
+#[test]
+fn revision_source_is_revision_scoped() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] revision-source: a_first.rs
+//@ [bpass2] revision-source: a_second.rs
+"#,
+    );
+
+    for (revision, expected) in [("bpass1", "a_first.rs"), ("bpass2", "a_second.rs")] {
+        let mut props = TestProps::new();
+        super::iter_directives(&config, &file_directives, &mut |line| {
+            props.apply_directive(&config, line, Some(revision));
+        });
+
+        assert_eq!(props.revision_source.as_deref(), Some(Utf8Path::new(expected)));
+        assert_eq!(
+            props.revision_source_candidates,
+            vec![Utf8PathBuf::from("a_first.rs"), Utf8PathBuf::from("a_second.rs")]
+        );
+    }
 }
 
 #[test]

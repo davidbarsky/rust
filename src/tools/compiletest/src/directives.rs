@@ -80,6 +80,32 @@ impl EarlyProps {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RdrByteExpectation {
+    Same,
+    Different,
+}
+
+impl std::str::FromStr for RdrByteExpectation {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "same" => Ok(Self::Same),
+            "different" => Ok(Self::Different),
+            _ => Err(()),
+        }
+    }
+}
+
+fn parse_revision_source(value: String) -> Utf8PathBuf {
+    let value = value.trim();
+    if value.is_empty() {
+        panic!("`//@ revision-source` expects a physical source path");
+    }
+    Utf8PathBuf::from(value)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TestProps {
     // Lines that should be expected, in order, on standard out
@@ -162,6 +188,11 @@ pub(crate) struct TestProps {
     pub(crate) incremental: bool,
     // Whether invoking rustc for this crate is a test failure.
     pub(crate) rustc_not_invoked: bool,
+    pub(crate) rdr_rmeta: Option<RdrByteExpectation>,
+    pub(crate) rdr_spans: Option<RdrByteExpectation>,
+    pub(crate) rdr_sources: Vec<(Utf8PathBuf, RdrByteExpectation)>,
+    pub(crate) revision_source: Option<Utf8PathBuf>,
+    pub(crate) revision_source_candidates: Vec<Utf8PathBuf>,
     // If `true`, this test is a known bug.
     //
     // When set, some requirements are relaxed. Currently, this only means no
@@ -255,6 +286,10 @@ mod directives {
     pub(crate) const STDERR_PER_BITWIDTH: &str = "stderr-per-bitwidth";
     pub(crate) const INCREMENTAL: &str = "incremental";
     pub(crate) const RUSTC_NOT_INVOKED: &str = "rustc-not-invoked";
+    pub(crate) const RDR_RMETA: &str = "rdr-rmeta";
+    pub(crate) const RDR_SOURCE: &str = "rdr-source";
+    pub(crate) const RDR_SPANS: &str = "rdr-spans";
+    pub(crate) const REVISION_SOURCE: &str = "revision-source";
     pub(crate) const KNOWN_BUG: &str = "known-bug";
     pub(crate) const TEST_MIR_PASS: &str = "test-mir-pass";
     pub(crate) const REMAP_SRC_BASE: &str = "remap-src-base";
@@ -300,6 +335,11 @@ impl TestProps {
             incremental_dir: None,
             incremental: false,
             rustc_not_invoked: false,
+            rdr_rmeta: None,
+            rdr_spans: None,
+            rdr_sources: vec![],
+            revision_source: None,
+            revision_source_candidates: vec![],
             known_bug: false,
             pass_fail_mode: None,
             no_pass_override: false,
@@ -364,20 +404,9 @@ impl TestProps {
             let file_contents = fs::read_to_string(testfile).unwrap();
             let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
 
-            iter_directives(
-                config,
-                &file_directives,
-                // (dummy comment to force args into vertical layout)
-                &mut |ln: &DirectiveLine<'_>| {
-                    if !ln.applies_to_test_revision(test_revision) {
-                        return;
-                    }
-
-                    if let Some(handler) = DIRECTIVE_HANDLERS_MAP.get(ln.name) {
-                        handler.handle(config, ln, self);
-                    }
-                },
-            );
+            iter_directives(config, &file_directives, &mut |ln: &DirectiveLine<'_>| {
+                self.apply_directive(config, ln, test_revision);
+            });
         }
 
         if config.mode == TestMode::Incremental {
@@ -406,6 +435,35 @@ impl TestProps {
             // The edition is added at the start, since flags from //@compile-flags must be passed
             // to rustc last.
             self.compile_flags.insert(0, format!("--edition={edition}"));
+        }
+    }
+
+    fn apply_directive(
+        &mut self,
+        config: &Config,
+        line: &DirectiveLine<'_>,
+        test_revision: Option<&str>,
+    ) {
+        if line.name == directives::REVISION_SOURCE {
+            let source = config
+                .parse_name_value_directive(line, directives::REVISION_SOURCE)
+                .map(parse_revision_source);
+            let Some(source) = source else {
+                return;
+            };
+            self.revision_source_candidates.push(source.clone());
+            if line.applies_to_test_revision(test_revision) && self.revision_source.is_none() {
+                self.revision_source = Some(source);
+            }
+            return;
+        }
+
+        if !line.applies_to_test_revision(test_revision) {
+            return;
+        }
+
+        if let Some(handler) = DIRECTIVE_HANDLERS_MAP.get(line.name) {
+            handler.handle(config, line, self);
         }
     }
 

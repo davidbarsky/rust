@@ -70,6 +70,25 @@ pub enum CguFields {
     ExpectedCguReuse { cfg: Symbol, module: Symbol, kind: CguKind },
 }
 
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
+pub enum MetadataHashExpectation {
+    Reused,
+    Changed,
+}
+
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
+pub enum RmetaExpectation {
+    Reused,
+    Rebuilt,
+}
+
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
+pub struct IncrementalStateAssertion {
+    pub cfg: Symbol,
+    pub metadata_hash: MetadataHashExpectation,
+    pub rmeta: RmetaExpectation,
+}
+
 #[derive(Copy, Clone, PartialEq, Debug, PrintAttribute)]
 #[derive(StableHash, Encodable, Decodable)]
 pub enum DivergingFallbackBehavior {
@@ -1490,6 +1509,8 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_if_this_changed]`
     RustcIfThisChanged(Span, Option<Symbol>),
+
+    RustcIncrementalStateAssertion(ThinVec<(Span, IncrementalStateAssertion)>),
 
     /// Represents `#[rustc_inherit_overflow_checks]`
     RustcInheritOverflowChecks,

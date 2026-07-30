@@ -21,13 +21,16 @@
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::unord::UnordSet;
-use rustc_hir::attrs::{AttributeKind, RustcCleanAttribute};
-use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{
-    Attribute, ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind, find_attr,
-    intravisit,
+use rustc_hir::attrs::{
+    AttributeKind, IncrementalStateAssertion, MetadataHashExpectation, RmetaExpectation,
+    RustcCleanAttribute,
 };
-use rustc_middle::dep_graph::{DepKind, DepNode, dep_kind_from_label};
+use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
+use rustc_hir::{
+    Attribute, CRATE_HIR_ID, ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind,
+    find_attr, intravisit,
+};
+use rustc_middle::dep_graph::{DepKind, DepNode, WorkProductId, dep_kind_from_label};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, Symbol};
@@ -135,6 +138,73 @@ pub(crate) fn check_clean_annotations(tcx: TyCtxt<'_>) {
     // can't add `#[rustc_clean]` etc without opting into this feature
     if !tcx.features().rustc_attrs() {
         return;
+    }
+
+    for &(span, IncrementalStateAssertion { cfg, metadata_hash, rmeta }) in find_attr!(
+        tcx.hir_attrs(CRATE_HIR_ID),
+        RustcIncrementalStateAssertion(assertions) => assertions)
+    .into_iter()
+    .flatten()
+    {
+        if !tcx.sess.config.contains(&(cfg, None)) {
+            continue;
+        }
+
+        let dep_node = DepNode::construct(tcx, DepKind::crate_hash, &LOCAL_CRATE);
+        let is_green = tcx.dep_graph.is_green(&dep_node);
+        let is_red = tcx.dep_graph.is_red(&dep_node);
+        let matches = match metadata_hash {
+            MetadataHashExpectation::Reused => is_green,
+            MetadataHashExpectation::Changed => is_red,
+        };
+        let expected = match metadata_hash {
+            MetadataHashExpectation::Reused => "reused",
+            MetadataHashExpectation::Changed => "changed",
+        };
+        let actual = if is_green {
+            "reused"
+        } else if is_red {
+            "changed"
+        } else {
+            "unavailable"
+        };
+        if !matches {
+            tcx.dcx().emit_err(diagnostics::UnexpectedIncrementalState {
+                span,
+                component: "metadata hash",
+                expected,
+                actual,
+            });
+        }
+
+        let dep_node = tcx.metadata_dep_node();
+        let work_product_id = WorkProductId::from_cgu_name("metadata");
+        let is_green = tcx.dep_graph.is_green(&dep_node)
+            && tcx.dep_graph.previous_work_product(&work_product_id).is_some();
+        let is_red = tcx.dep_graph.is_red(&dep_node);
+        let matches = match rmeta {
+            RmetaExpectation::Reused => is_green,
+            RmetaExpectation::Rebuilt => is_red,
+        };
+        let expected = match rmeta {
+            RmetaExpectation::Reused => "reused",
+            RmetaExpectation::Rebuilt => "rebuilt",
+        };
+        let actual = if is_green {
+            "reused"
+        } else if is_red {
+            "rebuilt"
+        } else {
+            "unavailable"
+        };
+        if !matches {
+            tcx.dcx().emit_err(diagnostics::UnexpectedIncrementalState {
+                span,
+                component: "metadata",
+                expected,
+                actual,
+            });
+        }
     }
 
     tcx.dep_graph.with_ignore(|| {

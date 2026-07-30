@@ -105,6 +105,17 @@ pub(crate) struct UncheckedClean {
     #[primary_span]
     pub span: Span,
 }
+
+#[derive(Diagnostic)]
+#[diag("expected {$component} to be {$expected}, but it was {$actual}")]
+pub(crate) struct UnexpectedIncrementalState<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub component: &'a str,
+    pub expected: &'a str,
+    pub actual: &'a str,
+}
+
 #[derive(Diagnostic)]
 #[diag("unable to delete old {$name} at `{$path}`: {$err}")]
 pub(crate) struct DeleteOld<'a> {

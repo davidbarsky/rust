@@ -346,6 +346,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::RustcEvaluateWhereClauses => (),
             AttributeKind::RustcHasIncoherentInherentImpls => (),
             AttributeKind::RustcIfThisChanged(..) => (),
+            AttributeKind::RustcIncrementalStateAssertion(..) => (),
             AttributeKind::RustcInheritOverflowChecks => (),
             AttributeKind::RustcInsignificantDtor => (),
             AttributeKind::RustcIntrinsic => (),

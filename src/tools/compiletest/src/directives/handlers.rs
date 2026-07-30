@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use camino::Utf8PathBuf;
+
 use crate::common::{Config, PassFailMode, TestMode};
 use crate::directives::{
-    DirectiveLine, NormalizeKind, NormalizeRule, TestProps, parse_and_update_aux,
-    parse_edition_range, split_flags,
+    DirectiveLine, NormalizeKind, NormalizeRule, RdrByteExpectation, TestProps,
+    parse_and_update_aux, parse_edition_range, split_flags,
 };
 use crate::errors::ErrorKind;
 
@@ -149,6 +151,47 @@ fn make_directive_handlers_map() -> HashMap<&'static str, Handler> {
         }),
         handler(RUSTC_NOT_INVOKED, |config, ln, props| {
             config.set_name_directive(ln, RUSTC_NOT_INVOKED, &mut props.rustc_not_invoked);
+        }),
+        handler(RDR_RMETA, |config, ln, props| {
+            config.set_name_value_directive(ln, RDR_RMETA, &mut props.rdr_rmeta, |value| {
+                let value = value.trim();
+                value.parse::<RdrByteExpectation>().unwrap_or_else(|()| {
+                    panic!("`//@ {RDR_RMETA}` expects `same` or `different`, found `{value}`")
+                })
+            });
+        }),
+        handler(RDR_SPANS, |config, ln, props| {
+            config.set_name_value_directive(ln, RDR_SPANS, &mut props.rdr_spans, |value| {
+                let value = value.trim();
+                value.parse::<RdrByteExpectation>().unwrap_or_else(|()| {
+                    panic!("`//@ {RDR_SPANS}` expects `same` or `different`, found `{value}`")
+                })
+            });
+        }),
+        handler(RDR_SOURCE, |config, ln, props| {
+            config.push_name_value_directive(ln, RDR_SOURCE, &mut props.rdr_sources, |value| {
+                let value = value.trim();
+                let Some((path, expectation)) = value.rsplit_once(char::is_whitespace) else {
+                    panic!(
+                        "`//@ {RDR_SOURCE}` expects `<logical/path> same` or \
+                         `<logical/path> different`, found `{value}`"
+                    );
+                };
+                let path = path.trim();
+                if path.is_empty() {
+                    panic!(
+                        "`//@ {RDR_SOURCE}` expects `<logical/path> same` or \
+                         `<logical/path> different`, found `{value}`"
+                    );
+                }
+                let expectation = expectation.parse::<RdrByteExpectation>().unwrap_or_else(|()| {
+                    panic!(
+                        "`//@ {RDR_SOURCE}` expects `<logical/path> same` or \
+                             `<logical/path> different`, found `{value}`"
+                    )
+                });
+                (Utf8PathBuf::from(path), expectation)
+            });
         }),
         handler(PRETTY_MODE, |config, ln, props| {
             if let Some(m) = config.parse_name_value_directive(ln, PRETTY_MODE) {

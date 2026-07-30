@@ -38,6 +38,7 @@ impl TestCx<'_> {
         let rustc = self.make_compile_args(
             CompilerKind::Rustc,
             input_file,
+            None,
             TargetLocation::ThisFile(output_path.clone()),
             emit,
             AllowUnused::No,

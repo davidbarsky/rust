@@ -149,6 +149,7 @@ impl AttributeKind {
             RustcEvaluateWhereClauses => Yes,
             RustcHasIncoherentInherentImpls => Yes,
             RustcIfThisChanged(..) => No,
+            RustcIncrementalStateAssertion { .. } => No,
             RustcInheritOverflowChecks => No,
             RustcInsignificantDtor => Yes,
             RustcIntrinsic => Yes,
