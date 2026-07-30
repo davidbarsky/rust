@@ -170,18 +170,25 @@ mod visit;
 
 // Data types
 
+/// Records definitions whose nominal visibility does not capture access through opaque macros.
+#[derive(Debug, Default, StableHash)]
+pub struct MacroReachability {
+    // FIXME: Reachability of an ADT from a macro is currently determined by nominal visibility.
+    // This requires rustc_privacy to traverse the ADT fields from each defining module. Remove
+    // this workaround once macro reachability is computed from the macro's resolved references.
+    pub adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>>,
+    /// Import definitions remain addressable when their external targets provide no local
+    /// definition through which the binding can be recovered.
+    pub imports: UnordSet<LocalDefId>,
+}
+
 #[derive(Debug, StableHash)]
 pub struct ResolverGlobalCtxt {
     pub visibilities_for_hashing: Vec<(LocalDefId, Visibility)>,
     /// Item with a given `LocalDefId` was defined during macro expansion with ID `ExpnId`.
     pub expn_that_defined: UnordMap<LocalDefId, ExpnId>,
     pub effective_visibilities: EffectiveVisibilities,
-    // FIXME: This table contains ADTs reachable from macro 2.0.
-    // Currently, reachability of a definition from a macro is determined by nominal visibility
-    // (see `compute_effective_visibilities`). This is incorrect and leads to the necessity
-    // of traversing ADT fields in `rustc_privacy`. Remove this workaround once the
-    // correct reachability logic is implemented for macros.
-    pub macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>>,
+    pub macro_reachability: MacroReachability,
     pub extern_crate_map: UnordMap<LocalDefId, CrateNum>,
     pub maybe_unused_trait_imports: FxIndexSet<LocalDefId>,
     pub module_children: LocalDefIdMap<Vec<ModChild>>,

@@ -10,7 +10,7 @@ pub use encoder::{EncodedMetadata, encode_metadata, rendered_const};
 pub(crate) use parameterized::ParameterizedOverTcx;
 use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
 use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::stable_hash::{
     StableCompare, StableHash as StableHashTrait, StableHashCtxt, StableHasher,
 };
@@ -30,7 +30,9 @@ use rustc_macros::{
     BlobDecodable, Decodable, Encodable, LazyDecodable, MetadataEncodable, StableHash, TyDecodable,
     TyEncodable,
 };
-use rustc_middle::metadata::{AmbigModChild, ModChild};
+use rustc_middle::metadata::{
+    AmbigModChild, DefinitionState, MetadataSpanLayout, ModChild, SelectedDefinitions,
+};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs;
@@ -48,7 +50,7 @@ use rustc_session::config::{SymbolManglingVersion, TargetModifier};
 use rustc_session::cstore::{CrateDepKind, ForeignModule, LinkagePreference, NativeLib};
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{ExpnIndex, HygieneIdentity, MacroKind, SyntaxContextKey};
-use rustc_span::{self, ExpnData, ExpnHash, ExpnId, Ident, Span, Symbol};
+use rustc_span::{self, ExpnData, ExpnHash, ExpnId, ExternalSpanSlot, Ident, Span, Symbol};
 use rustc_target::spec::{PanicStrategy, TargetTuple};
 use table::{FixedSizeEncoding, TableBuilder};
 
@@ -1369,6 +1371,68 @@ struct MetadataRecordKey {
     owner: Option<DefPathHash>,
 }
 
+impl MetadataRecordKey {
+    fn is_selected(self, selection: SelectedDefinitions<'_>) -> bool {
+        match self.owner {
+            Some(owner) => match selection.state(owner) {
+                DefinitionState::Unselected => false,
+                DefinitionState::DecodeLayout | DefinitionState::Semantic => true,
+            },
+            None => true,
+        }
+    }
+
+    fn is_semantic(self, selection: SelectedDefinitions<'_>) -> bool {
+        match self.owner {
+            Some(owner) => match selection.state(owner) {
+                DefinitionState::Semantic => true,
+                DefinitionState::Unselected | DefinitionState::DecodeLayout => false,
+            },
+            None => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SpanOccurrence {
+    record: MetadataRecordKey,
+    ordinal: u32,
+}
+
+#[derive(Clone, Copy, Decodable, Encodable)]
+enum RdrSpanLocation {
+    Dummy,
+    Position(ExternalSpanSlot),
+}
+
+#[derive(Default)]
+struct SpanLayout {
+    slots: FxIndexSet<SpanOccurrence>,
+}
+
+impl SpanLayout {
+    fn push(&mut self, occurrence: SpanOccurrence) -> ExternalSpanSlot {
+        let (index, inserted) = self.slots.insert_full(occurrence);
+        assert!(inserted, "duplicate exported span occurrence {occurrence:?}");
+        ExternalSpanSlot::from_usize(index)
+    }
+
+    fn metadata_layout(&self) -> MetadataSpanLayout {
+        let mut hasher = StableHasher::new();
+        for occurrence in &self.slots {
+            occurrence.hash(&mut hasher);
+        }
+        MetadataSpanLayout {
+            id: hasher.finish(),
+            slot_count: self
+                .slots
+                .len()
+                .try_into()
+                .expect("cannot export more than U32_MAX span occurrences"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MetadataArtifactKind {
     Full,
@@ -1497,6 +1561,16 @@ pub fn provide(providers: &mut Providers) {
 }
 
 #[cfg(test)]
+use rustc_data_structures::fingerprint::Fingerprint;
+#[cfg(test)]
+use rustc_hir::def_id::CRATE_DEF_ID;
+#[cfg(test)]
+use rustc_middle::metadata::MetadataDefinitionLayout;
+
+#[cfg(test)]
+use self::encoder::{MetadataProjectionEncoder, SemanticRecordMembership};
+
+#[cfg(test)]
 macro_rules! assert_not_metadata_semantic_value {
     ($ty:ty) => {{
         trait AmbiguousIfSemantic<A> {
@@ -1518,4 +1592,133 @@ fn artifact_local_values_cannot_enter_the_semantic_projection() {
     assert_not_metadata_semantic_value!(crate::rmeta::LazyValue<()>);
     assert_not_metadata_semantic_value!(crate::rmeta::LazyArray<()>);
     assert_not_metadata_semantic_value!(crate::rmeta::LazyTable<(), ()>);
+}
+
+#[test]
+fn entering_a_nonsemantic_record_does_not_seed_the_semantic_digest() {
+    let owner = DefPathHash(Fingerprint::new(1, 2));
+    let key = MetadataRecordKey {
+        record: PersistedRecord::Table(PersistedTable::def_kind),
+        owner: Some(owner),
+    };
+    let (empty_contract, empty_decode_layout) = MetadataProjectionEncoder::new().finish();
+    let mut projected = MetadataProjectionEncoder::new();
+
+    projected.enter(key, SemanticRecordMembership::Omitted);
+    let (projected_contract, projected_decode_layout) = projected.finish();
+
+    assert_eq!(projected_contract, empty_contract);
+    assert_ne!(projected_decode_layout, empty_decode_layout);
+}
+
+#[test]
+fn wire_bytes_do_not_enter_the_semantic_projection() {
+    let key =
+        MetadataRecordKey { record: PersistedRecord::Table(PersistedTable::def_span), owner: None };
+    let mut original = MetadataProjectionEncoder::new();
+    original.enter(key, SemanticRecordMembership::Included);
+    original.record_wire_bytes(key, b"slot 1");
+    let (original_contract, original_decode_layout) = original.finish();
+    let mut moved = MetadataProjectionEncoder::new();
+    moved.enter(key, SemanticRecordMembership::Included);
+    moved.record_wire_bytes(key, b"slot 2");
+    let (moved_contract, moved_decode_layout) = moved.finish();
+
+    assert_eq!(original_contract, moved_contract);
+    assert_ne!(original_decode_layout, moved_decode_layout);
+}
+
+#[test]
+fn projection_digests_include_empty_records() {
+    let (empty_contract, empty_decode_layout) = MetadataProjectionEncoder::new().finish();
+    let mut declared = MetadataProjectionEncoder::new();
+    declared.enter(
+        MetadataRecordKey {
+            record: PersistedRecord::Table(PersistedTable::attributes),
+            owner: None,
+        },
+        SemanticRecordMembership::Included,
+    );
+    let (declared_contract, declared_decode_layout) = declared.finish();
+
+    assert_ne!(empty_contract, declared_contract);
+    assert_ne!(empty_decode_layout, declared_decode_layout);
+}
+
+#[test]
+fn span_layout_uses_exported_occurrences_not_coordinates() {
+    let owner = DefPathHash(Fingerprint::new(1, 1));
+    let record = MetadataRecordKey {
+        record: PersistedRecord::Table(PersistedTable::def_span),
+        owner: Some(owner),
+    };
+    let mut layout = SpanLayout::default();
+    layout.push(SpanOccurrence { record, ordinal: 0 });
+    layout.push(SpanOccurrence { record, ordinal: 1 });
+
+    assert_ne!(
+        layout.slots.get_index_of(&SpanOccurrence { record, ordinal: 0 }),
+        layout.slots.get_index_of(&SpanOccurrence { record, ordinal: 1 })
+    );
+}
+
+#[test]
+fn private_occurrences_do_not_change_exported_slots() {
+    let exported_owner = DefPathHash(Fingerprint::new(1, 1));
+    let private_owner = DefPathHash(Fingerprint::new(1, 2));
+    let exported_def_id = LocalDefId { local_def_index: DefIndex::from_u32(1) };
+    let exported = MetadataRecordKey {
+        record: PersistedRecord::Table(PersistedTable::def_span),
+        owner: Some(exported_owner),
+    };
+    let private = MetadataRecordKey {
+        record: PersistedRecord::Table(PersistedTable::def_span),
+        owner: Some(private_owner),
+    };
+    let layout = MetadataDefinitionLayout::from_artifact(
+        [
+            (CRATE_DEF_ID, DefPathHash(Fingerprint::new(1, 0)), None),
+            (exported_def_id, exported_owner, Some(CRATE_DEF_ID)),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    let selection = layout.selection();
+    let exported_occurrence = SpanOccurrence { record: exported, ordinal: 0 };
+    let mut first = SpanLayout::default();
+    first.push(exported_occurrence);
+    let mut second = SpanLayout::default();
+    for occurrence in [SpanOccurrence { record: private, ordinal: 0 }, exported_occurrence] {
+        if occurrence.record.is_selected(selection) {
+            second.push(occurrence);
+        }
+    }
+
+    assert_eq!(
+        first.slots.get_index_of(&SpanOccurrence { record: exported, ordinal: 0 }),
+        second.slots.get_index_of(&SpanOccurrence { record: exported, ordinal: 0 })
+    );
+    assert_eq!(first.metadata_layout(), second.metadata_layout());
+}
+
+#[test]
+fn exported_occurrence_order_changes_layout_identity() {
+    let left_owner = DefPathHash(Fingerprint::new(1, 1));
+    let right_owner = DefPathHash(Fingerprint::new(1, 2));
+    let left = MetadataRecordKey {
+        record: PersistedRecord::Table(PersistedTable::def_span),
+        owner: Some(left_owner),
+    };
+    let right = MetadataRecordKey {
+        record: PersistedRecord::Table(PersistedTable::def_ident_span),
+        owner: Some(right_owner),
+    };
+    let mut forward = SpanLayout::default();
+    forward.push(SpanOccurrence { record: left, ordinal: 0 });
+    forward.push(SpanOccurrence { record: right, ordinal: 0 });
+    let mut reverse = SpanLayout::default();
+    reverse.push(SpanOccurrence { record: right, ordinal: 0 });
+    reverse.push(SpanOccurrence { record: left, ordinal: 0 });
+
+    assert_ne!(forward.metadata_layout(), reverse.metadata_layout());
 }

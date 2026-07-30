@@ -314,11 +314,28 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
                     continue;
                 };
 
+                if !decl.vis().is_accessible_from(defining_mod, self.r.tcx) {
+                    continue;
+                }
+                if let DeclKind::Import { import, .. } = decl.kind {
+                    if let Some(def_id) = import.def_id() {
+                        self.r.macro_reachability.imports.insert(def_id);
+                    }
+                    let nominal_vis = decl.vis().expect_local();
+                    let private_vis = self.r.private_vis_decl(decl);
+                    self.changed |= self.import_effective_visibilities.update(
+                        decl,
+                        Some(nominal_vis),
+                        private_vis,
+                        macro_ev,
+                        Level::Reachable,
+                        self.r.tcx,
+                    );
+                }
                 if let Res::Def(def_kind, def_id) = decl.res()
                     && let Some(def_id) = def_id.as_local()
-                    // FIXME: defs should be checked with `EffectiveVisibilities::is_reachable`.
-                    && decl.vis().is_accessible_from(defining_mod, self.r.tcx)
                 {
+                    // FIXME: defs should be checked with `EffectiveVisibilities::is_reachable`.
                     let vis = self.r.tcx.local_visibility(def_id);
                     self.update_macro_reachable_def(def_id, def_kind, vis, defining_mod, macro_ev);
                 }
@@ -343,7 +360,7 @@ impl<'a, 'ra, 'tcx> EffectiveVisibilitiesVisitor<'a, 'ra, 'tcx> {
                 }
             }
             DefKind::Struct | DefKind::Union => {
-                self.r.macro_reachable_adts.entry(def_id).or_default().insert(module);
+                self.r.macro_reachability.adts.entry(def_id).or_default().insert(module);
             }
             _ => {}
         }

@@ -2034,6 +2034,42 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    /// Hashes the cross-crate semantic contract emitted in metadata.
+    ///
+    /// Unlike [`Self::crate_hash`], this remains stable when an edit changes no metadata visible to
+    /// downstream crates. Artifact-local addressing has a separate decode-layout identity.
+    query metadata_contract_hash(_: ()) -> crate::metadata::MetadataContractHash {
+        desc { "computing the metadata contract hash" }
+    }
+
+    /// Computes closed metadata membership, compact addresses, and coordinate-free identities.
+    query metadata_projection(_: ()) -> &'tcx crate::metadata::MetadataProjection {
+        arena_cache
+        desc { "projecting the metadata schema" }
+    }
+
+    /// Supplies definition spans without making coordinates part of metadata projection identity.
+    query metadata_definition_spans(def_id: LocalDefId) -> crate::metadata::MetadataSemantic<crate::metadata::MetadataDefinitionSpans> {
+        desc { "projecting the definition spans of `{}`", tcx.def_path_str(def_id) }
+    }
+
+    /// Supplies resolver state while keeping source coordinates out of metadata dependencies.
+    query metadata_resolutions(_: ()) -> crate::metadata::MetadataSemantic<&'tcx ty::ResolverGlobalCtxt> {
+        desc { "projecting resolver state for metadata" }
+    }
+
+    /// Supplies attributes while keeping source coordinates out of metadata dependencies.
+    query metadata_attrs(def_id: LocalDefId) -> crate::metadata::MetadataSemantic<&'tcx [hir::Attribute]> {
+        desc { "projecting attributes for `{}` into metadata", tcx.def_path_str(def_id) }
+    }
+
+    /// Identifies the artifact-local addresses expected while decoding a crate's metadata.
+    query metadata_decode_layout_id(_: CrateNum) -> crate::metadata::MetadataDecodeLayoutId {
+        eval_always
+        desc { "computing the metadata decode-layout identity" }
+        separate_provide_extern
+    }
+
     /// Gets the hash for the host proc macro. Used to support -Z dual-proc-macro.
     query crate_host_hash(_: CrateNum) -> Option<Svh> {
         eval_always

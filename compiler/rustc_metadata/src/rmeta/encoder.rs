@@ -1,13 +1,16 @@
 use std::borrow::Borrow;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustc_abi::FIRST_VARIANT;
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet, StdEntry as Entry};
 use rustc_data_structures::memmap::{Mmap, MmapMut};
-use rustc_data_structures::stable_hash::StableHash;
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{par_for_each_in, par_join};
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_data_structures::thousands::usize_with_underscores;
@@ -21,21 +24,26 @@ use rustc_hir::definitions::DefPathData;
 use rustc_hir::find_attr;
 use rustc_hir_pretty::id_to_string;
 use rustc_middle::dep_graph::WorkProductId;
-use rustc_middle::metadata::{DefinitionProjection, Reexport};
+use rustc_middle::metadata::{
+    DefinitionProjection, MetadataContractHash, MetadataDecodeLayoutId, MetadataDefinitionLayout,
+    MetadataDefinitionSpans, MetadataProjection, MetadataSemantic, Reexport, ReferencedDefinitions,
+    SelectedDefinitions, TraceScope,
+};
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::interpret;
-use rustc_middle::query::Providers;
+use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::traits::specialization_graph;
 use rustc_middle::ty::AssocContainer;
 use rustc_middle::ty::codec::TyEncoder;
 use rustc_middle::ty::fast_reject::{self, TreatParams};
 use rustc_middle::{bug, span_bug};
+use rustc_serialize::opaque::mem_encoder::MemEncoder;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder, opaque};
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
 use rustc_session::config::{CrateType, OptLevel, TargetModifier};
 use rustc_span::def_id::CRATE_MOD_ID;
-use rustc_span::hygiene::{HygieneDelta, HygieneEncodeContext};
+use rustc_span::hygiene::{HygieneDelta, HygieneEncodeContext, HygieneEncodeLayout, HygieneTrace};
 use rustc_span::{
     ByteSymbol, ExternalSource, FileName, SourceFile, SpanData, SpanEncoder, StableSourceFileId,
     Symbol, SyntaxContext, sym,
@@ -46,10 +54,66 @@ use crate::diagnostics::{FailCreateFileEncoder, FailWriteFile};
 use crate::eii::EiiMapEncodedKeyValue;
 use crate::rmeta::*;
 
+pub(crate) struct MetadataProjectionEncoder {
+    semantic: StableHasher,
+    decode_layout: StableHasher,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum SemanticRecordMembership {
     Included,
     Omitted,
+}
+
+impl MetadataProjectionEncoder {
+    pub(crate) fn new() -> Self {
+        Self { semantic: StableHasher::new(), decode_layout: StableHasher::new() }
+    }
+
+    pub(crate) fn enter(&mut self, key: MetadataRecordKey, semantic: SemanticRecordMembership) {
+        if key.record.projections().contains(PersistedProjection::Semantic) {
+            match semantic {
+                SemanticRecordMembership::Included => {
+                    self.record_semantic(key, Fingerprint::ZERO);
+                }
+                SemanticRecordMembership::Omitted => {}
+            }
+        }
+        if key.record.projections().contains(PersistedProjection::DecodeLayout) {
+            Self::record(&mut self.decode_layout, key, &[]);
+        }
+    }
+
+    fn record(hasher: &mut StableHasher, key: MetadataRecordKey, bytes: &[u8]) {
+        hasher.write_u8(1);
+        key.hash(hasher);
+        hasher.write_u8(0);
+        hasher.write_usize(bytes.len());
+        hasher.write(bytes);
+    }
+
+    pub(crate) fn record_semantic(&mut self, key: MetadataRecordKey, value: Fingerprint) {
+        trace!(
+            record = key.record.name(),
+            owner = ?key.owner,
+            ?value,
+            "projected semantic metadata record"
+        );
+        Self::record(&mut self.semantic, key, &value.to_le_bytes());
+    }
+
+    pub(crate) fn record_wire_bytes(&mut self, key: MetadataRecordKey, bytes: &[u8]) {
+        if key.record.projections().contains(PersistedProjection::DecodeLayout) {
+            Self::record(&mut self.decode_layout, key, bytes);
+        }
+    }
+
+    pub(crate) fn finish(self) -> (MetadataContractHash, MetadataDecodeLayoutId) {
+        (
+            MetadataContractHash(Svh::new(self.semantic.finish())),
+            MetadataDecodeLayoutId(self.decode_layout.finish()),
+        )
+    }
 }
 
 enum SourceFileLayout {
@@ -73,8 +137,26 @@ impl SourceFileLayout {
 }
 
 enum MetadataEncoding<'a> {
-    CoarseFull { encoder: opaque::FileEncoder<'a> },
-    CoarseStub { encoder: opaque::FileEncoder<'a> },
+    CoarseFull {
+        encoder: opaque::FileEncoder<'static>,
+    },
+    CoarseStub {
+        encoder: opaque::FileEncoder<'static>,
+    },
+    RdrTrace {
+        encoder: MemEncoder,
+        selected: SelectedDefinitions<'a>,
+        references: ReferencedDefinitions,
+        scope: TraceScope,
+        hygiene_ctxt: Arc<HygieneEncodeContext>,
+        hygiene: &'a HygieneTrace,
+    },
+    RdrProjection {
+        encoder: MemEncoder,
+        projections: MetadataProjectionEncoder,
+        layout: &'a MetadataDefinitionLayout,
+        hygiene: &'a HygieneEncodeLayout,
+    },
 }
 
 struct MetadataEncoder<'a> {
@@ -83,12 +165,30 @@ struct MetadataEncoder<'a> {
 }
 
 impl MetadataEncoder<'_> {
-    pub(crate) fn enter(&mut self, key: MetadataRecordKey, _semantic: SemanticRecordMembership) {
+    pub(crate) fn enter(&mut self, key: MetadataRecordKey, semantic: SemanticRecordMembership) {
         self.records.push(key);
+        match &mut self.encoding {
+            MetadataEncoding::RdrProjection { projections, .. } => projections.enter(key, semantic),
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. } => {}
+        }
     }
 
     pub(crate) fn leave(&mut self, key: MetadataRecordKey) {
         assert_eq!(self.records.pop(), Some(key), "metadata encoder left a different record");
+    }
+
+    pub(crate) fn record_semantic(&mut self, fingerprint: Fingerprint) {
+        let key = self.active_record();
+        match &mut self.encoding {
+            MetadataEncoding::RdrProjection { projections, .. } => {
+                projections.record_semantic(key, fingerprint);
+            }
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. } => {}
+        }
     }
 
     pub(crate) fn active_record(&self) -> MetadataRecordKey {
@@ -99,6 +199,8 @@ impl MetadataEncoder<'_> {
         match &self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
             | MetadataEncoding::CoarseStub { encoder } => encoder.position(),
+            MetadataEncoding::RdrTrace { encoder, .. }
+            | MetadataEncoding::RdrProjection { encoder, .. } => encoder.position(),
         }
     }
 
@@ -106,6 +208,9 @@ impl MetadataEncoder<'_> {
         match &self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
             | MetadataEncoding::CoarseStub { encoder } => encoder.file(),
+            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {
+                bug!("metadata projection has no output file")
+            }
         }
     }
 
@@ -113,10 +218,25 @@ impl MetadataEncoder<'_> {
         match &mut self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
             | MetadataEncoding::CoarseStub { encoder } => encoder.flush(),
+            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {}
         }
     }
 
-    fn record_wire_bytes(&mut self, _bytes: &[u8]) {}
+    fn record_wire_bytes(&mut self, bytes: &[u8]) {
+        match &mut self.encoding {
+            MetadataEncoding::RdrProjection { projections, .. } => {
+                let key = self
+                    .records
+                    .last()
+                    .copied()
+                    .expect("metadata encoder operated outside a declared record");
+                projections.record_wire_bytes(key, bytes);
+            }
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. } => {}
+        }
+    }
 }
 
 macro_rules! encoder_methods {
@@ -127,6 +247,8 @@ macro_rules! encoder_methods {
                     match &mut self.encoding {
                         MetadataEncoding::CoarseFull { encoder, .. }
                         | MetadataEncoding::CoarseStub { encoder } => encoder.$name(value),
+                        MetadataEncoding::RdrTrace { encoder, .. }
+                        | MetadataEncoding::RdrProjection { encoder, .. } => encoder.$name(value),
                     }
                 }
             )*
@@ -154,6 +276,16 @@ impl Encoder for MetadataEncoder<'_> {
         match &mut self.encoding {
             MetadataEncoding::CoarseFull { encoder, .. }
             | MetadataEncoding::CoarseStub { encoder } => encoder.emit_raw_bytes(bytes),
+            MetadataEncoding::RdrTrace { encoder, .. }
+            | MetadataEncoding::RdrProjection { encoder, .. } => encoder.emit_raw_bytes(bytes),
+        }
+    }
+}
+impl MetadataEncoding<'_> {
+    fn definition_layout(&self) -> Option<&MetadataDefinitionLayout> {
+        match self {
+            Self::CoarseFull { .. } | Self::CoarseStub { .. } | Self::RdrTrace { .. } => None,
+            Self::RdrProjection { layout, .. } => Some(layout),
         }
     }
 }
@@ -161,7 +293,9 @@ impl Encoder for MetadataEncoder<'_> {
 impl MetadataEncoder<'_> {
     fn artifact_kind(&self) -> MetadataArtifactKind {
         match &self.encoding {
-            MetadataEncoding::CoarseFull { .. } => MetadataArtifactKind::Full,
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. } => MetadataArtifactKind::Full,
             MetadataEncoding::CoarseStub { .. } => MetadataArtifactKind::Stub,
         }
     }
@@ -169,20 +303,29 @@ impl MetadataEncoder<'_> {
     fn is_rdr(&self) -> bool {
         match self.encoding {
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => false,
+            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => true,
         }
     }
 
-    fn includes_semantics(&self, _key: MetadataRecordKey) -> bool {
+    fn includes_semantics(&self, key: MetadataRecordKey) -> bool {
         match &self.encoding {
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => true,
+            MetadataEncoding::RdrTrace { selected, .. } => key.is_semantic(*selected),
+            MetadataEncoding::RdrProjection { layout, .. } => key.is_semantic(layout.selection()),
         }
     }
 
-    fn contains_def_id(&self, _def_id: DefId) -> bool {
-        true
+    fn contains_def_id(&mut self, def_id: DefId) -> bool {
+        match &mut self.encoding {
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => true,
+            MetadataEncoding::RdrTrace { selected, references, .. } => {
+                references.selection_query(*selected, def_id)
+            }
+            MetadataEncoding::RdrProjection { layout, .. } => layout.selection().includes(def_id),
+        }
     }
 
-    fn contains_module_child(&self, child: &ModChild) -> bool {
+    fn contains_module_child(&mut self, child: &ModChild) -> bool {
         let def_id = match child.reexport_chain.first().copied() {
             Some(Reexport::Single(def_id))
             | Some(Reexport::Glob(def_id))
@@ -192,9 +335,36 @@ impl MetadataEncoder<'_> {
         def_id.is_none_or(|def_id| self.contains_def_id(def_id))
     }
 
-    fn encode_def_index(&mut self, index: DefIndex, _projection: DefinitionProjection) -> DefIndex {
+    fn contains_trait_impl(&mut self, def_id: LocalDefId, trait_ref: ty::TraitRef<'_>) -> bool {
+        let tracing = matches!(self.encoding, MetadataEncoding::RdrTrace { .. });
+        if self.contains_def_id(def_id.to_def_id()) {
+            return true;
+        }
+        if !tracing {
+            return false;
+        }
+        if trait_ref.def_id.is_local() && self.contains_def_id(trait_ref.def_id) {
+            return true;
+        }
+
+        trait_ref.self_ty().walk().filter_map(|arg| arg.as_type()).any(|ty| {
+            let def_id = match ty.kind() {
+                ty::Adt(def, _) => def.did(),
+                ty::Foreign(def_id) => *def_id,
+                _ => return false,
+            };
+            def_id.is_local() && self.contains_def_id(def_id)
+        })
+    }
+
+    fn encode_def_index(&mut self, index: DefIndex, projection: DefinitionProjection) -> DefIndex {
         match &mut self.encoding {
             MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => index,
+            MetadataEncoding::RdrTrace { references, .. } => {
+                references.observe(LocalDefId { local_def_index: index }, projection);
+                index
+            }
+            MetadataEncoding::RdrProjection { layout, .. } => layout.encode(index),
         }
     }
 }
@@ -204,6 +374,9 @@ pub(crate) struct EncodeContext<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     feat: &'tcx rustc_feature::Features,
     tables: TableBuilders,
+    span_layout: SpanLayout,
+    span_occurrence_counts: FxHashMap<MetadataRecordKey, u32>,
+    hygiene_occurrence_counts: FxHashMap<(MetadataRecordKey, HygieneReferenceKind), u32>,
     recorded_records: FxIndexSet<PersistedRecord>,
 
     lazy_state: LazyState,
@@ -221,6 +394,17 @@ pub(crate) struct EncodeContext<'a, 'tcx> {
     hygiene_ctxt: Arc<HygieneEncodeContext>,
     // Used for both `Symbol`s and `ByteSymbol`s.
     symbol_index_table: FxHashMap<u32, usize>,
+}
+
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+enum HygieneReferenceKind {
+    SyntaxContext,
+    Expansion,
+}
+
+enum HygieneReference {
+    SyntaxContext(SyntaxContext),
+    Expansion(rustc_span::hygiene::ExpnId),
 }
 
 define_table_writers!();
@@ -318,11 +502,13 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
     }
 
     fn encode_syntax_context(&mut self, syntax_context: SyntaxContext) {
+        self.trace_hygiene_reference(HygieneReference::SyntaxContext(syntax_context));
         let hygiene_ctxt = Arc::clone(&self.hygiene_ctxt);
         rustc_span::hygiene::raw_encode_syntax_context(syntax_context, &hygiene_ctxt, self);
     }
 
     fn encode_expn_id(&mut self, expn_id: ExpnId) {
+        self.trace_hygiene_reference(HygieneReference::Expansion(expn_id));
         if expn_id.krate == LOCAL_CRATE {
             // We will only write details for local expansions. Non-local expansions will fetch
             // data from the corresponding crate's metadata.
@@ -335,6 +521,25 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
     }
 
     fn encode_span(&mut self, span: Span) {
+        let record = self.opaque.active_record();
+        let ordinal = self.span_occurrence_counts.entry(record).or_default();
+        let occurrence = SpanOccurrence { record, ordinal: *ordinal };
+        *ordinal =
+            ordinal.checked_add(1).expect("cannot encode more than U32_MAX spans per record");
+        match &self.opaque.encoding {
+            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {
+                let slot = self.span_layout.push(occurrence);
+                if span.is_dummy() {
+                    RdrSpanLocation::Dummy
+                } else {
+                    RdrSpanLocation::Position(slot)
+                }
+                .encode(self);
+                span.ctxt().encode(self);
+                return;
+            }
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {}
+        }
         match self.span_shorthands.entry(span) {
             Entry::Occupied(o) => {
                 // If an offset is smaller than the absolute position, we encode with the offset.
@@ -372,6 +577,45 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
         self.encode_symbol_or_byte_symbol(byte_sym.as_u32(), |this| {
             this.emit_byte_str(byte_sym.as_byte_str())
         });
+    }
+}
+
+impl EncodeContext<'_, '_> {
+    fn trace_hygiene_reference(&mut self, reference: HygieneReference) {
+        let trace = match &self.opaque.encoding {
+            MetadataEncoding::RdrTrace { scope, hygiene, .. }
+                if !matches!(scope, TraceScope::Hygiene) =>
+            {
+                Some(*hygiene)
+            }
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. }
+            | MetadataEncoding::RdrProjection { .. } => None,
+        };
+        let Some(trace) = trace else {
+            return;
+        };
+        let kind = match reference {
+            HygieneReference::SyntaxContext(_) => HygieneReferenceKind::SyntaxContext,
+            HygieneReference::Expansion(_) => HygieneReferenceKind::Expansion,
+        };
+        let record = self.opaque.active_record();
+        let ordinal = self.hygiene_occurrence_counts.entry((record, kind)).or_default();
+        let occurrence = {
+            let mut hasher = StableHasher::new();
+            (record, kind, *ordinal).hash(&mut hasher);
+            hasher.finish()
+        };
+        *ordinal = ordinal
+            .checked_add(1)
+            .expect("cannot encode more than U32_MAX hygiene references per record");
+        match reference {
+            HygieneReference::SyntaxContext(ctxt) => {
+                trace.observe_syntax_context(ctxt, occurrence);
+            }
+            HygieneReference::Expansion(expn) => trace.observe_expansion(expn, occurrence),
+        }
     }
 }
 
@@ -598,8 +842,27 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
     pub(crate) fn project_semantic<T: MetadataSemanticValue + StableHash + ?Sized>(
         &mut self,
-        _value: &T,
+        value: &T,
     ) {
+        match &self.opaque.encoding {
+            MetadataEncoding::RdrProjection { .. } => {}
+            MetadataEncoding::CoarseFull { .. }
+            | MetadataEncoding::CoarseStub { .. }
+            | MetadataEncoding::RdrTrace { .. } => return,
+        }
+        let key = self.opaque.active_record();
+        if !key.record.projections().contains(PersistedProjection::Semantic)
+            || !self.opaque.includes_semantics(key)
+        {
+            return;
+        }
+        let layout = self.hygiene_ctxt.artifact_layout();
+        let fingerprint = self.tcx.with_metadata_stable_hashing_context(layout, |hcx| {
+            let mut hasher = StableHasher::new();
+            value.stable_hash(hcx, &mut hasher);
+            hasher.finish()
+        });
+        self.opaque.record_semantic(fingerprint);
     }
 
     pub(crate) fn map_def_index(&mut self, index: DefIndex) -> DefIndex {
@@ -625,10 +888,22 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     fn with_definition_record(
         &mut self,
         record: PersistedRecord,
-        _index: DefIndex,
+        index: DefIndex,
         encode: impl FnOnce(&mut Self),
     ) {
-        self.with_record_key(MetadataRecordKey { record, owner: None }, encode);
+        let def_id = LocalDefId { local_def_index: index };
+        let owner = if self.opaque.is_rdr() {
+            Some(self.tcx.definitions().def_path_hash(def_id))
+        } else {
+            None
+        };
+        let key = MetadataRecordKey { record, owner };
+        if let MetadataEncoding::RdrTrace { selected, references, .. } = &mut self.opaque.encoding
+            && !references.selection_query(*selected, def_id.to_def_id())
+        {
+            return;
+        }
+        self.with_record_key(key, encode);
     }
 
     fn with_record_key<T>(
@@ -670,7 +945,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     ) -> T {
         let record = key.record;
         assert!(
-            self.visits(record),
+            self.visits(record)
+                && self
+                    .opaque
+                    .encoding
+                    .definition_layout()
+                    .is_none_or(|layout| key.is_selected(layout.selection())),
             "metadata encoder entered a record absent from its selection: {}",
             record.name()
         );
@@ -824,7 +1104,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         let defs = self.tcx.definitions();
         for def_id in std::iter::once(CRATE_DEF_ID)
-            .chain(self.tcx.resolutions(()).proc_macros.iter().copied())
+            .chain(self.tcx.metadata_resolutions(()).0.proc_macros.iter().copied())
         {
             let def_path_hash = defs.def_path_hash(def_id);
             self.def_keys(
@@ -959,6 +1239,32 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         })
     }
 
+    fn encode_artifact_records(&mut self) {
+        let _ = self.encode_externally_implementable_items();
+        let _ = self.encode_crate_deps();
+        let _ = self.encode_dylib_dependency_formats();
+        let _ = self.encode_lib_features();
+        let _ = self.encode_stability_implications();
+        let _ = self.encode_lang_items();
+        let _ = self.encode_lang_items_missing();
+        let _ = self.encode_stripped_cfg_items();
+        let _ = self.encode_diagnostic_items();
+        let _ = self.encode_canonical_symbols();
+        let _ = self.encode_native_libraries();
+        let _ = self.encode_foreign_modules();
+        let _ = self.encode_traits();
+        let _ = self.encode_impls();
+        let _ = self.encode_incoherent_impls();
+        let _ = self.encode_debugger_visualizers();
+        let _ = self.encode_exportable_items();
+        let _ = self.encode_stable_order_of_exportable_impls();
+
+        let _ = self.encode_exported_symbols();
+        let _ = self.encode_def_path_hash_map();
+        let _ = self.encode_target_modifiers();
+        let _ = self.encode_enabled_denied_partial_mitigations();
+    }
+
     fn encode_exported_symbols(
         &mut self,
     ) -> (
@@ -1014,7 +1320,13 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     }
 
     fn encode_crate_root(&mut self) -> (LazyValue<CrateRoot>, HygieneDelta) {
-        let contract_hash = self.tcx.crate_hash(LOCAL_CRATE);
+        let contract_hash = match &self.opaque.encoding {
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
+                self.tcx.crate_hash(LOCAL_CRATE)
+            }
+            MetadataEncoding::RdrTrace { .. } => bug!("definition trace encoded a crate root"),
+            MetadataEncoding::RdrProjection { .. } => Svh::new(Fingerprint::ZERO),
+        };
 
         let tcx = self.tcx;
         let mut stats: Vec<(&'static str, usize)> = Vec::with_capacity(32);
@@ -1122,7 +1434,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             .encode_enabled_denied_partial_mitigations());
 
         let root = stat!("final", || {
-            let attrs = tcx.hir_krate_attrs();
+            let attrs = tcx.metadata_attrs(CRATE_DEF_ID).0;
             let is_proc_macro_crate = proc_macro_data.is_some();
             let header = self.header(
                 CrateHeaderRecord {
@@ -1242,7 +1554,11 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let computed_total_bytes: usize = stats.iter().map(|(_, size)| size).sum();
         assert_eq!(total_bytes, computed_total_bytes);
 
-        if tcx.sess.opts.unstable_opts.meta_stats {
+        let emitted_artifact = match &self.opaque.encoding {
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => true,
+            MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => false,
+        };
+        if tcx.sess.opts.unstable_opts.meta_stats && emitted_artifact {
             use std::fmt::Write;
 
             self.opaque.flush();
@@ -1583,6 +1899,161 @@ fn should_encode_mir(
     }
 }
 
+fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
+    let reachable_set = tcx.reachable_set(());
+    let effective_visibilities = tcx.effective_visibilities(());
+    let macro_reachable_imports = &tcx.resolutions(()).macro_reachability.imports;
+    let mut semantic_roots = Vec::new();
+    for def_id in tcx.iter_local_def_id() {
+        if def_id == CRATE_DEF_ID {
+            continue;
+        }
+        let def_kind = tcx.def_kind(def_id);
+        let inherent_impl = def_kind == (DefKind::Impl { of_trait: false });
+        // A trait member can be codegen-reachable merely because its trait is external. Its
+        // enclosing impl determines whether that member can affect a downstream crate.
+        let trait_impl_is_relevant =
+            tcx.trait_impl_of_assoc(def_id.to_def_id()).is_none_or(|impl_id| {
+                let impl_id = impl_id.expect_local();
+                reachable_set.contains(&impl_id) || effective_visibilities.is_reachable(impl_id)
+            });
+        // Codegen reachability includes generated coroutine definitions reached through private
+        // owners. They become metadata definitions only when an already-selected semantic record
+        // references them.
+        let reachable = reachable_set.contains(&def_id)
+            && def_kind != DefKind::Closure
+            && def_kind != DefKind::SyntheticCoroutineBody
+            && !inherent_impl
+            && trait_impl_is_relevant;
+        let effectively_visible =
+            effective_visibilities.is_reachable(def_id) && !inherent_impl && trait_impl_is_relevant;
+        if reachable || effectively_visible || macro_reachable_imports.contains(&def_id) {
+            semantic_roots.push(def_id);
+        }
+    }
+    for &(symbol, _) in tcx
+        .exported_non_generic_symbols(LOCAL_CRATE)
+        .iter()
+        .chain(tcx.exported_generic_symbols(LOCAL_CRATE).iter())
+    {
+        let def_id = match symbol {
+            ExportedSymbol::NonGeneric(def_id)
+            | ExportedSymbol::Generic(def_id, _)
+            | ExportedSymbol::AsyncDropGlue(def_id, _)
+            | ExportedSymbol::ThreadLocalShim(def_id) => def_id,
+            ExportedSymbol::DropGlue(_)
+            | ExportedSymbol::AsyncDropGlueCtorShim(_)
+            | ExportedSymbol::NoDefId(_) => continue,
+        };
+        if let Some(def_id) = def_id.as_local() {
+            semantic_roots.push(def_id);
+        }
+    }
+
+    let hygiene_ctxt = Arc::new(HygieneEncodeContext::default());
+    let (definitions, hygiene) = tcx.with_stable_hashing_context(|mut hcx| {
+        HygieneEncodeLayout::trace(&mut hcx, |hygiene| {
+            MetadataDefinitionLayout::trace(tcx, semantic_roots, |scope, selected| {
+                let mut sink = MemEncoder::new();
+                sink.emit_u8(0);
+                let mut encoder = EncodeContext::new(
+                    tcx,
+                    MetadataEncoding::RdrTrace {
+                        encoder: sink,
+                        selected,
+                        references: ReferencedDefinitions::default(),
+                        scope,
+                        hygiene_ctxt: Arc::clone(&hygiene_ctxt),
+                        hygiene,
+                    },
+                );
+                match scope {
+                    TraceScope::Artifact => {
+                        encoder.encode_artifact_records();
+                        let _ = encoder.encode_interpret_alloc_index();
+                    }
+                    TraceScope::Definition { def_id, projection: _ } => {
+                        encoder.encode_definition(def_id);
+                        let _ = encoder.encode_interpret_alloc_index();
+                    }
+                    TraceScope::Hygiene => {
+                        let (_, _, _, delta) = encoder.encode_hygiene();
+                        hygiene.extend(delta);
+                    }
+                }
+                let MetadataEncoder {
+                    encoding: MetadataEncoding::RdrTrace { references, .. },
+                    records: _,
+                } = encoder.opaque
+                else {
+                    unreachable!("definition trace changed encoding mode")
+                };
+                references
+            })
+        })
+    });
+    debug!("planned RDR metadata definition and hygiene closure");
+    let mut encoder = EncodeContext::new(
+        tcx,
+        MetadataEncoding::RdrProjection {
+            encoder: MemEncoder::new(),
+            projections: MetadataProjectionEncoder::new(),
+            layout: &definitions,
+            hygiene: &hygiene,
+        },
+    );
+    encoder.encode_preamble();
+    encoder.with_record(
+        PersistedRecord::Artifact(PersistedArtifactRecord::rustc_version),
+        |encoder| rustc_version(tcx.sess.cfg_version).encode(encoder),
+    );
+    let (_, encoded_hygiene) = encoder.encode_crate_root();
+    let span_layout = encoder.span_layout.metadata_layout();
+    let MetadataEncoder {
+        encoding: MetadataEncoding::RdrProjection { projections, .. },
+        records: _,
+    } = encoder.opaque
+    else {
+        unreachable!("closed projection changed encoding mode")
+    };
+    let (contract, decode_layout) = projections.finish();
+    hygiene.assert_reached(encoded_hygiene);
+    MetadataProjection { contract, decode_layout, definitions, hygiene, span_layout }
+}
+
+fn metadata_contract_hash(tcx: TyCtxt<'_>, _: ()) -> MetadataContractHash {
+    if !tcx.sess.opts.unstable_opts.rdr || tcx.crate_types().contains(&CrateType::ProcMacro) {
+        return MetadataContractHash(tcx.crate_hash(LOCAL_CRATE));
+    }
+    tcx.metadata_projection(()).contract
+}
+
+fn metadata_decode_layout_id(tcx: TyCtxt<'_>, _: LocalCrate) -> MetadataDecodeLayoutId {
+    if !tcx.sess.opts.unstable_opts.rdr || tcx.crate_types().contains(&CrateType::ProcMacro) {
+        let hash = tcx.crate_hash(LOCAL_CRATE).as_u128();
+        return MetadataDecodeLayoutId(Fingerprint::new(hash as u64, (hash >> 64) as u64));
+    }
+    tcx.metadata_projection(()).decode_layout
+}
+
+fn metadata_definition_spans(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+) -> MetadataSemantic<MetadataDefinitionSpans> {
+    MetadataSemantic(MetadataDefinitionSpans {
+        span: tcx.def_span(def_id),
+        ident: tcx.def_ident_span(def_id.to_def_id()),
+    })
+}
+
+fn metadata_resolutions(tcx: TyCtxt<'_>, _: ()) -> MetadataSemantic<&ty::ResolverGlobalCtxt> {
+    MetadataSemantic(tcx.resolutions(()))
+}
+
+fn metadata_attrs(tcx: TyCtxt<'_>, def_id: LocalDefId) -> MetadataSemantic<&[hir::Attribute]> {
+    MetadataSemantic(tcx.hir_attrs(tcx.local_def_id_to_hir_id(def_id)))
+}
+
 fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: DefKind) -> bool {
     match def_kind {
         DefKind::Struct
@@ -1845,8 +2316,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             is_exported: tcx.effective_visibilities(()).is_exported(def_id),
             is_doc_hidden: false,
         };
-        let attrs = tcx.hir_attrs(tcx.local_def_id_to_hir_id(def_id));
-        let attr_iter = attrs.iter().filter(|attr| analyze_attr(*attr, &mut state));
+        let attr_iter =
+            tcx.metadata_attrs(def_id).0.iter().filter(|attr| analyze_attr(*attr, &mut state));
 
         record_array!(self.tables.attributes[def_id.to_def_id()] <- attr_iter);
 
@@ -1864,7 +2335,14 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
 
         let tcx = self.tcx;
-        for local_id in tcx.iter_local_def_id() {
+        let definitions: Vec<_> = match &self.opaque.encoding {
+            MetadataEncoding::RdrProjection { layout, .. } => layout.iter().collect(),
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
+                tcx.iter_local_def_id().collect()
+            }
+            MetadataEncoding::RdrTrace { .. } => Vec::new(),
+        };
+        for local_id in definitions {
             self.encode_definition(local_id);
         }
     }
@@ -1914,12 +2392,12 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
 
         let definition_spans = if should_encode_span(def_kind) {
-            Some((tcx.def_span(local_id), tcx.def_ident_span(def_id)))
+            Some(tcx.metadata_definition_spans(local_id).0)
         } else {
             None
         };
-        if let Some((span, _)) = definition_spans {
-            record!(self.tables.def_span[def_id] <- span);
+        if let Some(spans) = definition_spans {
+            record!(self.tables.def_span[def_id] <- spans.span);
         }
         if should_encode_attrs(def_kind) {
             self.encode_attrs(local_id);
@@ -1927,8 +2405,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         if should_encode_expn_that_defined(def_kind) {
             record!(self.tables.expn_that_defined[def_id] <- self.tcx.expn_that_defined(def_id));
         }
-        if let Some((_, ident)) = definition_spans {
-            if let Some(ident_span) = ident {
+        if let Some(spans) = definition_spans {
+            if let Some(ident_span) = spans.ident {
                 record!(self.tables.def_ident_span[def_id] <- ident_span);
             }
         }
@@ -2002,7 +2480,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     self.tcx.explicit_implied_clauses_of(def_id).skip_binder());
             let module_children = self
                 .tcx
-                .resolutions(())
+                .metadata_resolutions(())
+                .0
                 .module_children
                 .get(&local_id)
                 .map_or_default(|children| &children[..]);
@@ -2109,14 +2588,17 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         if let DefKind::Mod = def_kind {
             self.encode_info_for_mod(local_id);
             let mod_id = LocalModId::new_unchecked(local_id);
-            if let Some(res_map) = tcx.resolutions(()).doc_link_resolutions.get(&mod_id) {
+            if let Some(res_map) = tcx.metadata_resolutions(()).0.doc_link_resolutions.get(&mod_id)
+            {
                 self.doc_link_resolutions(
                     local_id.local_def_index,
                     DocLinkResolutionsRecord::new(res_map),
                     |encoder, record| encoder.lazy_doc_link_resolutions(&record.encoded),
                 );
             }
-            if let Some(traits) = tcx.resolutions(()).doc_link_traits_in_scope.get(&mod_id) {
+            if let Some(traits) =
+                tcx.metadata_resolutions(()).0.doc_link_traits_in_scope.get(&mod_id)
+            {
                 record_array!(self.tables.doc_link_traits_in_scope[def_id] <- traits);
             }
         }
@@ -2236,7 +2718,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         if adt_def.is_enum() {
             let module_children = tcx
-                .resolutions(())
+                .metadata_resolutions(())
+                .0
                 .module_children
                 .get(&local_def_id)
                 .map_or_default(|children| &children[..]);
@@ -2355,7 +2838,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             record!(self.tables.expn_that_defined[def_id] <- tcx.expn_that_defined(local_def_id));
         } else {
             let module_children = tcx
-                .resolutions(())
+                .metadata_resolutions(())
+                .0
                 .module_children
                 .get(&local_def_id)
                 .map_or_default(|children| &children[..]);
@@ -2386,7 +2870,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 }));
 
             let ambig_module_children = tcx
-                .resolutions(())
+                .metadata_resolutions(())
+                .0
                 .ambig_module_children
                 .get(&local_def_id)
                 .map_or_default(|v| &v[..]);
@@ -2706,14 +3191,18 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record!(self.tables.lookup_stability[LOCAL_CRATE.as_def_id()] <- stability);
             }
             self.encode_deprecation(LOCAL_CRATE.as_def_id());
-            if let Some(res_map) = tcx.resolutions(()).doc_link_resolutions.get(&CRATE_MOD_ID) {
+            if let Some(res_map) =
+                tcx.metadata_resolutions(()).0.doc_link_resolutions.get(&CRATE_MOD_ID)
+            {
                 self.doc_link_resolutions(
                     LOCAL_CRATE.as_def_id().index,
                     DocLinkResolutionsRecord::new(res_map),
                     |encoder, record| encoder.lazy_doc_link_resolutions(&record.encoded),
                 );
             }
-            if let Some(traits) = tcx.resolutions(()).doc_link_traits_in_scope.get(&CRATE_MOD_ID) {
+            if let Some(traits) =
+                tcx.metadata_resolutions(()).0.doc_link_traits_in_scope.get(&CRATE_MOD_ID)
+            {
                 record_array!(self.tables.doc_link_traits_in_scope[LOCAL_CRATE.as_def_id()] <- traits);
             }
 
@@ -2722,14 +3211,14 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             // Normally, this information is encoded when we walk the items
             // defined in this crate. However, we skip doing that for proc-macro crates,
             // so we manually encode just the information that we need
-            for &proc_macro in &tcx.resolutions(()).proc_macros {
+            for &proc_macro in &tcx.metadata_resolutions(()).0.proc_macros {
                 let id = proc_macro;
                 let proc_macro = tcx.local_def_id_to_hir_id(proc_macro);
                 let mut name = tcx.hir_name(proc_macro);
                 let span = tcx.hir_span(proc_macro);
                 // Proc-macros may have attributes like `#[allow_internal_unstable]`,
                 // so downstream crates need access to them.
-                let attrs = tcx.hir_attrs(tcx.local_def_id_to_hir_id(id));
+                let attrs = tcx.metadata_attrs(id).0;
                 let (macro_kind, kind) = if find_attr!(attrs, ProcMacro) {
                     (MacroKind::Bang, ProcMacroKind::Bang { name: name.as_str().to_owned() })
                 } else if find_attr!(attrs, ProcMacroAttribute) {
@@ -2968,7 +3457,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 let parent_scope = item.parent_scope.expect_local();
                 let module_children = self
                     .tcx
-                    .resolutions(())
+                    .metadata_resolutions(())
+                    .0
                     .module_children
                     .get(&parent_scope)
                     .map_or_default(|children| &children[..]);
@@ -3030,6 +3520,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             if of_trait {
                 let header = tcx.impl_trait_header(def_id);
                 let trait_ref = header.trait_ref.instantiate_identity().skip_norm_wip();
+                if !self.opaque.contains_trait_impl(id.owner_id.def_id, trait_ref) {
+                    continue;
+                }
                 let simplified_self_ty = fast_reject::simplify_type(
                     self.tcx,
                     trait_ref.self_ty(),
@@ -3372,7 +3865,15 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
 
 impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     fn new(tcx: TyCtxt<'tcx>, encoding: MetadataEncoding<'a>) -> Self {
-        let hygiene_ctxt = Arc::new(HygieneEncodeContext::default());
+        let hygiene_ctxt = match &encoding {
+            MetadataEncoding::RdrTrace { hygiene_ctxt, .. } => Arc::clone(hygiene_ctxt),
+            MetadataEncoding::RdrProjection { hygiene, .. } => {
+                Arc::new(HygieneEncodeContext::with_layout((*hygiene).clone()))
+            }
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => {
+                Arc::new(HygieneEncodeContext::default())
+            }
+        };
         let source_map_files = tcx.sess.source_map().files();
         let source_file_cache = (Arc::clone(&source_map_files[0]), 0);
         drop(source_map_files);
@@ -3384,6 +3885,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             tcx,
             feat: tcx.features(),
             tables: Default::default(),
+            span_layout: SpanLayout::default(),
+            span_occurrence_counts: FxHashMap::default(),
+            hygiene_occurrence_counts: FxHashMap::default(),
             recorded_records,
             lazy_state: LazyState::NoNode,
             span_shorthands: Default::default(),
@@ -3444,6 +3948,9 @@ fn with_encode_metadata_header<'a, 'tcx>(
         MetadataEncoding::CoarseFull { encoder } | MetadataEncoding::CoarseStub { encoder } => {
             encoder
         }
+        MetadataEncoding::RdrTrace { .. } | MetadataEncoding::RdrProjection { .. } => {
+            bug!("metadata projection reached file encoding")
+        }
     };
     encoder
         .finish()
@@ -3462,21 +3969,27 @@ fn encode_root_position(mut file: &File, position: usize) -> Result<(), std::io:
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    *providers = Providers {
-        doc_link_resolutions: |tcx, def_id| {
-            tcx.resolutions(())
-                .doc_link_resolutions
-                .get(&def_id)
-                .unwrap_or_else(|| span_bug!(tcx.def_span(def_id), "no resolutions for a doc link"))
-        },
-        doc_link_traits_in_scope: |tcx, def_id| {
-            tcx.resolutions(()).doc_link_traits_in_scope.get(&def_id).unwrap_or_else(|| {
-                span_bug!(tcx.def_span(def_id), "no traits in scope for a doc link")
-            })
-        },
+    *providers =
+        Providers {
+            doc_link_resolutions: |tcx, def_id| {
+                tcx.metadata_resolutions(()).0.doc_link_resolutions.get(&def_id).unwrap_or_else(
+                    || span_bug!(tcx.def_span(def_id), "no resolutions for a doc link"),
+                )
+            },
+            doc_link_traits_in_scope: |tcx, def_id| {
+                tcx.metadata_resolutions(()).0.doc_link_traits_in_scope.get(&def_id).unwrap_or_else(
+                    || span_bug!(tcx.def_span(def_id), "no traits in scope for a doc link"),
+                )
+            },
+            metadata_attrs,
+            metadata_contract_hash,
+            metadata_decode_layout_id,
+            metadata_definition_spans,
+            metadata_projection,
+            metadata_resolutions,
 
-        ..*providers
-    }
+            ..*providers
+        }
 }
 
 /// Build a textual representation of an unevaluated constant expression.

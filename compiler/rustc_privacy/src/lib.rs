@@ -1833,8 +1833,8 @@ fn effective_visibilities(tcx: TyCtxt<'_>, (): ()) -> &EffectiveVisibilities {
     }
 
     // FIXME: remove this once proper support for defs reachability from macros is implemented.
-    // See `ResolverGlobalCtxt::macro_reachable_adts` comment.
-    for (&adt_def_id, macro_mods) in &tcx.resolutions(()).macro_reachable_adts {
+    // See `MacroReachability::adts`.
+    for (&adt_def_id, macro_mods) in &tcx.resolutions(()).macro_reachability.adts {
         let struct_def = tcx.adt_def(adt_def_id);
         let Some(struct_ev) = visitor.effective_visibilities.effective_vis(adt_def_id).copied()
         else {

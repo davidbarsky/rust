@@ -1,17 +1,38 @@
 use std::collections::VecDeque;
 
-#[cfg(test)]
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet, IndexEntry};
 use rustc_data_structures::stable_hash::{SpanHashMode, StableHash, StableHashCtxt, StableHasher};
+use rustc_data_structures::svh::Svh;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefIndex, DefPathHash, LocalDefId};
-use rustc_macros::{StableHash, TyDecodable, TyEncodable};
-use rustc_span::Ident;
+use rustc_macros::{
+    Decodable_NoContext, Encodable_NoContext, StableHash, TyDecodable, TyEncodable,
+};
 use rustc_span::def_id::{DefId, ModId};
+use rustc_span::hygiene::HygieneEncodeLayout;
+use rustc_span::{Ident, Span};
 use smallvec::SmallVec;
 
 use crate::ty::{self, TyCtxt};
+
+/// Identifies only the cross-crate semantic contract exposed through metadata.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Decodable_NoContext,
+    Encodable_NoContext,
+    Eq,
+    Hash,
+    PartialEq,
+    StableHash
+)]
+pub struct MetadataContractHash(pub Svh);
+
+impl crate::query::erase::Erasable for MetadataContractHash {
+    type Storage = [u8; size_of::<Self>()];
+}
 
 /// Describes why an artifact-local definition remains in an RDR metadata artifact.
 ///
@@ -533,10 +554,37 @@ fn closed_layout_rejects_an_untraced_definition() {
     layout.encode(DefIndex::from_u32(1));
 }
 
+/// Carries the result of one complete projection of the metadata schema.
+///
+/// Coordinates are intentionally excluded from stable hashing so source movement can replace the
+/// position data without invalidating the semantic and decode-layout identities.
+#[derive(Debug)]
+pub struct MetadataProjection {
+    pub contract: MetadataContractHash,
+    pub decode_layout: MetadataDecodeLayoutId,
+    pub definitions: MetadataDefinitionLayout,
+    pub hygiene: HygieneEncodeLayout,
+    pub span_layout: MetadataSpanLayout,
+}
+
+/// Keeps both definition spans in one coordinate-free incremental dependency.
+///
+/// Metadata must observe declaration and identifier hygiene together without making either
+/// source coordinate part of its semantic contract.
+#[derive(Clone, Copy, Debug, StableHash)]
+pub struct MetadataDefinitionSpans {
+    pub span: Span,
+    pub ident: Option<Span>,
+}
+
+impl crate::query::erase::Erasable for MetadataDefinitionSpans {
+    type Storage = [u8; size_of::<Self>()];
+}
+
 /// Keeps source coordinates out of metadata's semantic incremental dependencies.
 ///
 /// The wrapped value still hashes span hygiene. Position traversal reads ordinary query results,
-/// so coordinate-only edits regenerate the spans cache without forcing semantic metadata
+/// so coordinate-only edits regenerate the position data without forcing semantic metadata
 /// projection.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
@@ -552,6 +600,51 @@ impl<T: StableHash> StableHash for MetadataSemantic<T> {
 
 impl<T: crate::query::erase::Erasable> crate::query::erase::Erasable for MetadataSemantic<T> {
     type Storage = T::Storage;
+}
+
+impl StableHash for MetadataProjection {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        self.contract.stable_hash(hcx, hasher);
+        self.decode_layout.stable_hash(hcx, hasher);
+    }
+}
+
+/// Identifies the compact-address and span-slot layout expected by a metadata decoder.
+///
+/// This is separate from the semantic crate hash because equal exported semantics can use
+/// incompatible artifact-local addresses.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Decodable_NoContext,
+    Encodable_NoContext,
+    Eq,
+    Hash,
+    PartialEq,
+    StableHash
+)]
+pub struct MetadataDecodeLayoutId(pub Fingerprint);
+
+impl crate::query::erase::Erasable for MetadataDecodeLayoutId {
+    type Storage = [u8; size_of::<Self>()];
+}
+
+/// Keeps a span occurrence transcript inseparable from the slot range that it addresses.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Decodable_NoContext,
+    Encodable_NoContext,
+    Eq,
+    Hash,
+    PartialEq,
+    StableHash
+)]
+pub struct MetadataSpanLayout {
+    pub id: Fingerprint,
+    pub slot_count: u32,
 }
 
 /// A simplified version of `ImportKind` from resolve.
