@@ -1,0 +1,34 @@
+error[E0425]: cannot find function `unavailable` in module `cfg_stripped::api`
+  --> $DIR/cfg-stripped.rs:7:24
+   |
+LL |     cfg_stripped::api::unavailable();
+   |                        ^^^^^^^^^^^ not found in `cfg_stripped::api`
+   |
+note: found an item that was configured out
+  --> $DIR/auxiliary/cfg_stripped.rs:7:12
+   |
+LL |     #[cfg(false)]
+   |           ----- the item is gated here
+LL |     pub fn unavailable() {}
+   |            ^^^^^^^^^^^
+
+error[E0573]: cannot find type `value_namespace` in module `cfg_stripped::api`
+  --> $DIR/cfg-stripped.rs:12:31
+   |
+LL |     let _: cfg_stripped::api::value_namespace;
+   |                               ^^^^^^^^^^^^^^^ not found in `cfg_stripped::api`
+   |
+   = note: a function named `cfg_stripped::api::value_namespace` exists in another namespace
+note: found an item that was configured out
+  --> $DIR/auxiliary/cfg_stripped.rs:13:14
+   |
+LL |     #[cfg(false)]
+   |           ----- the item is gated here
+LL |     #[allow(non_camel_case_types)]
+LL |     pub type value_namespace = ();
+   |              ^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0425, E0573.
+For more information about an error, try `rustc --explain E0425`.
