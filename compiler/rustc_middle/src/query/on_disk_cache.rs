@@ -278,20 +278,21 @@ impl OnDiskCache {
             // Encode all hygiene data (`SyntaxContextData` and `ExpnData`) from the current
             // session.
 
-            hygiene_encode_context.encode(
+            hygiene_encode_context.encode_pending(
                 &mut encoder,
-                |encoder, index, ctxt_data| {
+                |encoder, context| {
                     let pos = AbsoluteBytePos::new(encoder.position());
-                    encoder.encode_tagged(TAG_SYNTAX_CONTEXT, ctxt_data);
-                    syntax_contexts.insert(index, pos);
+                    encoder.encode_tagged(TAG_SYNTAX_CONTEXT, context.data());
+                    syntax_contexts.insert(context.index(), pos);
                 },
-                |encoder, expn_id, data, hash| {
-                    if expn_id.krate == LOCAL_CRATE {
+                |encoder, expansion| {
+                    if expansion.id().krate == LOCAL_CRATE {
                         let pos = AbsoluteBytePos::new(encoder.position());
-                        encoder.encode_tagged(TAG_EXPN_DATA, data);
-                        expn_data.insert(hash, pos);
+                        encoder.encode_tagged(TAG_EXPN_DATA, expansion.data());
+                        expn_data.insert(expansion.hash(), pos);
                     } else {
-                        foreign_expn_data.insert(hash, expn_id.local_id.as_u32());
+                        foreign_expn_data
+                            .insert(expansion.hash(), expansion.id().local_id.as_u32());
                     }
                 },
             );

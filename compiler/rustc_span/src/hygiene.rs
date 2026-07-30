@@ -24,6 +24,7 @@
 // because getting it wrong can lead to nested `HygieneData::with` calls that
 // trigger runtime aborts. (Fortunately these are obvious and easy to fix.)
 
+use std::collections::VecDeque;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::{fmt, iter, mem};
@@ -31,10 +32,12 @@ use std::{fmt, iter, mem};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stable_hash::{
-    StableHash, StableHashCtxt, StableHasher, ToStableHashKey,
+    RawDefId, RawDefPathHash, RawExpnId, RawSpan, SpanHashMode, StableCompare, StableHash,
+    StableHashControls, StableHashCtxt, StableHasher, ToStableHashKey,
 };
 use rustc_data_structures::sync::Lock;
 use rustc_data_structures::unhash::UnhashMap;
+use rustc_data_structures::unord::{ExtendUnord, UnordMap, UnordSet};
 use rustc_hashes::Hash64;
 use rustc_index::IndexVec;
 use rustc_macros::{Decodable, Encodable, StableHash};
@@ -157,6 +160,14 @@ impl ExpnHash {
     /// `local_hash`, where `local_hash` must be unique within its crate.
     fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> ExpnHash {
         ExpnHash(Fingerprint::new(stable_crate_id.0, local_hash))
+    }
+}
+
+impl StableCompare for ExpnHash {
+    const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    fn stable_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
     }
 }
 
@@ -1104,6 +1115,25 @@ impl ExpnData {
         matches!(self.kind, ExpnKind::Root)
     }
 
+    /// Hashes cross-artifact expansion meaning without the session collision disambiguator.
+    ///
+    /// The ordinary disambiguator depends on which equivalent expansions the current session
+    /// allocated first. RDR assigns duplicate identities from canonical metadata provenance, so
+    /// session allocation history must not enter this hash.
+    pub fn stable_hash_artifact_semantics<Hcx: StableHashCtxt>(
+        &self,
+        hcx: &mut Hcx,
+        hasher: &mut StableHasher,
+    ) {
+        self.for_metadata_artifact().stable_hash(hcx, hasher);
+    }
+
+    fn for_metadata_artifact(&self) -> Self {
+        let mut data = self.clone();
+        data.disambiguator = 0;
+        data
+    }
+
     #[inline]
     fn hash_expn(&self, hcx: &mut impl StableHashCtxt) -> Hash64 {
         let mut hasher = StableHasher::new();
@@ -1272,24 +1302,351 @@ impl DesugaringKind {
     }
 }
 
-#[derive(Default)]
 pub struct HygieneEncodeContext {
-    /// All `SyntaxContexts` for which we have written `SyntaxContextData` into crate metadata.
-    /// This is `None` after we finish encoding `SyntaxContexts`, to ensure
-    /// that we don't accidentally try to encode any more `SyntaxContexts`
-    serialized_ctxts: Lock<FxHashSet<SyntaxContext>>,
-    /// The `SyntaxContexts` that we have serialized (e.g. as a result of encoding `Spans`)
-    /// in the most recent 'round' of serializing. Serializing `SyntaxContextData`
-    /// may cause us to serialize more `SyntaxContext`s, so serialize in a loop
-    /// until we reach a fixed point.
-    latest_ctxts: Lock<FxHashSet<SyntaxContext>>,
+    // All syntax contexts emitted by this context. A frontier returns only the identities newly
+    // inserted into this set.
+    serialized_ctxts: Lock<UnordSet<SyntaxContext>>,
+    // Syntax contexts scheduled during the current round. Encoding their data may schedule more
+    // contexts, so `encode_pending` drains rounds until this set remains empty.
+    latest_ctxts: Lock<UnordSet<SyntaxContext>>,
 
-    serialized_expns: Lock<FxHashSet<ExpnId>>,
+    // Expansions use the same emitted/scheduled fixed-point protocol as syntax contexts.
+    serialized_expns: Lock<UnordSet<ExpnId>>,
+    latest_expns: Lock<UnordSet<ExpnId>>,
 
-    latest_expns: Lock<FxHashSet<ExpnId>>,
+    mode: HygieneEncodeMode,
+}
+
+enum HygieneEncodeMode {
+    SessionLocal,
+    Artifact(HygieneEncodeLayout),
+}
+
+impl Default for HygieneEncodeContext {
+    fn default() -> Self {
+        Self {
+            serialized_ctxts: Default::default(),
+            latest_ctxts: Default::default(),
+            serialized_expns: Default::default(),
+            latest_expns: Default::default(),
+            mode: HygieneEncodeMode::SessionLocal,
+        }
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct SyntaxContextStableKey<T>(Vec<(T, u8)>);
+
+impl<T: Ord> StableCompare for SyntaxContextStableKey<T> {
+    const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    fn stable_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+/// Separates content-derived hygiene meaning from session and wire-format addresses.
+///
+/// The fingerprint remains private so metadata cannot accidentally substitute an ordinary hash
+/// or persist a dense artifact index where semantic identity is required.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, StableHash)]
+pub struct HygieneIdentity(Fingerprint);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArtifactSyntaxContext {
+    index: u32,
+    identity: HygieneIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArtifactExpansion {
+    index: ExpnIndex,
+    identity: HygieneIdentity,
+    hash: ExpnHash,
+}
+
+/// Maps content-derived hygiene identities to one deterministic artifact address space.
+///
+/// Projection owns this value so emission cannot derive a second set of identities. Dense indices
+/// remain wire addresses only; stable hashing uses the identities stored beside them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HygieneEncodeLayout {
+    syntax_contexts: Arc<FxHashMap<SyntaxContext, ArtifactSyntaxContext>>,
+    expansions: Arc<FxHashMap<ExpnId, ArtifactExpansion>>,
+}
+
+impl HygieneEncodeLayout {
+    /// Runs a hygiene trace and closes its reached graph into an immutable layout.
+    ///
+    /// The trace handle cannot outlive this call. This keeps an open trace from being reused after
+    /// its identities have been assigned.
+    pub fn trace<Hcx: StableHashCtxt, R>(
+        hcx: &mut Hcx,
+        trace: impl FnOnce(&HygieneTrace) -> R,
+    ) -> (R, Self) {
+        let hygiene = HygieneTrace::new();
+        let result = trace(&hygiene);
+        let HygieneTrace { reached, roots } = hygiene;
+        let layout = HygieneIdentityBuilder::build(hcx, reached.into_inner(), roots.into_inner());
+        (result, layout)
+    }
+
+    fn syntax_context(&self, ctxt: SyntaxContext) -> ArtifactSyntaxContext {
+        self.syntax_contexts.get(&ctxt).copied().unwrap_or_else(|| {
+            panic!("metadata emission discovered an unprojected syntax context {ctxt:?}")
+        })
+    }
+
+    fn expansion(&self, expn: ExpnId) -> ArtifactExpansion {
+        self.expansions.get(&expn).copied().unwrap_or_else(|| {
+            panic!("metadata emission discovered an unprojected expansion {expn:?}")
+        })
+    }
+
+    /// Hashes an expansion through the identity assigned by projection.
+    pub fn stable_hash_expansion<Hcx: StableHashCtxt>(
+        &self,
+        expn: ExpnId,
+        hcx: &mut Hcx,
+        hasher: &mut StableHasher,
+    ) {
+        self.expansion(expn).identity.stable_hash(hcx, hasher);
+    }
+
+    /// Verifies that emission reached exactly the graph closed by projection.
+    pub fn assert_reached(&self, delta: HygieneDelta) {
+        let HygieneDelta { syntax_contexts, expansions } = delta;
+        let mut syntax_contexts = syntax_contexts;
+        syntax_contexts.insert(SyntaxContext::root());
+        let mut expansions = expansions;
+        expansions.insert(ExpnId::root());
+        assert_eq!(
+            syntax_contexts.len(),
+            self.syntax_contexts.len(),
+            "canonical metadata emission changed its syntax-context closure"
+        );
+        assert_eq!(
+            expansions.len(),
+            self.expansions.len(),
+            "canonical metadata emission changed its expansion closure"
+        );
+        assert!(
+            syntax_contexts.into_items().all(|ctxt| self.syntax_contexts.contains_key(&ctxt)),
+            "canonical metadata emission changed its syntax-context closure"
+        );
+        assert!(
+            expansions.into_items().all(|expn| self.expansions.contains_key(&expn)),
+            "canonical metadata emission changed its expansion closure"
+        );
+    }
+}
+
+/// Owns the identities reached by one hygiene frontier.
+#[derive(Default)]
+pub struct HygieneDelta {
+    syntax_contexts: UnordSet<SyntaxContext>,
+    expansions: UnordSet<ExpnId>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum HygieneNode {
+    SyntaxContext(SyntaxContext),
+    Expansion(ExpnId),
+}
+
+/// Collects the closed hygiene graph and its canonical metadata entry points.
+///
+/// Callers can add observations only while [`HygieneEncodeLayout::trace`] is running. The layout
+/// then consumes the private trace state, so identity assignment and later emission cannot race.
+pub struct HygieneTrace {
+    reached: Lock<HygieneDelta>,
+    roots: Lock<UnordMap<HygieneNode, Fingerprint>>,
+}
+
+impl HygieneTrace {
+    fn new() -> Self {
+        Self { reached: Lock::new(HygieneDelta::default()), roots: Lock::new(UnordMap::default()) }
+    }
+
+    /// Records a metadata occurrence that directly names a syntax context.
+    pub fn observe_syntax_context(&self, ctxt: SyntaxContext, occurrence: Fingerprint) {
+        if ctxt.is_root() {
+            return;
+        }
+        Self::observe(&mut self.roots.lock(), HygieneNode::SyntaxContext(ctxt), occurrence);
+    }
+
+    /// Records a metadata occurrence that directly names a local expansion.
+    pub fn observe_expansion(&self, expn: ExpnId, occurrence: Fingerprint) {
+        if expn == ExpnId::root() || expn.krate != LOCAL_CRATE {
+            return;
+        }
+        Self::observe(&mut self.roots.lock(), HygieneNode::Expansion(expn), occurrence);
+    }
+
+    /// Adds the identities discovered by one hygiene encoding frontier.
+    pub fn extend(&self, delta: HygieneDelta) {
+        let HygieneDelta { syntax_contexts, expansions } = delta;
+        let mut reached = self.reached.lock();
+        reached.syntax_contexts.extend_unord(syntax_contexts.into_items());
+        reached.expansions.extend_unord(expansions.into_items());
+    }
+
+    fn observe(
+        roots: &mut UnordMap<HygieneNode, Fingerprint>,
+        node: HygieneNode,
+        occurrence: Fingerprint,
+    ) {
+        roots
+            .entry(node)
+            .and_modify(|current| *current = (*current).min(occurrence))
+            .or_insert(occurrence);
+    }
+}
+
+/// Keeps a syntax context's artifact address, payload, and identity in one encoding mode.
+pub struct HygieneEncodedSyntaxContext {
+    index: u32,
+    data: SyntaxContextKey,
+    identity: HygieneIdentity,
+}
+
+impl HygieneEncodedSyntaxContext {
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    pub fn data(&self) -> &SyntaxContextKey {
+        &self.data
+    }
+
+    pub fn identity(&self) -> HygieneIdentity {
+        self.identity
+    }
+}
+
+/// Keeps an expansion's artifact address, payload, and identity in one encoding mode.
+///
+/// RDR replaces session-local addresses and coordinate-sensitive hashes as one operation.
+pub struct HygieneEncodedExpansion {
+    id: ExpnId,
+    index: ExpnIndex,
+    data: ExpnData,
+    hash: ExpnHash,
+    identity: HygieneIdentity,
+}
+
+impl HygieneEncodedExpansion {
+    pub fn id(&self) -> ExpnId {
+        self.id
+    }
+
+    pub fn index(&self) -> ExpnIndex {
+        self.index
+    }
+
+    pub fn data(&self) -> &ExpnData {
+        &self.data
+    }
+
+    pub fn hash(&self) -> ExpnHash {
+        self.hash
+    }
+
+    pub fn identity(&self) -> HygieneIdentity {
+        self.identity
+    }
 }
 
 impl HygieneEncodeContext {
+    /// Makes encoding reject hygiene identities absent from the projected layout.
+    pub fn with_layout(layout: HygieneEncodeLayout) -> Self {
+        Self { mode: HygieneEncodeMode::Artifact(layout), ..Self::default() }
+    }
+
+    /// Returns the closed identity space required by artifact encoding.
+    pub fn artifact_layout(&self) -> &HygieneEncodeLayout {
+        match &self.mode {
+            HygieneEncodeMode::Artifact(layout) => layout,
+            HygieneEncodeMode::SessionLocal => {
+                panic!("session-local hygiene encoding has no artifact layout")
+            }
+        }
+    }
+
+    fn syntax_context_stable_key<T>(
+        data: &HygieneData,
+        ctxt: SyntaxContext,
+        mut expansion_key: impl FnMut(ExpnId) -> T,
+    ) -> SyntaxContextStableKey<T> {
+        let mut stable_key = Vec::new();
+        let mut current = ctxt;
+        while !current.is_root() {
+            let context = &data.syntax_context_data[current.0 as usize];
+            let transparency = match context.outer_transparency {
+                Transparency::Transparent => 0,
+                Transparency::SemiOpaque => 1,
+                Transparency::Opaque => 2,
+            };
+            stable_key.push((expansion_key(context.outer_expn), transparency));
+            current = context.parent;
+        }
+        stable_key.reverse();
+        SyntaxContextStableKey(stable_key)
+    }
+
+    fn encoded_expansion(
+        &self,
+        id: ExpnId,
+        data: ExpnData,
+        hash: ExpnHash,
+    ) -> HygieneEncodedExpansion {
+        match &self.mode {
+            HygieneEncodeMode::SessionLocal => HygieneEncodedExpansion {
+                id,
+                index: id.local_id,
+                data,
+                hash,
+                identity: HygieneIdentity(hash.0),
+            },
+            HygieneEncodeMode::Artifact(layout) if id.krate == LOCAL_CRATE => {
+                let artifact = layout.expansion(id);
+                let data = data.for_metadata_artifact();
+                HygieneEncodedExpansion {
+                    id,
+                    index: artifact.index,
+                    data,
+                    hash: artifact.hash,
+                    identity: artifact.identity,
+                }
+            }
+            HygieneEncodeMode::Artifact(_) => HygieneEncodedExpansion {
+                id,
+                index: id.local_id,
+                data,
+                hash,
+                identity: HygieneIdentity(hash.0),
+            },
+        }
+    }
+
+    pub fn syntax_context_index(&self, ctxt: SyntaxContext) -> u32 {
+        match &self.mode {
+            HygieneEncodeMode::SessionLocal => ctxt.0,
+            HygieneEncodeMode::Artifact(layout) => layout.syntax_context(ctxt).index,
+        }
+    }
+
+    pub fn expansion_index(&self, expn: ExpnId) -> ExpnIndex {
+        if expn.krate != LOCAL_CRATE {
+            return expn.local_id;
+        }
+        match &self.mode {
+            HygieneEncodeMode::SessionLocal => expn.local_id,
+            HygieneEncodeMode::Artifact(layout) => layout.expansion(expn).index,
+        }
+    }
+
     /// Record the fact that we need to serialize the corresponding `ExpnData`.
     pub fn schedule_expn_data_for_encoding(&self, expn: ExpnId) {
         if !self.serialized_expns.lock().contains(&expn) {
@@ -1297,12 +1654,15 @@ impl HygieneEncodeContext {
         }
     }
 
-    pub fn encode<T>(
+    /// Drains identities scheduled by the preceding metadata frontier.
+    pub fn encode_pending<T>(
         &self,
         encoder: &mut T,
-        mut encode_ctxt: impl FnMut(&mut T, u32, &SyntaxContextKey),
-        mut encode_expn: impl FnMut(&mut T, ExpnId, &ExpnData, ExpnHash),
-    ) {
+        mut encode_ctxt: impl FnMut(&mut T, &HygieneEncodedSyntaxContext),
+        mut encode_expn: impl FnMut(&mut T, &HygieneEncodedExpansion),
+    ) -> HygieneDelta {
+        let mut encoded_ctxts = UnordSet::default();
+        let mut encoded_expns = UnordSet::default();
         // When we serialize a `SyntaxContextData`, we may end up serializing
         // a `SyntaxContext` that we haven't seen before
         while !self.latest_ctxts.lock().is_empty() || !self.latest_expns.lock().is_empty() {
@@ -1312,38 +1672,523 @@ impl HygieneEncodeContext {
                 self.latest_ctxts
             );
 
-            // Consume the current round of syntax contexts.
-            // Drop the lock() temporary early.
-            // It's fine to iterate over a HashMap, because the serialization of the table
-            // that we insert data into doesn't depend on insertion order.
-            #[allow(rustc::potential_query_instability)]
-            let latest_ctxts = { mem::take(&mut *self.latest_ctxts.lock()) }.into_iter();
-            let all_ctxt_data: Vec<_> = HygieneData::with(|data| {
-                latest_ctxts
-                    .map(|ctxt| (ctxt, data.syntax_context_data[ctxt.0 as usize].key()))
-                    .collect()
+            let latest_ctxts = mem::take(&mut *self.latest_ctxts.lock()).into_items();
+            let all_ctxt_data: Vec<_> = HygieneData::with(|data| match &self.mode {
+                HygieneEncodeMode::SessionLocal => latest_ctxts
+                    .map(|ctxt| {
+                        let stable_key = Self::syntax_context_stable_key(data, ctxt, |expn| {
+                            data.expn_hash(expn).0
+                        });
+                        (stable_key, ctxt, data.syntax_context_data[ctxt.0 as usize].key())
+                    })
+                    .into_sorted_stable_ord_by_key(|(stable_key, _, _)| stable_key)
+                    .into_iter()
+                    .map(|(stable_key, ctxt, data)| {
+                        let mut hasher = StableHasher::new();
+                        stable_key.0.hash(&mut hasher);
+                        (
+                            ctxt,
+                            HygieneEncodedSyntaxContext {
+                                index: ctxt.0,
+                                data,
+                                identity: HygieneIdentity(hasher.finish()),
+                            },
+                        )
+                    })
+                    .collect(),
+                HygieneEncodeMode::Artifact(layout) => latest_ctxts
+                    .map(|ctxt| {
+                        let artifact = layout.syntax_context(ctxt);
+                        (
+                            artifact.index,
+                            ctxt,
+                            data.syntax_context_data[ctxt.0 as usize].key(),
+                            artifact.identity,
+                        )
+                    })
+                    .into_sorted_stable_ord_by_key(|(index, _, _, _)| index)
+                    .into_iter()
+                    .map(|(index, ctxt, data, identity)| {
+                        (ctxt, HygieneEncodedSyntaxContext { index, data, identity })
+                    })
+                    .collect(),
             });
-            for (ctxt, ctxt_key) in all_ctxt_data {
+            for (ctxt, context) in all_ctxt_data {
                 if self.serialized_ctxts.lock().insert(ctxt) {
-                    encode_ctxt(encoder, ctxt.0, &ctxt_key);
+                    encoded_ctxts.insert(ctxt);
+                    encode_ctxt(encoder, &context);
                 }
             }
 
-            // Same as above, but for expansions instead of syntax contexts.
-            #[allow(rustc::potential_query_instability)]
-            let latest_expns = { mem::take(&mut *self.latest_expns.lock()) }.into_iter();
-            let all_expn_data: Vec<_> = HygieneData::with(|data| {
-                latest_expns
-                    .map(|expn| (expn, data.expn_data(expn).clone(), data.expn_hash(expn)))
-                    .collect()
+            let latest_expns = mem::take(&mut *self.latest_expns.lock()).into_items();
+            let all_expn_data = HygieneData::with(|data| {
+                let expansions = latest_expns.map(|expn| {
+                    self.encoded_expansion(expn, data.expn_data(expn).clone(), data.expn_hash(expn))
+                });
+                match &self.mode {
+                    HygieneEncodeMode::SessionLocal => {
+                        expansions.into_sorted_stable_ord_by_key(|expansion| &expansion.hash)
+                    }
+                    HygieneEncodeMode::Artifact(_) => {
+                        expansions.into_sorted_stable_ord_by_key(|expansion| &expansion.identity.0)
+                    }
+                }
             });
-            for (expn, expn_data, expn_hash) in all_expn_data {
-                if self.serialized_expns.lock().insert(expn) {
-                    encode_expn(encoder, expn, &expn_data, expn_hash);
+            for expansion in all_expn_data {
+                if self.serialized_expns.lock().insert(expansion.id) {
+                    encoded_expns.insert(expansion.id);
+                    encode_expn(encoder, &expansion);
                 }
             }
         }
         debug!("encode_hygiene: Done serializing SyntaxContextData");
+        HygieneDelta { syntax_contexts: encoded_ctxts, expansions: encoded_expns }
+    }
+}
+
+struct HygieneGraph {
+    syntax_contexts: FxHashMap<SyntaxContext, SyntaxContextKey>,
+    expansions: FxHashMap<ExpnId, ExpnData>,
+    syntax_context_order: Vec<SyntaxContext>,
+    expansion_order: Vec<ExpnId>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HygieneProvenance {
+    root: Fingerprint,
+    edges: Vec<HygieneEdge>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum HygieneEdge {
+    ContextParent,
+    ContextExpansion,
+    ExpansionParent,
+    ExpansionCallSite,
+    ExpansionDefSite,
+}
+
+#[derive(Clone, Copy)]
+enum ExpansionIdentity<'a> {
+    Structural,
+    Disambiguated(&'a FxHashMap<ExpnId, Option<u32>>),
+}
+
+struct HygieneIdentityBuilder<'a, Hcx> {
+    graph: &'a HygieneGraph,
+    hcx: &'a mut Hcx,
+    expansion_identity: ExpansionIdentity<'a>,
+    syntax_contexts: FxHashMap<SyntaxContext, Fingerprint>,
+    expansions: FxHashMap<ExpnId, Fingerprint>,
+    visiting_syntax_contexts: FxHashSet<SyntaxContext>,
+    visiting_expansions: FxHashSet<ExpnId>,
+}
+
+impl<Hcx: StableHashCtxt> HygieneIdentityBuilder<'_, Hcx> {
+    fn build(
+        hcx: &mut Hcx,
+        delta: HygieneDelta,
+        roots: UnordMap<HygieneNode, Fingerprint>,
+    ) -> HygieneEncodeLayout {
+        let HygieneDelta { syntax_contexts, expansions } = delta;
+        let syntax_contexts: Vec<_> = syntax_contexts
+            .into_items()
+            .filter(|ctxt| !ctxt.is_root())
+            .map(|ctxt| (ctxt.0, ctxt))
+            .into_sorted_stable_ord_by_key(|(index, _)| index)
+            .into_iter()
+            .map(|(_, ctxt)| ctxt)
+            .collect();
+        let expansions: Vec<_> = expansions
+            .into_items()
+            .filter(|expn| *expn != ExpnId::root())
+            .map(|expn| {
+                assert_eq!(
+                    expn.krate, LOCAL_CRATE,
+                    "foreign expansion entered a local metadata hygiene layout"
+                );
+                (expn.local_id.as_u32(), expn)
+            })
+            .into_sorted_stable_ord_by_key(|(index, _)| index)
+            .into_iter()
+            .map(|(_, expn)| expn)
+            .collect();
+        let graph = HygieneData::with(|data| HygieneGraph {
+            syntax_contexts: syntax_contexts
+                .iter()
+                .map(|ctxt| (*ctxt, data.syntax_context_data[ctxt.0 as usize].key()))
+                .collect(),
+            expansions: expansions
+                .iter()
+                .map(|expn| (*expn, data.expn_data(*expn).clone()))
+                .collect(),
+            syntax_context_order: syntax_contexts,
+            expansion_order: expansions,
+        });
+        let stable_crate_id = LOCAL_CRATE.as_def_id().to_stable_hash_key(hcx).stable_crate_id();
+        let structural_expansions = {
+            let mut builder = HygieneIdentityBuilder {
+                graph: &graph,
+                hcx,
+                expansion_identity: ExpansionIdentity::Structural,
+                syntax_contexts: FxHashMap::default(),
+                expansions: FxHashMap::default(),
+                visiting_syntax_contexts: FxHashSet::default(),
+                visiting_expansions: FxHashSet::default(),
+            };
+            for &expn in &graph.expansion_order {
+                let _ = builder.expansion_identity(expn);
+            }
+            for &ctxt in &graph.syntax_context_order {
+                let _ = builder.syntax_context_identity(ctxt);
+            }
+            builder.expansions
+        };
+        let provenance = graph.provenance(roots);
+
+        let mut structural_classes: Vec<_> = graph
+            .expansion_order
+            .iter()
+            .map(|&expn| (structural_expansions[&expn], expn))
+            .collect();
+        structural_classes.sort_unstable_by_key(|&(identity, _)| identity);
+        let mut duplicate_ranks: FxHashMap<_, _> =
+            graph.expansion_order.iter().map(|&expn| (expn, None)).collect();
+        for class in structural_classes
+            .chunk_by_mut(|left, right| left.0 == right.0)
+            .filter(|class| class.len() > 1)
+        {
+            class.sort_unstable_by(|left, right| {
+                provenance
+                    .get(&left.1)
+                    .unwrap_or_else(|| panic!("expansion {:?} has no metadata provenance", left.1))
+                    .cmp(provenance.get(&right.1).unwrap_or_else(|| {
+                        panic!("expansion {:?} has no metadata provenance", right.1)
+                    }))
+            });
+            assert!(
+                class.windows(2).all(|pair| provenance[&pair[0].1] != provenance[&pair[1].1]),
+                "structurally identical expansions have indistinguishable metadata provenance"
+            );
+            for (rank, &(_, expn)) in class.iter().enumerate() {
+                let rank =
+                    u32::try_from(rank).expect("cannot disambiguate more than U32_MAX expansions");
+                *duplicate_ranks
+                    .get_mut(&expn)
+                    .expect("structural expansion missing from duplicate-rank layout") = Some(rank);
+            }
+        }
+
+        let mut builder = HygieneIdentityBuilder {
+            graph: &graph,
+            hcx,
+            expansion_identity: ExpansionIdentity::Disambiguated(&duplicate_ranks),
+            syntax_contexts: FxHashMap::default(),
+            expansions: FxHashMap::default(),
+            visiting_syntax_contexts: FxHashSet::default(),
+            visiting_expansions: FxHashSet::default(),
+        };
+        for &expn in &graph.expansion_order {
+            let _ = builder.expansion_identity(expn);
+        }
+        for &ctxt in &graph.syntax_context_order {
+            let _ = builder.syntax_context_identity(ctxt);
+        }
+
+        let mut ordered_expansions: Vec<_> =
+            graph.expansion_order.iter().map(|&id| (builder.expansions[&id], id)).collect();
+        ordered_expansions.sort_unstable_by_key(|&(identity, _)| identity);
+        assert!(
+            ordered_expansions.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "two expansions have the same content-derived metadata identity"
+        );
+        let mut expansion_hashes = FxHashSet::default();
+        let mut expansion_layout = FxHashMap::default();
+        expansion_layout.insert(
+            ExpnId::root(),
+            ArtifactExpansion {
+                index: ExpnIndex::ZERO,
+                identity: HygieneIdentity(Fingerprint::ZERO),
+                hash: ExpnHash(Fingerprint::ZERO),
+            },
+        );
+        for (index, (identity, expn)) in ordered_expansions.into_iter().enumerate() {
+            let index =
+                u32::try_from(index + 1).expect("cannot encode more than U32_MAX local expansions");
+            let hash = ExpnHash::new(stable_crate_id, identity.to_smaller_hash());
+            let identity = HygieneIdentity(identity);
+            assert!(
+                expansion_hashes.insert(hash),
+                "two expansions have the same content-derived metadata hash"
+            );
+            assert!(
+                expansion_layout
+                    .insert(
+                        expn,
+                        ArtifactExpansion { index: ExpnIndex::from_u32(index), identity, hash },
+                    )
+                    .is_none(),
+                "duplicate expansion in metadata hygiene layout"
+            );
+        }
+
+        let mut ordered_syntax_contexts: Vec<_> = graph
+            .syntax_context_order
+            .iter()
+            .map(|&id| (builder.syntax_contexts[&id], id))
+            .collect();
+        ordered_syntax_contexts.sort_unstable_by_key(|&(identity, _)| identity);
+        assert!(
+            ordered_syntax_contexts.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "two syntax contexts have the same content-derived metadata identity"
+        );
+        let mut syntax_context_layout = FxHashMap::default();
+        syntax_context_layout.insert(
+            SyntaxContext::root(),
+            ArtifactSyntaxContext { index: 0, identity: HygieneIdentity(Fingerprint::ZERO) },
+        );
+        for (index, (identity, ctxt)) in ordered_syntax_contexts.into_iter().enumerate() {
+            let index =
+                u32::try_from(index + 1).expect("cannot encode more than U32_MAX syntax contexts");
+            assert!(
+                syntax_context_layout
+                    .insert(
+                        ctxt,
+                        ArtifactSyntaxContext { index, identity: HygieneIdentity(identity) }
+                    )
+                    .is_none(),
+                "duplicate syntax context in metadata hygiene layout"
+            );
+        }
+
+        HygieneEncodeLayout {
+            syntax_contexts: Arc::new(syntax_context_layout),
+            expansions: Arc::new(expansion_layout),
+        }
+    }
+
+    fn syntax_context_identity(&mut self, ctxt: SyntaxContext) -> Fingerprint {
+        if ctxt.is_root() {
+            return Fingerprint::ZERO;
+        }
+        if let Some(&identity) = self.syntax_contexts.get(&ctxt) {
+            return identity;
+        }
+        assert!(
+            self.visiting_syntax_contexts.insert(ctxt),
+            "cycle in metadata syntax-context graph at {ctxt:?}"
+        );
+        let &(parent, expansion, transparency) =
+            self.graph.syntax_contexts.get(&ctxt).unwrap_or_else(|| {
+                panic!("metadata hygiene graph omitted syntax context {ctxt:?}")
+            });
+        let parent = self.syntax_context_identity(parent);
+        let expansion = self.expansion_identity(expansion);
+        let mut hasher = StableHasher::new();
+        0_u8.stable_hash(self, &mut hasher);
+        parent.stable_hash(self, &mut hasher);
+        expansion.stable_hash(self, &mut hasher);
+        transparency.stable_hash(self, &mut hasher);
+        let identity = hasher.finish();
+        assert!(self.visiting_syntax_contexts.remove(&ctxt));
+        self.syntax_contexts.insert(ctxt, identity);
+        identity
+    }
+
+    fn expansion_identity(&mut self, expn: ExpnId) -> Fingerprint {
+        if expn == ExpnId::root() {
+            return Fingerprint::ZERO;
+        }
+        if expn.krate != LOCAL_CRATE {
+            return expn.expn_hash().0;
+        }
+        if let Some(&identity) = self.expansions.get(&expn) {
+            return identity;
+        }
+        assert!(
+            self.visiting_expansions.insert(expn),
+            "cycle in metadata expansion graph at {expn:?}"
+        );
+        let data = self
+            .graph
+            .expansions
+            .get(&expn)
+            .unwrap_or_else(|| panic!("metadata hygiene graph omitted expansion {expn:?}"))
+            .clone();
+        let mut hasher = StableHasher::new();
+        1_u8.stable_hash(self, &mut hasher);
+        data.stable_hash_artifact_semantics(self, &mut hasher);
+        if let ExpansionIdentity::Disambiguated(duplicate_ranks) = self.expansion_identity {
+            duplicate_ranks[&expn].stable_hash(self, &mut hasher);
+        }
+        let identity = hasher.finish();
+        assert!(self.visiting_expansions.remove(&expn));
+        self.expansions.insert(expn, identity);
+        identity
+    }
+}
+
+impl HygieneGraph {
+    fn provenance(
+        &self,
+        roots: UnordMap<HygieneNode, Fingerprint>,
+    ) -> FxHashMap<ExpnId, HygieneProvenance> {
+        let mut provenance = FxHashMap::default();
+        let mut queue = VecDeque::new();
+        let mut paths: FxHashMap<HygieneNode, HygieneProvenance> = FxHashMap::default();
+        let roots = roots
+            .into_items()
+            .map(|(node, root)| (root, node))
+            .into_sorted_stable_ord_by_key(|(root, _)| root);
+        assert!(
+            roots.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "two metadata hygiene occurrences have the same provenance hash"
+        );
+        for (root, node) in roots {
+            assert!(
+                self.contains(node),
+                "metadata hygiene occurrence names a node absent from the reached graph"
+            );
+            let path = HygieneProvenance { root, edges: Vec::new() };
+            if paths.get(&node).is_none_or(|current| &path < current) {
+                paths.insert(node, path);
+                queue.push_back(node);
+            }
+        }
+
+        while let Some(node) = queue.pop_front() {
+            let path = paths[&node].clone();
+            for (edge, dependency) in self.dependencies(node) {
+                let mut candidate = path.clone();
+                candidate.edges.push(edge);
+                if paths.get(&dependency).is_none_or(|current| &candidate < current) {
+                    paths.insert(dependency, candidate);
+                    queue.push_back(dependency);
+                }
+            }
+        }
+
+        for &expn in &self.expansion_order {
+            provenance.insert(
+                expn,
+                paths
+                    .remove(&HygieneNode::Expansion(expn))
+                    .unwrap_or_else(|| panic!("expansion {expn:?} has no metadata provenance")),
+            );
+        }
+        assert!(
+            self.syntax_contexts.len() == self.syntax_context_order.len()
+                && self
+                    .syntax_context_order
+                    .iter()
+                    .all(|ctxt| paths.contains_key(&HygieneNode::SyntaxContext(*ctxt))),
+            "a syntax context has no metadata provenance"
+        );
+        provenance
+    }
+
+    fn contains(&self, node: HygieneNode) -> bool {
+        match node {
+            HygieneNode::SyntaxContext(ctxt) => {
+                ctxt.is_root() || self.syntax_contexts.contains_key(&ctxt)
+            }
+            HygieneNode::Expansion(expn) => {
+                expn == ExpnId::root()
+                    || expn.krate != LOCAL_CRATE
+                    || self.expansions.contains_key(&expn)
+            }
+        }
+    }
+
+    fn dependencies(&self, node: HygieneNode) -> Vec<(HygieneEdge, HygieneNode)> {
+        let candidates = match node {
+            HygieneNode::SyntaxContext(ctxt) => {
+                let &(parent, expn, _) = &self.syntax_contexts[&ctxt];
+                vec![
+                    (HygieneEdge::ContextParent, HygieneNode::SyntaxContext(parent)),
+                    (HygieneEdge::ContextExpansion, HygieneNode::Expansion(expn)),
+                ]
+            }
+            HygieneNode::Expansion(expn) => {
+                let data = &self.expansions[&expn];
+                vec![
+                    (HygieneEdge::ExpansionParent, HygieneNode::Expansion(data.parent)),
+                    (
+                        HygieneEdge::ExpansionCallSite,
+                        HygieneNode::SyntaxContext(data.call_site.ctxt()),
+                    ),
+                    (
+                        HygieneEdge::ExpansionDefSite,
+                        HygieneNode::SyntaxContext(data.def_site.ctxt()),
+                    ),
+                ]
+            }
+        };
+        candidates
+            .into_iter()
+            .filter(|(_, dependency)| match dependency {
+                HygieneNode::SyntaxContext(ctxt) => !ctxt.is_root(),
+                HygieneNode::Expansion(expn) => {
+                    *expn != ExpnId::root() && expn.krate == LOCAL_CRATE
+                }
+            })
+            .map(|candidate @ (_, dependency)| {
+                assert!(
+                    self.contains(dependency),
+                    "metadata hygiene graph omitted a reached dependency"
+                );
+                candidate
+            })
+            .collect()
+    }
+}
+
+impl<Hcx: StableHashCtxt> StableHashCtxt for HygieneIdentityBuilder<'_, Hcx> {
+    fn stable_hash_span(&mut self, raw_span: RawSpan, hasher: &mut StableHasher) {
+        self.syntax_context_identity(Span::from_raw_span(raw_span).data_untracked().ctxt)
+            .stable_hash(self, hasher);
+    }
+
+    fn def_path_hash(&self, def_id: RawDefId) -> RawDefPathHash {
+        self.hcx.def_path_hash(def_id)
+    }
+
+    fn stable_hash_controls(&self) -> StableHashControls {
+        StableHashControls::MetadataHygiene
+    }
+
+    fn stable_hash_expn_id(
+        &mut self,
+        RawExpnId(krate, local_id): RawExpnId,
+        ordinary_hash: Fingerprint,
+        hasher: &mut StableHasher,
+    ) {
+        let expn =
+            ExpnId { krate: CrateNum::from_u32(krate), local_id: ExpnIndex::from_u32(local_id) };
+        let identity =
+            if expn.krate == LOCAL_CRATE { self.expansion_identity(expn) } else { ordinary_hash };
+        identity.stable_hash(self, hasher);
+    }
+
+    fn with_span_hash_mode<R>(
+        &mut self,
+        mode: SpanHashMode,
+        hash: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        assert_eq!(
+            mode,
+            SpanHashMode::Hygiene,
+            "content-derived hygiene identity cannot change span hashing modes"
+        );
+        hash(self)
+    }
+
+    fn assert_default_stable_hash_controls(&self, msg: &str) {
+        assert_eq!(
+            self.stable_hash_controls(),
+            StableHashControls::MetadataHygiene,
+            "attempted hashing of {msg} outside content-derived hygiene mode"
+        );
     }
 }
 
@@ -1473,7 +2318,7 @@ pub fn raw_encode_syntax_context(
     if !context.serialized_ctxts.lock().contains(&ctxt) {
         context.latest_ctxts.lock().insert(ctxt);
     }
-    ctxt.0.encode(e);
+    context.syntax_context_index(ctxt).encode(e);
 }
 
 /// Updates the `disambiguator` field of the corresponding `ExpnData`
@@ -1539,14 +2384,15 @@ impl StableHash for SyntaxContext {
 impl StableHash for ExpnId {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         hcx.assert_default_stable_hash_controls("ExpnId");
-        let hash = if *self == ExpnId::root() {
-            // Avoid fetching TLS storage for a trivial often-used value.
-            Fingerprint::ZERO
-        } else {
-            self.expn_hash().0
-        };
-
-        hash.stable_hash(hcx, hasher);
+        if *self == ExpnId::root() {
+            Fingerprint::ZERO.stable_hash(hcx, hasher);
+            return;
+        }
+        hcx.stable_hash_expn_id(
+            RawExpnId(self.krate.as_u32(), self.local_id.as_u32()),
+            self.expn_hash().0,
+            hasher,
+        );
     }
 }
 
@@ -1554,4 +2400,267 @@ impl StableHash for LocalExpnId {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         self.to_expn_id().stable_hash(hcx, hasher);
     }
+}
+
+#[cfg(test)]
+use crate::create_session_globals_then;
+
+#[test]
+fn hygiene_frontiers_form_one_stable_union() {
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        let first = register_local_expn_id(
+            ExpnData::default(
+                ExpnKind::AstPass(AstPass::TestHarness),
+                DUMMY_SP,
+                Edition::Edition2024,
+                None,
+                None,
+            ),
+            ExpnHash(Fingerprint::new(1, 1)),
+        );
+        let second = register_local_expn_id(
+            ExpnData::default(
+                ExpnKind::AstPass(AstPass::ProcMacroHarness),
+                DUMMY_SP,
+                Edition::Edition2024,
+                None,
+                None,
+            ),
+            ExpnHash(Fingerprint::new(2, 2)),
+        );
+        let context = HygieneEncodeContext::default();
+        context.schedule_expn_data_for_encoding(first);
+        let mut encoded = Vec::new();
+        let hygiene = context.encode_pending(
+            &mut (),
+            |(), _| {},
+            |(), expansion| encoded.push(expansion.id()),
+        );
+        assert_eq!(encoded, [first]);
+
+        context.schedule_expn_data_for_encoding(first);
+        context.schedule_expn_data_for_encoding(second);
+        let delta = context.encode_pending(
+            &mut (),
+            |(), _| {},
+            |(), expansion| encoded.push(expansion.id()),
+        );
+        assert_eq!(encoded, [first, second]);
+        let trace = HygieneTrace::new();
+        trace.extend(hygiene);
+        trace.extend(delta);
+        let HygieneTrace { reached, roots: _ } = trace;
+        let hygiene = reached.into_inner();
+
+        let layout = HygieneEncodeLayout {
+            syntax_contexts: Arc::new(FxHashMap::from_iter([(
+                SyntaxContext::root(),
+                ArtifactSyntaxContext { index: 0, identity: HygieneIdentity(Fingerprint::ZERO) },
+            )])),
+            expansions: Arc::new(FxHashMap::from_iter([
+                (
+                    ExpnId::root(),
+                    ArtifactExpansion {
+                        index: ExpnIndex::ZERO,
+                        identity: HygieneIdentity(Fingerprint::ZERO),
+                        hash: ExpnHash(Fingerprint::ZERO),
+                    },
+                ),
+                (
+                    first,
+                    ArtifactExpansion {
+                        index: ExpnIndex::from_u32(1),
+                        identity: HygieneIdentity(Fingerprint::new(1, 1)),
+                        hash: ExpnHash(Fingerprint::new(1, 1)),
+                    },
+                ),
+                (
+                    second,
+                    ArtifactExpansion {
+                        index: ExpnIndex::from_u32(2),
+                        identity: HygieneIdentity(Fingerprint::new(2, 2)),
+                        hash: ExpnHash(Fingerprint::new(2, 2)),
+                    },
+                ),
+            ])),
+        };
+        layout.assert_reached(hygiene);
+        assert_ne!(layout.expansion(first).index, layout.expansion(second).index);
+    });
+}
+
+#[test]
+#[should_panic(expected = "metadata emission discovered an unprojected expansion")]
+fn closed_hygiene_layout_rejects_an_untraced_expansion() {
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        let expansion = register_local_expn_id(
+            ExpnData::default(
+                ExpnKind::AstPass(AstPass::TestHarness),
+                DUMMY_SP,
+                Edition::Edition2024,
+                None,
+                None,
+            ),
+            ExpnHash(Fingerprint::new(1, 1)),
+        );
+        let context = HygieneEncodeContext::with_layout(HygieneEncodeLayout {
+            syntax_contexts: Arc::new(FxHashMap::from_iter([(
+                SyntaxContext::root(),
+                ArtifactSyntaxContext { index: 0, identity: HygieneIdentity(Fingerprint::ZERO) },
+            )])),
+            expansions: Arc::new(FxHashMap::from_iter([(
+                ExpnId::root(),
+                ArtifactExpansion {
+                    index: ExpnIndex::ZERO,
+                    identity: HygieneIdentity(Fingerprint::ZERO),
+                    hash: ExpnHash(Fingerprint::ZERO),
+                },
+            )])),
+        });
+
+        context.expansion_index(expansion);
+    });
+}
+
+#[test]
+#[should_panic(expected = "cycle in metadata syntax-context graph")]
+fn content_identity_rejects_a_context_only_cycle_before_provenance() {
+    struct TestHashContext;
+
+    impl StableHashCtxt for TestHashContext {
+        fn stable_hash_span(&mut self, _: RawSpan, _: &mut StableHasher) {
+            unreachable!()
+        }
+
+        fn def_path_hash(&self, _: RawDefId) -> RawDefPathHash {
+            RawDefPathHash([0; 16])
+        }
+
+        fn stable_hash_controls(&self) -> StableHashControls {
+            StableHashControls::MetadataHygiene
+        }
+
+        fn stable_hash_expn_id(&mut self, _: RawExpnId, _: Fingerprint, _: &mut StableHasher) {
+            unreachable!()
+        }
+
+        fn with_span_hash_mode<R>(
+            &mut self,
+            _: SpanHashMode,
+            hash: impl FnOnce(&mut Self) -> R,
+        ) -> R {
+            hash(self)
+        }
+
+        fn assert_default_stable_hash_controls(&self, _: &str) {}
+    }
+
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        let ctxt = HygieneData::with(|data| {
+            let ctxt =
+                data.alloc_ctxt(SyntaxContext::root(), ExpnId::root(), Transparency::Transparent);
+            data.syntax_context_data[ctxt.0 as usize].parent = ctxt;
+            ctxt
+        });
+        let mut syntax_contexts = UnordSet::default();
+        syntax_contexts.insert(ctxt);
+        HygieneIdentityBuilder::build(
+            &mut TestHashContext,
+            HygieneDelta { syntax_contexts, expansions: UnordSet::default() },
+            UnordMap::from_iter([(HygieneNode::SyntaxContext(ctxt), Fingerprint::new(1, 1))]),
+        );
+    });
+}
+
+#[test]
+fn artifact_payloads_follow_artifact_order() {
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        let first = register_local_expn_id(
+            ExpnData::default(
+                ExpnKind::AstPass(AstPass::TestHarness),
+                DUMMY_SP,
+                Edition::Edition2024,
+                None,
+                None,
+            ),
+            ExpnHash(Fingerprint::new(9, 9)),
+        );
+        let second = register_local_expn_id(
+            ExpnData::default(
+                ExpnKind::AstPass(AstPass::ProcMacroHarness),
+                DUMMY_SP,
+                Edition::Edition2024,
+                None,
+                None,
+            ),
+            ExpnHash(Fingerprint::new(1, 1)),
+        );
+        let first_context = SyntaxContext::root().apply_mark(first, Transparency::Transparent);
+        let second_context = SyntaxContext::root().apply_mark(second, Transparency::Transparent);
+        let context = HygieneEncodeContext::with_layout(HygieneEncodeLayout {
+            syntax_contexts: Arc::new(FxHashMap::from_iter([
+                (
+                    SyntaxContext::root(),
+                    ArtifactSyntaxContext {
+                        index: 0,
+                        identity: HygieneIdentity(Fingerprint::ZERO),
+                    },
+                ),
+                (
+                    first_context,
+                    ArtifactSyntaxContext {
+                        index: 1,
+                        identity: HygieneIdentity(Fingerprint::new(1, 1)),
+                    },
+                ),
+                (
+                    second_context,
+                    ArtifactSyntaxContext {
+                        index: 2,
+                        identity: HygieneIdentity(Fingerprint::new(2, 2)),
+                    },
+                ),
+            ])),
+            expansions: Arc::new(FxHashMap::from_iter([
+                (
+                    ExpnId::root(),
+                    ArtifactExpansion {
+                        index: ExpnIndex::ZERO,
+                        identity: HygieneIdentity(Fingerprint::ZERO),
+                        hash: ExpnHash(Fingerprint::ZERO),
+                    },
+                ),
+                (
+                    first,
+                    ArtifactExpansion {
+                        index: ExpnIndex::from_u32(1),
+                        identity: HygieneIdentity(Fingerprint::new(1, 1)),
+                        hash: ExpnHash(Fingerprint::new(1, 1)),
+                    },
+                ),
+                (
+                    second,
+                    ArtifactExpansion {
+                        index: ExpnIndex::from_u32(2),
+                        identity: HygieneIdentity(Fingerprint::new(2, 2)),
+                        hash: ExpnHash(Fingerprint::new(2, 2)),
+                    },
+                ),
+            ])),
+        });
+        let mut sink = rustc_serialize::opaque::mem_encoder::MemEncoder::new();
+        raw_encode_syntax_context(second_context, &context, &mut sink);
+        raw_encode_syntax_context(first_context, &context, &mut sink);
+        context.schedule_expn_data_for_encoding(second);
+        context.schedule_expn_data_for_encoding(first);
+        let mut encoded = (Vec::new(), Vec::new());
+        context.encode_pending(
+            &mut encoded,
+            |encoded, context| encoded.0.push(context.index()),
+            |encoded, expansion| encoded.1.push(expansion.index().as_u32()),
+        );
+
+        assert_eq!(encoded.0, [1, 2]);
+        assert_eq!(encoded.1, [1, 2]);
+    });
 }

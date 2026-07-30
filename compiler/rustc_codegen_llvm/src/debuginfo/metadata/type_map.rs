@@ -4,7 +4,7 @@ use libc::c_uint;
 use rustc_abi::{Align, Size, VariantIdx};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::stable_hash::{SpanHashMode, StableHash, StableHashCtxt, StableHasher};
 use rustc_macros::StableHash;
 use rustc_middle::bug;
 use rustc_middle::ty::{self, ExistentialTraitRef, Ty, TyCtxt};
@@ -94,7 +94,9 @@ impl<'tcx> UniqueTypeId<'tcx> {
     fn generate_unique_id_string(self, tcx: TyCtxt<'tcx>) -> String {
         let mut hasher = StableHasher::new();
         tcx.with_stable_hashing_context(|mut hcx| {
-            hcx.while_hashing_spans(false, |hcx| self.stable_hash(hcx, &mut hasher))
+            hcx.with_span_hash_mode(SpanHashMode::Ignore, |hcx| {
+                self.stable_hash(hcx, &mut hasher);
+            });
         });
         hasher.finish::<Fingerprint>().to_hex()
     }

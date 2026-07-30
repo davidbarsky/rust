@@ -1,7 +1,7 @@
 use std::fmt::{self, Write};
 use std::mem::{self, discriminant};
 
-use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::stable_hash::{SpanHashMode, StableHash, StableHashCtxt, StableHasher};
 use rustc_hashes::Hash64;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
@@ -150,7 +150,7 @@ fn get_symbol_hash<'tcx>(
         // assertions about `has_param` may not hold, but this item-type
         // ought to be the same for every reference anyway.
         assert!(!item_type.has_erasable_regions());
-        hcx.while_hashing_spans(false, |hcx| {
+        hcx.with_span_hash_mode(SpanHashMode::Ignore, |hcx| {
             item_type.stable_hash(hcx, &mut hasher);
 
             // If this is a function, we hash the signature as well.

@@ -14,6 +14,9 @@ use rustc_abi::{FieldIdx, VariantIdx};
 pub use rustc_ast::{Mutability, Pinnedness};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::graph::dominators::Dominators;
+use rustc_data_structures::stable_hash::{
+    StableHash, StableHashControls, StableHashCtxt, StableHasher,
+};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{CtorKind, Namespace};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
@@ -765,10 +768,24 @@ impl<'tcx> IndexMut<BasicBlock> for Body<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Debug, StableHash, TypeFoldable, TypeVisitable)]
+#[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable)]
 pub enum ClearCrossCrate<T> {
     Clear,
     Set(T),
+}
+
+impl<T: StableHash> StableHash for ClearCrossCrate<T> {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        if hcx.stable_hash_controls() == StableHashControls::MetadataHygiene {
+            return;
+        }
+
+        std::mem::discriminant(self).stable_hash(hcx, hasher);
+        match self {
+            ClearCrossCrate::Clear => {}
+            ClearCrossCrate::Set(value) => value.stable_hash(hcx, hasher),
+        }
+    }
 }
 
 impl<T> ClearCrossCrate<T> {

@@ -1,11 +1,15 @@
 use std::hash::Hash;
 
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{
-    RawDefId, RawDefPathHash, RawSpan, StableHash, StableHashControls, StableHashCtxt, StableHasher,
+    RawDefId, RawDefPathHash, RawExpnId, RawSpan, SpanHashMode, StableHash, StableHashControls,
+    StableHashCtxt, StableHasher,
 };
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_session::Session;
 use rustc_session::cstore::Untracked;
+use rustc_span::def_id::CrateNum;
+use rustc_span::hygiene::{ExpnId, ExpnIndex, HygieneEncodeLayout};
 use rustc_span::source_map::SourceMap;
 use rustc_span::{CachingSourceMapView, DUMMY_SP, Pos, Span};
 
@@ -26,28 +30,30 @@ pub struct StableHashState<'a> {
     // This field should only be used by `unstable_opts_incremental_ignore_span`
     incremental_ignore_spans: bool,
     caching_source_map: CachingSourceMap<'a>,
-    stable_hash_controls: StableHashControls,
+    mode: StableHashingMode,
+}
+
+#[derive(Clone)]
+enum StableHashingMode {
+    Span(SpanHashMode),
+    MetadataHygiene(HygieneEncodeLayout),
 }
 
 impl<'a> StableHashState<'a> {
     #[inline]
     pub fn new(sess: &'a Session, untracked: &'a Untracked) -> Self {
-        let hash_spans_initial = !sess.opts.unstable_opts.incremental_ignore_spans;
+        let span_mode = if sess.opts.unstable_opts.incremental_ignore_spans {
+            SpanHashMode::Ignore
+        } else {
+            SpanHashMode::Full
+        };
 
         StableHashState {
             untracked,
             incremental_ignore_spans: sess.opts.unstable_opts.incremental_ignore_spans,
             caching_source_map: CachingSourceMap::Unused(sess.source_map()),
-            stable_hash_controls: StableHashControls { hash_spans: hash_spans_initial },
+            mode: StableHashingMode::Span(span_mode),
         }
-    }
-
-    #[inline]
-    pub fn while_hashing_spans<F: FnOnce(&mut Self)>(&mut self, hash_spans: bool, f: F) {
-        let prev_hash_spans = self.stable_hash_controls.hash_spans;
-        self.stable_hash_controls.hash_spans = hash_spans;
-        f(self);
-        self.stable_hash_controls.hash_spans = prev_hash_spans;
     }
 
     #[inline]
@@ -65,10 +71,29 @@ impl<'a> StableHashState<'a> {
     fn def_span(&self, def_id: LocalDefId) -> Span {
         self.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP)
     }
+}
 
-    #[inline]
-    pub fn stable_hash_controls(&self) -> StableHashControls {
-        self.stable_hash_controls
+struct StableHashingModeGuard<'state, 'tcx> {
+    state: &'state mut StableHashState<'tcx>,
+    previous: StableHashingMode,
+}
+
+impl Drop for StableHashingModeGuard<'_, '_> {
+    fn drop(&mut self) {
+        self.state.mode = self.previous.clone();
+    }
+}
+
+impl StableHashState<'_> {
+    pub fn with_metadata_hygiene_layout<R>(
+        &mut self,
+        layout: &HygieneEncodeLayout,
+        hash: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous =
+            std::mem::replace(&mut self.mode, StableHashingMode::MetadataHygiene(layout.clone()));
+        let guard = StableHashingModeGuard { state: self, previous };
+        hash(&mut *guard.state)
     }
 }
 
@@ -90,14 +115,31 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
         const TAG_INVALID_SPAN: u8 = 1;
         const TAG_RELATIVE_SPAN: u8 = 2;
 
-        if !self.stable_hash_controls().hash_spans {
-            return;
+        let controls = self.stable_hash_controls();
+        match controls {
+            StableHashControls::Span(SpanHashMode::Ignore) => return,
+            StableHashControls::Span(SpanHashMode::Hygiene)
+            | StableHashControls::Span(SpanHashMode::Full)
+            | StableHashControls::MetadataHygiene => {}
         }
 
         let span = Span::from_raw_span(raw_span);
         let span = span.data_untracked();
         span.ctxt.stable_hash(self, hasher);
+        match controls {
+            StableHashControls::MetadataHygiene => return,
+            StableHashControls::Span(SpanHashMode::Hygiene)
+            | StableHashControls::Span(SpanHashMode::Full) => {}
+            StableHashControls::Span(SpanHashMode::Ignore) => unreachable!(),
+        }
+
         span.parent.stable_hash(self, hasher);
+        match controls {
+            StableHashControls::Span(SpanHashMode::Hygiene) => return,
+            StableHashControls::Span(SpanHashMode::Full) => {}
+            StableHashControls::Span(SpanHashMode::Ignore)
+            | StableHashControls::MetadataHygiene => unreachable!(),
+        }
 
         if span.is_dummy() {
             Hash::hash(&TAG_INVALID_SPAN, hasher);
@@ -175,24 +217,83 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
     /// versions of `ExpnData` hashes for each permutation of `StableHashControls` settings.
     #[inline]
     fn assert_default_stable_hash_controls(&self, msg: &str) {
-        let stable_hash_controls = self.stable_hash_controls;
-        let StableHashControls { hash_spans } = stable_hash_controls;
+        let stable_hash_controls = self.stable_hash_controls();
+        let default_span_mode =
+            if self.incremental_ignore_spans { SpanHashMode::Ignore } else { SpanHashMode::Full };
+        let valid = match stable_hash_controls {
+            StableHashControls::Span(span_mode) => {
+                span_mode == default_span_mode || span_mode == SpanHashMode::Hygiene
+            }
+            StableHashControls::MetadataHygiene => true,
+        };
 
-        // Note that we require that `hash_spans` be the inverse of the global `-Z
-        // incremental-ignore-spans` option. Normally, this option is disabled, in which case
-        // `hash_spans` must be true.
+        // The default mode follows the global `-Z incremental-ignore-spans` option. Normally,
+        // this option is disabled, in which case spans are hashed in full.
         //
         // Span hashing can also be disabled without `-Z incremental-ignore-spans`. This is the
         // case for instance when building a hash for name mangling. Such configuration must not be
         // used for metadata.
-        assert_eq!(
-            hash_spans, !self.incremental_ignore_spans,
+        assert!(
+            valid,
             "Attempted hashing of {msg} with non-default StableHashControls: {stable_hash_controls:?}"
         );
     }
 
     #[inline]
     fn stable_hash_controls(&self) -> StableHashControls {
-        self.stable_hash_controls
+        match &self.mode {
+            StableHashingMode::Span(span_mode) => StableHashControls::Span(*span_mode),
+            StableHashingMode::MetadataHygiene(_) => StableHashControls::MetadataHygiene,
+        }
+    }
+
+    fn stable_hash_expn_id(
+        &mut self,
+        RawExpnId(krate, local_id): RawExpnId,
+        expn_hash: Fingerprint,
+        hasher: &mut StableHasher,
+    ) {
+        match self.mode.clone() {
+            StableHashingMode::Span(_) => {
+                expn_hash.stable_hash(self, hasher);
+            }
+            StableHashingMode::MetadataHygiene(layout) => {
+                let expn = ExpnId {
+                    krate: CrateNum::from_u32(krate),
+                    local_id: ExpnIndex::from_u32(local_id),
+                };
+                if expn.krate == rustc_span::def_id::LOCAL_CRATE {
+                    layout.stable_hash_expansion(expn, self, hasher);
+                } else {
+                    expn_hash.stable_hash(self, hasher);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn with_span_hash_mode<R>(
+        &mut self,
+        mode: SpanHashMode,
+        hash: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let restricted = match (&self.mode, mode) {
+            (StableHashingMode::Span(SpanHashMode::Ignore), _) | (_, SpanHashMode::Ignore) => {
+                StableHashingMode::Span(SpanHashMode::Ignore)
+            }
+            (StableHashingMode::Span(SpanHashMode::Hygiene), _)
+            | (StableHashingMode::Span(SpanHashMode::Full), SpanHashMode::Hygiene) => {
+                StableHashingMode::Span(SpanHashMode::Hygiene)
+            }
+            (StableHashingMode::Span(SpanHashMode::Full), SpanHashMode::Full) => {
+                StableHashingMode::Span(SpanHashMode::Full)
+            }
+            (StableHashingMode::MetadataHygiene(layout), _) => {
+                StableHashingMode::MetadataHygiene(layout.clone())
+            }
+        };
+        let previous = std::mem::replace(&mut self.mode, restricted);
+        let guard = StableHashingModeGuard { state: self, previous };
+        hash(&mut *guard.state)
     }
 }

@@ -27,8 +27,33 @@ pub trait StableHashCtxt {
     /// Compute a `DefPathHash`.
     fn def_path_hash(&self, def_id: RawDefId) -> RawDefPathHash;
 
-    /// Get the stable hash controls.
+    /// Returns the controls that must participate in stable-hash cache keys.
     fn stable_hash_controls(&self) -> StableHashControls;
+
+    /// Hashes an expansion through the identity space owned by this context.
+    ///
+    /// The context receives the ordinary session-independent hash as an input because expansion
+    /// data lives downstream of this crate. Metadata contexts replace it atomically with their
+    /// closed content identity instead of exposing the layout as a separate optional operation.
+    fn stable_hash_expn_id(
+        &mut self,
+        expn_id: RawExpnId,
+        expn_hash: crate::fingerprint::Fingerprint,
+        hasher: &mut StableHasher,
+    );
+
+    /// Restricts span hashing for one projection.
+    ///
+    /// A nested projection cannot enable span data excluded by its enclosing projection. The
+    /// previous mode is restored during normal return and unwinding, so nested projections cannot
+    /// affect later hashes.
+    fn with_span_hash_mode<R>(
+        &mut self,
+        mode: SpanHashMode,
+        hash: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized;
 
     /// Assert that the provided `StableHashCtxt` is configured with the default
     /// `StableHashControls`. We should always have bailed out before getting to here with a
@@ -42,6 +67,9 @@ pub struct RawSpan(pub u32, pub u16, pub u16);
 // A type used to work around `DefId` not being visible in this crate. It is the same size as
 // `DefId`.
 pub struct RawDefId(pub u32, pub u32);
+
+// A type used to work around `ExpnId` not being visible in this crate.
+pub struct RawExpnId(pub u32, pub u32);
 
 // A type used to work around `DefPathHash` not being visible in this crate. It is the same size as
 // `DefPathHash`.
@@ -611,14 +639,23 @@ where
     }
 }
 
-/// Controls what data we do or do not hash.
-/// Whenever a `StableHash` implementation caches its
-/// result, it needs to include `StableHashControls` as part
-/// of the key, to ensure that it does not produce an incorrect
-/// result (for example, using a `Fingerprint` produced while
-/// hashing `Span`s when a `Fingerprint` without `Span`s is
-/// being requested)
+/// Distinguishes stable-hash projections that can produce different cached results.
+///
+/// Metadata hygiene is not an ordinary span mode because it requires an artifact-local layout.
+/// Keeping it separate prevents the scoped span-mode API from selecting it without that layout.
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
-pub struct StableHashControls {
-    pub hash_spans: bool,
+pub enum StableHashControls {
+    Span(SpanHashMode),
+    MetadataHygiene,
+}
+
+/// Selects the portion of a span that contributes to a stable hash.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
+pub enum SpanHashMode {
+    /// Ignore source positions while retaining macro-expansion identity.
+    Hygiene,
+    /// Ignore the complete span.
+    Ignore,
+    /// Hash macro-expansion identity and source positions.
+    Full,
 }
