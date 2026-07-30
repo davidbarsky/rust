@@ -115,7 +115,7 @@ fn parse(
             let Some(tokenstream::TokenTree::Token(token, _)) = iter.next() else {
                 // Invalid, return a nice source location as `var:`
                 result.push(missing_fragment_specifier(
-                    colon_span.with_lo(start_sp.lo()),
+                    colon_span.with_lo_from(start_sp),
                     colon_span.shrink_to_hi(),
                 ));
                 continue;
@@ -150,7 +150,7 @@ fn parse(
                 continue;
             };
 
-            let span = token.span.with_lo(start_sp.lo());
+            let span = token.span.with_lo_from(start_sp);
             let edition = || {
                 // FIXME(#85708) - once we properly decode a foreign
                 // crate's `SyntaxContext::root`, then we can replace
@@ -326,7 +326,7 @@ fn parse_tree<'a>(
                 // special metavariable that names the crate of the invocation.
                 Some(tokenstream::TokenTree::Token(token, _)) if token.is_ident() => {
                     let (ident, is_raw) = token.ident().unwrap();
-                    let span = ident.span.with_lo(dollar_span.lo());
+                    let span = ident.span.with_lo_from(dollar_span);
                     if ident.name == kw::Crate && matches!(is_raw, IdentIsRaw::No) {
                         TokenTree::token(token::Ident(kw::DollarCrate, is_raw), span)
                     } else {

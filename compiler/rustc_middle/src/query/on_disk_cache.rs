@@ -18,8 +18,9 @@ use rustc_span::hygiene::{
     ExpnId, HygieneDecodeContext, HygieneEncodeContext, SyntaxContext, SyntaxContextKey,
 };
 use rustc_span::{
-    BlobDecoder, BytePos, ByteSymbol, CachingSourceMapView, ExpnData, ExpnHash, RelativeBytePos,
-    SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
+    BlobDecoder, BytePos, ByteSymbol, CachingSourceMapView, ExpnData, ExpnHash, ExternalSpanSlot,
+    RelativeBytePos, SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId,
+    Symbol,
 };
 
 use crate::dep_graph::{DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
@@ -36,6 +37,7 @@ const TAG_FULL_SPAN: u8 = 0;
 // A partial span with no location information, encoded only with a `SyntaxContext`
 const TAG_PARTIAL_SPAN: u8 = 1;
 const TAG_RELATIVE_SPAN: u8 = 2;
+const TAG_EXTERNAL_SPAN: u8 = 3;
 
 const TAG_SYNTAX_CONTEXT: u8 = 0;
 const TAG_EXPN_DATA: u8 = 1;
@@ -610,6 +612,15 @@ impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
         let parent = Option::<LocalDefId>::decode(self);
         let tag: u8 = Decodable::decode(self);
 
+        if tag == TAG_EXTERNAL_SPAN {
+            return Span::new_external_with_slots(
+                CrateNum::decode(self),
+                ExternalSpanSlot::decode(self),
+                ExternalSpanSlot::decode(self),
+                ctxt,
+            );
+        }
+
         let (lo, hi) = match tag {
             TAG_PARTIAL_SPAN => (BytePos(0), BytePos(0)),
             TAG_RELATIVE_SPAN => {
@@ -927,6 +938,21 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
         line_lo.encode(self);
         col_lo.encode(self);
         len.encode(self);
+    }
+
+    fn encode_external_span(
+        &mut self,
+        cnum: CrateNum,
+        lo: ExternalSpanSlot,
+        hi: ExternalSpanSlot,
+        ctxt: SyntaxContext,
+    ) {
+        ctxt.encode(self);
+        Option::<LocalDefId>::None.encode(self);
+        TAG_EXTERNAL_SPAN.encode(self);
+        cnum.encode(self);
+        lo.encode(self);
+        hi.encode(self);
     }
 
     fn encode_symbol(&mut self, sym: Symbol) {

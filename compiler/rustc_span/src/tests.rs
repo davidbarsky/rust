@@ -1,4 +1,66 @@
+use rustc_data_structures::fx::FxHashSet;
+
 use super::*;
+
+#[test]
+fn external_span_preserves_context_equality() {
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        let ctxt = SyntaxContext::root();
+        let inline = Span::new(BytePos(1), BytePos(2), ctxt, None);
+        let external = Span::new_external(
+            ExternalSpanId { cnum: LOCAL_CRATE, slot: ExternalSpanSlot::from_u32(0) },
+            ctxt,
+        );
+
+        assert!(inline.eq_ctxt(external));
+        assert!(external.eq_ctxt(inline));
+        assert!(!external.is_dummy());
+
+        let other_external = Span::new_external(
+            ExternalSpanId { cnum: LOCAL_CRATE, slot: ExternalSpanSlot::from_u32(1) },
+            ctxt,
+        );
+        assert!(external.with_lo_from(other_external).eq_ctxt(inline));
+        assert!(external.with_hi_from(other_external).eq_ctxt(inline));
+
+        let name = sym::field;
+        let mut identifiers = FxHashSet::default();
+        identifiers.insert(Ident::new(name, inline));
+        assert!(identifiers.contains(&Ident::new(name, external)));
+    });
+}
+
+#[test]
+fn external_span_normalizes_composed_endpoints() {
+    fn external_span_data(id: ExternalSpanId) -> ExternalSpanData {
+        match id.slot.as_u32() {
+            0 => ExternalSpanData { lo: BytePos(10), hi: BytePos(20) },
+            1 => ExternalSpanData { lo: BytePos(30), hi: BytePos(40) },
+            slot => panic!("unexpected external span slot {slot}"),
+        }
+    }
+
+    let previous =
+        EXTERNAL_SPAN_DATA.swap(&(external_span_data as fn(ExternalSpanId) -> ExternalSpanData));
+    let _restore = rustc_data_structures::defer(move || {
+        EXTERNAL_SPAN_DATA.swap(previous);
+    });
+
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        let earlier = Span::new_external(
+            ExternalSpanId { cnum: LOCAL_CRATE, slot: ExternalSpanSlot::from_u32(0) },
+            SyntaxContext::root(),
+        );
+        let later = Span::new_external(
+            ExternalSpanId { cnum: LOCAL_CRATE, slot: ExternalSpanSlot::from_u32(1) },
+            SyntaxContext::root(),
+        );
+        let expected = Span::new(BytePos(20), BytePos(30), SyntaxContext::root(), None).data();
+
+        assert_eq!(earlier.with_lo_from(later).data(), expected);
+        assert_eq!(later.with_hi_from(earlier).data(), expected);
+    });
+}
 
 #[test]
 fn test_lookup_line() {

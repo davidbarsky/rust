@@ -1,12 +1,20 @@
+use std::hash::Hash;
+
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_data_structures::stable_hash::RawSpan;
+use rustc_data_structures::stable_hash::{
+    RawSpan, SpanHashMode, StableHash, StableHashControls, StableHashCtxt, StableHasher,
+};
+use rustc_serialize::Encodable;
 // This code is very hot and uses lots of arithmetic, avoid overflow checks for performance.
 // See https://github.com/rust-lang/rust/pull/119440#issuecomment-1874255727
 use rustc_serialize::int_overflow::DebugStrictAdd;
 
 use crate::def_id::{DefIndex, LocalDefId};
 use crate::hygiene::SyntaxContext;
-use crate::{BytePos, SPAN_TRACK, SpanData};
+use crate::{
+    BytePos, EXTERNAL_SPAN_DATA, ExternalSpanData, ExternalSpanId, ExternalSpanSlot, SPAN_TRACK,
+    SpanData,
+};
 
 /// A compressed span.
 ///
@@ -23,7 +31,7 @@ use crate::{BytePos, SPAN_TRACK, SpanData};
 /// very large crates) and so the interner was used a lot more. That version of
 /// the code also predated the storage of parents.
 ///
-/// There are four different span forms.
+/// There are five different span forms.
 ///
 /// Inline-context format (requires non-huge length, non-huge context, and no parent):
 /// - `span.lo_or_index == span_data.lo`
@@ -47,10 +55,20 @@ use crate::{BytePos, SPAN_TRACK, SpanData};
 /// - `span.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER`
 /// - `span.ctxt_or_parent_or_marker == CTXT_INTERNED_MARKER`
 ///
+/// External format (source coordinates decoded from another crate's metadata):
+/// - `span.lo_or_index == index` (indexes into the external span interner table)
+/// - `span.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER`
+/// - `span.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER`
+///
 /// The partially-interned form requires looking in the interning table for
 /// lo and length, but the context is stored inline as well as interned.
 /// This is useful because context lookups are often done in isolation, and
 /// inline lookups are quicker.
+///
+/// The external form keeps the syntax context available without loading source
+/// coordinates. Operations that need `lo` or `hi` resolve the external span
+/// through `EXTERNAL_SPAN_DATA`, which lets the query engine track the spans
+/// cache only for computations that observe positions.
 ///
 /// Notes about the choice of field sizes:
 /// - `lo` is 32 bits in both `Span` and `SpanData`, which means that `lo`
@@ -74,9 +92,10 @@ use crate::{BytePos, SPAN_TRACK, SpanData};
 ///   bits. The number of bits needed for `parent` hasn't been measured,
 ///   because `parent` isn't currently used by default.
 ///
-/// In order to reliably use parented spans in incremental compilation,
-/// accesses to `lo` and `hi` must introduce a dependency to the parent definition's span.
-/// This is performed using the callback `SPAN_TRACK` to access the query engine.
+/// In order to reliably use parented and external spans in incremental compilation,
+/// accesses to `lo` and `hi` must introduce dependencies on their source coordinates.
+/// `SPAN_TRACK` and `EXTERNAL_SPAN_DATA` provide access to the query engine without
+/// making `rustc_span` depend on it.
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 #[rustc_pass_by_value]
 pub struct Span {
@@ -109,6 +128,25 @@ struct PartiallyInterned {
 #[derive(Clone, Copy)]
 struct Interned {
     index: u32,
+}
+
+#[derive(Clone, Copy)]
+struct External {
+    index: u32,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct ExternalSpan {
+    cnum: crate::def_id::CrateNum,
+    lo: ExternalSpanSlot,
+    hi: ExternalSpanSlot,
+    ctxt: SyntaxContext,
+}
+
+#[derive(Clone, Copy)]
+enum IndirectCtxt {
+    Span(usize),
+    External(usize),
 }
 
 impl InlineCtxt {
@@ -198,6 +236,21 @@ impl Interned {
     }
 }
 
+impl External {
+    #[inline]
+    fn data(self) -> SpanData {
+        let span = with_span_interner(|interner| interner.external_spans[self.index as usize]);
+        let id = |slot| ExternalSpanId { cnum: span.cnum, slot };
+        let ExternalSpanData { mut lo, hi: same_span_hi } = (*EXTERNAL_SPAN_DATA)(id(span.lo));
+        let mut hi =
+            if span.lo == span.hi { same_span_hi } else { (*EXTERNAL_SPAN_DATA)(id(span.hi)).hi };
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        SpanData { lo, hi, ctxt: span.ctxt, parent: None }
+    }
+}
+
 // This code is very hot, and converting span to an enum and matching on it doesn't optimize away
 // properly. So we are using a macro emulating such a match, but expand it directly to an if-else
 // chain.
@@ -208,6 +261,7 @@ macro_rules! match_span_kind {
         InlineParent($span2:ident) => $arm2:expr,
         PartiallyInterned($span3:ident) => $arm3:expr,
         Interned($span4:ident) => $arm4:expr,
+        External($span5:ident) => $arm5:expr,
     ) => {
         if $span.len_with_tag_or_marker != BASE_LEN_INTERNED_MARKER {
             if $span.len_with_tag_or_marker & PARENT_TAG == 0 {
@@ -219,6 +273,10 @@ macro_rules! match_span_kind {
                 let $span2 = InlineParent::from_span($span);
                 $arm2
             }
+        } else if $span.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER {
+            // External format.
+            let $span5 = External { index: $span.lo_or_index };
+            $arm5
         } else if $span.ctxt_or_parent_or_marker != CTXT_INTERNED_MARKER {
             // Partially-interned format.
             let $span3 = PartiallyInterned::from_span($span);
@@ -237,6 +295,7 @@ const MAX_LEN: u32 = 0b0111_1111_1111_1110;
 const MAX_CTXT: u32 = 0b0111_1111_1111_1110;
 const PARENT_TAG: u16 = 0b1000_0000_0000_0000;
 const BASE_LEN_INTERNED_MARKER: u16 = 0b1111_1111_1111_1111;
+const CTXT_EXTERNAL_MARKER: u16 = 0b1111_1111_1111_1110;
 const CTXT_INTERNED_MARKER: u16 = 0b1111_1111_1111_1111;
 
 /// The dummy span has zero position, length, and context, and no parent.
@@ -281,9 +340,44 @@ impl Span {
         }
     }
 
+    /// Defers loading an external span's source coordinates while retaining its hygiene context.
+    #[inline]
+    pub fn new_external(id: ExternalSpanId, ctxt: SyntaxContext) -> Self {
+        Self::new_external_with_slots(id.cnum, id.slot, id.slot, ctxt)
+    }
+
+    /// Defers source coordinates whose endpoints occupy distinct slots in one external artifact.
+    ///
+    /// Owning the crate number once prevents a composed span from addressing unrelated artifacts.
+    #[inline]
+    pub fn new_external_with_slots(
+        cnum: crate::def_id::CrateNum,
+        lo: ExternalSpanSlot,
+        hi: ExternalSpanSlot,
+        ctxt: SyntaxContext,
+    ) -> Self {
+        let index = with_span_interner(|interner| {
+            let (index, _) =
+                interner.external_spans.insert_full(ExternalSpan { cnum, lo, hi, ctxt });
+            index as u32
+        });
+        Span {
+            lo_or_index: index,
+            len_with_tag_or_marker: BASE_LEN_INTERNED_MARKER,
+            ctxt_or_parent_or_marker: CTXT_EXTERNAL_MARKER,
+        }
+    }
+
     #[inline]
     pub fn data(self) -> SpanData {
-        let data = self.data_untracked();
+        let data = match_span_kind! {
+            self,
+            InlineCtxt(span) => span.data(),
+            InlineParent(span) => span.data(),
+            PartiallyInterned(span) => span.data(),
+            Interned(span) => span.data(),
+            External(span) => span.data(),
+        };
         if let Some(parent) = data.parent {
             (*SPAN_TRACK)(parent);
         }
@@ -300,6 +394,7 @@ impl Span {
             InlineParent(span) => span.data(),
             PartiallyInterned(span) => span.data(),
             Interned(span) => span.data(),
+            External(span) => span.data(),
         }
     }
 
@@ -319,6 +414,9 @@ impl Span {
             InlineParent(_span) => SyntaxContext::root(),
             PartiallyInterned(span) => SyntaxContext::from_u16(span.ctxt),
             Interned(_span) => SyntaxContext::from_u16(CTXT_INTERNED_MARKER),
+            External(span) => {
+                with_span_interner(|interner| interner.external_spans[span.index as usize].ctxt)
+            },
         };
         !ctxt.is_root()
     }
@@ -334,9 +432,13 @@ impl Span {
             lo == 0 && len == 0
         } else {
             // Fully-interned or partially-interned format.
-            let index = self.lo_or_index;
-            let data = with_span_interner(|interner| interner.spans[index as usize]);
-            data.lo == BytePos(0) && data.hi == BytePos(0)
+            if self.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER {
+                false
+            } else {
+                let index = self.lo_or_index;
+                let data = with_span_interner(|interner| interner.spans[index as usize]);
+                data.lo == BytePos(0) && data.hi == BytePos(0)
+            }
         }
     }
 
@@ -359,21 +461,81 @@ impl Span {
             InlineParent(span) => span.data(),
             PartiallyInterned(span) => span.data(),
             Interned(span) => span.data(),
+            External(span) => {
+                let external = with_span_interner(|interner| {
+                    interner.external_spans[span.index as usize]
+                });
+                return Span::new_external_with_slots(
+                    external.cnum,
+                    external.lo,
+                    external.hi,
+                    map(external.ctxt),
+                );
+            },
         };
 
         data.with_ctxt(map(data.ctxt))
     }
 
+    /// Replaces the lower endpoint without resolving deferred external coordinates.
+    ///
+    /// When both spans are external, the result retains their artifact-local endpoints so
+    /// position-independent compiler work remains independent of their source coordinates.
+    #[inline]
+    pub fn with_lo_from(self, other: Span) -> Span {
+        if self.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER
+            && self.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER
+            && other.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER
+            && other.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER
+        {
+            let (this, other) = with_span_interner(|interner| {
+                (
+                    interner.external_spans[self.lo_or_index as usize],
+                    interner.external_spans[other.lo_or_index as usize],
+                )
+            });
+            if this.cnum == other.cnum {
+                return Span::new_external_with_slots(this.cnum, other.lo, this.hi, this.ctxt);
+            }
+        }
+        self.with_lo(other.lo())
+    }
+
+    /// Replaces the upper endpoint without resolving deferred external coordinates.
+    ///
+    /// When both spans are external, the result retains their artifact-local endpoints so
+    /// position-independent compiler work remains independent of their source coordinates.
+    #[inline]
+    pub fn with_hi_from(self, other: Span) -> Span {
+        if self.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER
+            && self.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER
+            && other.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER
+            && other.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER
+        {
+            let (this, other) = with_span_interner(|interner| {
+                (
+                    interner.external_spans[self.lo_or_index as usize],
+                    interner.external_spans[other.lo_or_index as usize],
+                )
+            });
+            if this.cnum == other.cnum {
+                return Span::new_external_with_slots(this.cnum, this.lo, other.hi, this.ctxt);
+            }
+        }
+        self.with_hi(other.hi())
+    }
+
     // Returns either syntactic context, if it can be retrieved without taking the interner lock,
     // or an index into the interner if it cannot.
     #[inline]
-    fn inline_ctxt(self) -> Result<SyntaxContext, usize> {
+    fn inline_ctxt(self) -> Result<SyntaxContext, IndirectCtxt> {
         match_span_kind! {
             self,
             InlineCtxt(span) => Ok(SyntaxContext::from_u16(span.ctxt)),
             InlineParent(_span) => Ok(SyntaxContext::root()),
             PartiallyInterned(span) => Ok(SyntaxContext::from_u16(span.ctxt)),
-            Interned(span) => Err(span.index as usize),
+            Interned(span) => Err(IndirectCtxt::Span(span.index as usize)),
+            External(span) => Err(IndirectCtxt::External(span.index as usize)),
         }
     }
 
@@ -382,20 +544,30 @@ impl Span {
     #[cfg_attr(not(test), rustc_diagnostic_item = "SpanCtxt")]
     #[inline]
     pub fn ctxt(self) -> SyntaxContext {
-        self.inline_ctxt()
-            .unwrap_or_else(|index| with_span_interner(|interner| interner.spans[index].ctxt))
+        self.inline_ctxt().unwrap_or_else(|index| {
+            with_span_interner(|interner| match index {
+                IndirectCtxt::Span(index) => interner.spans[index].ctxt,
+                IndirectCtxt::External(index) => interner.external_spans[index].ctxt,
+            })
+        })
     }
 
     #[inline]
     pub fn eq_ctxt(self, other: Span) -> bool {
         match (self.inline_ctxt(), other.inline_ctxt()) {
             (Ok(ctxt1), Ok(ctxt2)) => ctxt1 == ctxt2,
-            // If `inline_ctxt` returns `Ok` the context is <= MAX_CTXT.
-            // If it returns `Err` the span is fully interned and the context is > MAX_CTXT.
-            // As these do not overlap an `Ok` and `Err` result cannot have an equal context.
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+            (Ok(ctxt), Err(IndirectCtxt::External(index)))
+            | (Err(IndirectCtxt::External(index)), Ok(ctxt)) => {
+                with_span_interner(|interner| ctxt == interner.external_spans[index].ctxt)
+            }
+            (Ok(_ctxt), Err(IndirectCtxt::Span(_index)))
+            | (Err(IndirectCtxt::Span(_index)), Ok(_ctxt)) => false,
             (Err(index1), Err(index2)) => with_span_interner(|interner| {
-                interner.spans[index1].ctxt == interner.spans[index2].ctxt
+                let ctxt = |index| match index {
+                    IndirectCtxt::Span(index) => interner.spans[index].ctxt,
+                    IndirectCtxt::External(index) => interner.external_spans[index].ctxt,
+                };
+                ctxt(index1) == ctxt(index2)
             }),
         }
     }
@@ -422,6 +594,10 @@ impl Span {
             InlineParent(span) => span.data(),
             PartiallyInterned(span) => span.data(),
             Interned(span) => span.data(),
+            External(span) => match parent {
+                None => return self,
+                Some(_) => span.data(),
+            },
         };
 
         if let Some(old_parent) = data.parent {
@@ -440,6 +616,7 @@ impl Span {
             InlineParent(span) => Some(LocalDefId { local_def_index: DefIndex::from_u16(span.parent) }),
             PartiallyInterned(span) => interned_parent(span.index),
             Interned(span) => interned_parent(span.index),
+            External(_span) => None,
         }
     }
 
@@ -456,9 +633,54 @@ impl Span {
     }
 }
 
+impl<E: crate::SpanEncoder> Encodable<E> for Span {
+    fn encode(&self, encoder: &mut E) {
+        if self.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER
+            && self.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER
+        {
+            let external =
+                with_span_interner(|interner| interner.external_spans[self.lo_or_index as usize]);
+            encoder.encode_external_span(external.cnum, external.lo, external.hi, external.ctxt);
+        } else {
+            encoder.encode_span(*self);
+        }
+    }
+}
+
+impl StableHash for Span {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        if self.len_with_tag_or_marker == BASE_LEN_INTERNED_MARKER
+            && self.ctxt_or_parent_or_marker == CTXT_EXTERNAL_MARKER
+        {
+            let external =
+                with_span_interner(|interner| interner.external_spans[self.lo_or_index as usize]);
+            match hcx.stable_hash_controls() {
+                StableHashControls::Span(SpanHashMode::Ignore) => {}
+                StableHashControls::Span(SpanHashMode::Hygiene)
+                | StableHashControls::MetadataHygiene => {
+                    external.ctxt.stable_hash(hcx, hasher);
+                    Option::<LocalDefId>::None.stable_hash(hcx, hasher);
+                }
+                StableHashControls::Span(SpanHashMode::Full) => {
+                    external.ctxt.stable_hash(hcx, hasher);
+                    Option::<LocalDefId>::None.stable_hash(hcx, hasher);
+                    Hash::hash(&3u8, hasher);
+                    external.cnum.stable_hash(hcx, hasher);
+                    external.lo.stable_hash(hcx, hasher);
+                    external.hi.stable_hash(hcx, hasher);
+                }
+            }
+            return;
+        }
+
+        hcx.stable_hash_span(self.to_raw_span(), hasher)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SpanInterner {
     spans: FxIndexSet<SpanData>,
+    external_spans: FxIndexSet<ExternalSpan>,
 }
 
 impl SpanInterner {

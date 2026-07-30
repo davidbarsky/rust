@@ -1063,7 +1063,7 @@ fn check_redundant_vis_repetition(
                     sess.source_map().span_extend_to_prev_char_before(span.open, '$', true),
                     "".to_string(),
                 ),
-                (span.close.with_hi(seq.kleene.span.hi()), "".to_string()),
+                (span.close.with_hi_from(seq.kleene.span), "".to_string()),
             ],
             Applicability::MaybeIncorrect,
         );

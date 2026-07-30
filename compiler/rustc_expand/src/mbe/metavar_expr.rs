@@ -151,7 +151,7 @@ fn iter_span(iter: &TokenStreamIter<'_>) -> Option<Span> {
     let mut iter = iter.clone(); // cloning is cheap
     let first_sp = iter.next()?.span();
     let last_sp = iter.last().map(TokenTree::span).unwrap_or(first_sp);
-    let span = first_sp.with_hi(last_sp.hi());
+    let span = first_sp.with_hi_from(last_sp);
     Some(span)
 }
 

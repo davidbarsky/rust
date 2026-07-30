@@ -31,7 +31,6 @@
 extern crate self as rustc_span;
 
 use derive_where::derive_where;
-use rustc_data_structures::stable_hash::StableHashCtxt;
 use rustc_data_structures::{AtomicRef, outline};
 use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_serialize::opaque::mem_encoder::MemEncoder;
@@ -82,7 +81,7 @@ use std::sync::Arc;
 use std::{fmt, iter};
 
 use md5::{Digest, Md5};
-use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock};
 use rustc_data_structures::unord::UnordMap;
 use rustc_hashes::{Hash64, Hash128};
@@ -1356,6 +1355,15 @@ rustc_index::newtype_index! {
 /// It is similar to rustc_type_ir's TyEncoder.
 pub trait SpanEncoder: Encoder {
     fn encode_span(&mut self, span: Span);
+    fn encode_external_span(
+        &mut self,
+        cnum: CrateNum,
+        lo: ExternalSpanSlot,
+        hi: ExternalSpanSlot,
+        ctxt: SyntaxContext,
+    ) {
+        self.encode_span(Span::new_external_with_slots(cnum, lo, hi, ctxt));
+    }
     fn encode_symbol(&mut self, sym: Symbol);
     fn encode_byte_symbol(&mut self, byte_sym: ByteSymbol);
     fn encode_expn_id(&mut self, expn_id: ExpnId);
@@ -1438,12 +1446,6 @@ impl SpanEncoder for MemEncoder {
     fn encode_def_id(&mut self, def_id: DefId) {
         def_id.krate.encode(self);
         def_id.index.encode(self);
-    }
-}
-
-impl<E: SpanEncoder> Encodable<E> for Span {
-    fn encode(&self, s: &mut E) {
-        s.encode_span(*self);
     }
 }
 
@@ -2780,7 +2782,35 @@ pub struct FileLines {
     pub lines: Vec<LineInfo>,
 }
 
+rustc_index::newtype_index! {
+    /// Addresses source coordinates within one crate's metadata spans cache.
+    ///
+    /// The address is meaningful only with the crate number carried by [`ExternalSpanId`].
+    #[encodable]
+    #[stable_hash]
+    #[debug_format = "ExternalSpanSlot({})"]
+    #[max = 0xFFFF_FFFE]
+    pub struct ExternalSpanSlot {}
+}
+
+/// Identifies source coordinates stored outside the metadata value that refers to them.
+#[derive(Clone, Copy, Debug, Encodable, Decodable, Eq, Hash, PartialEq, StableHash)]
+pub struct ExternalSpanId {
+    pub cnum: CrateNum,
+    pub slot: ExternalSpanSlot,
+}
+
+/// Carries only coordinates so deferred position lookup cannot replace a span's stored hygiene.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalSpanData {
+    pub lo: BytePos,
+    pub hi: BytePos,
+}
+
 pub static SPAN_TRACK: AtomicRef<fn(LocalDefId)> = AtomicRef::new(&((|_| {}) as fn(_)));
+pub static EXTERNAL_SPAN_DATA: AtomicRef<fn(ExternalSpanId) -> ExternalSpanData> = AtomicRef::new(
+    &((|id| panic!("external span {id:?} resolved without a compiler context")) as fn(_) -> _),
+);
 
 // _____________________________________________________________________________
 // SpanLinesError, SpanSnippetError, DistinctSources, MalformedSourceMapPositions
@@ -2825,13 +2855,6 @@ pub struct InnerSpan {
 impl InnerSpan {
     pub fn new(start: usize, end: usize) -> InnerSpan {
         InnerSpan { start, end }
-    }
-}
-
-impl StableHash for Span {
-    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
-        // `stable_hash_span` does all the work.
-        hcx.stable_hash_span(self.to_raw_span(), hasher)
     }
 }
 
