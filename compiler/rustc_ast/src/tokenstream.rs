@@ -1089,7 +1089,7 @@ impl DelimSpan {
     }
 
     pub fn entire(self) -> Span {
-        self.open.with_hi(self.close.hi())
+        self.open.with_hi_from(self.close)
     }
 }
 
