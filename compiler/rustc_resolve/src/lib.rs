@@ -61,8 +61,9 @@ use rustc_lint_defs::builtin::PRIVATE_MACRO_USE;
 use rustc_metadata::creader::CStore;
 use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::middle::resolve::{
-    AmbigModChild, DelegationInfo, DelegationInherentFnKind, DocLinkResMap, MainDefinition,
-    ModChild, PartialRes, PerOwnerResolverData, Reexport, ResolverAstLowering, ResolverGlobalCtxt,
+    AmbigModChild, DelegationInfo, DelegationInherentFnKind, DocLinkResMap, MacroReachability,
+    MainDefinition, ModChild, PartialRes, PerOwnerResolverData, Reexport, ResolverAstLowering,
+    ResolverGlobalCtxt,
 };
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, RegisteredTools, TyCtxt, TyCtxtFeed, Visibility};
@@ -1543,7 +1544,7 @@ pub struct Resolver<'ra, 'tcx> {
     stripped_cfg_items: Vec<StrippedCfgItem<NodeId>> = Vec::new(),
 
     effective_visibilities: EffectiveVisibilities = Default::default(),
-    macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>> = default::fx_index_map(),
+    macro_reachability: MacroReachability,
 
     doc_link_resolutions: FxIndexMap<LocalModId, DocLinkResMap> = default::fx_index_map(),
     doc_link_traits_in_scope: FxIndexMap<LocalModId, Vec<DefId>> = default::fx_index_map(),
@@ -1900,6 +1901,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             current_crate_outer_attr_insert_span,
             disambiguators: Default::default(),
             features: tcx.features(),
+            macro_reachability: Default::default(),
             ..
         };
 
@@ -1995,7 +1997,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             expn_that_defined,
             visibilities_for_hashing: self.visibilities_for_hashing,
             effective_visibilities,
-            macro_reachable_adts: self.macro_reachable_adts,
+            macro_reachability: self.macro_reachability,
             extern_crate_map,
             module_children: self.module_children,
             ambig_module_children: self.ambig_module_children,
