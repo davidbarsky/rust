@@ -1,7 +1,7 @@
 use rustc_data_structures::owned_slice::OwnedSlice;
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_hashes::Hash64;
-use rustc_hir::def_path_hash_map::Config as HashMapConfig;
+use rustc_hir::def_path_hash_map::{Config as HashMapConfig, DefPathHashMap};
 use rustc_hir::definitions::DefPathToIndexMap;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_span::def_id::{DefIndex, DefPathHash};
@@ -12,6 +12,7 @@ use crate::rmeta::decoder::BlobDecodeContext;
 pub(crate) enum DefPathHashMapRef<'tcx> {
     OwnedFromMetadata(odht::HashTable<HashMapConfig, OwnedSlice>, SortedMap<Hash64, DefIndex>),
     BorrowedFromTcx(&'tcx DefPathToIndexMap),
+    OwnedForEncoding(DefPathHashMap),
 }
 
 impl DefPathHashMapRef<'_> {
@@ -25,7 +26,7 @@ impl DefPathHashMapRef<'_> {
                 let hash = &def_path_hash.local_hash();
                 det_map.get(hash).or_else(|| non_det_map.get(hash).copied())
             }
-            DefPathHashMapRef::BorrowedFromTcx(_) => {
+            DefPathHashMapRef::BorrowedFromTcx(_) | DefPathHashMapRef::OwnedForEncoding(_) => {
                 panic!("DefPathHashMap::BorrowedFromTcx variant only exists for serialization")
             }
         }
@@ -45,6 +46,12 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for DefPathHashMapRef<'tcx> {
                     .expect("must be set before metadata encoding")
                     .range(..)
                     .encode(e);
+            }
+            DefPathHashMapRef::OwnedForEncoding(ref def_path_hash_map) => {
+                let bytes = def_path_hash_map.raw_bytes();
+                e.emit_usize(bytes.len());
+                e.emit_raw_bytes(bytes);
+                Vec::<(Hash64, DefIndex)>::new().encode(e);
             }
             DefPathHashMapRef::OwnedFromMetadata(..) => {
                 panic!("DefPathHashMap::OwnedFromMetadata variant only exists for deserialization")
