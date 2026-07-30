@@ -83,10 +83,50 @@ impl<'tcx> ExportedSymbol<'tcx> {
     }
 }
 
-pub fn metadata_symbol_name(tcx: TyCtxt<'_>) -> String {
-    format!(
+/// Names a dylib metadata export.
+///
+/// Its link-closure export is derived from the same crate-specific name.
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct MetadataSymbolName(String);
+
+impl MetadataSymbolName {
+    /// Derives the corresponding link-closure export.
+    pub fn rmeta_link_symbol(&self) -> RmetaLinkSymbolName {
+        RmetaLinkSymbolName(format!("{}_rmeta_link", self.0))
+    }
+}
+
+impl AsRef<str> for MetadataSymbolName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<MetadataSymbolName> for String {
+    fn from(symbol: MetadataSymbolName) -> Self {
+        symbol.0
+    }
+}
+
+/// Names an RDR dylib's link-closure export.
+pub struct RmetaLinkSymbolName(String);
+
+impl AsRef<str> for RmetaLinkSymbolName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<RmetaLinkSymbolName> for String {
+    fn from(symbol: RmetaLinkSymbolName) -> Self {
+        symbol.0
+    }
+}
+
+pub fn metadata_symbol_name(tcx: TyCtxt<'_>) -> MetadataSymbolName {
+    MetadataSymbolName(format!(
         "rust_metadata_{}_{:08x}",
         tcx.crate_name(LOCAL_CRATE),
         tcx.stable_crate_id(LOCAL_CRATE),
-    )
+    ))
 }

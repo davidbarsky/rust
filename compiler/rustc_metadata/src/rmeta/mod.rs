@@ -13,6 +13,11 @@ use encoder::EncodeContext;
 pub use encoder::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair, rendered_const};
 pub(crate) use encoder::{EncodedMetadataFiles, encode_metadata};
 pub(crate) use parameterized::ParameterizedOverTcx;
+pub use rmeta_link::{
+    DYLIB_RMETA_LINK_SECTION, RMETA_LINK_FILENAME, RMETA_LINK_SECTION, RmetaLink,
+    RmetaLinkContents, RmetaLinkData,
+};
+pub(crate) use rmeta_link::{LinkCrateDep, LinkCrateDepKind};
 use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
 use rustc_ast as ast;
 use rustc_attr_ir::lang_items::LangItem;
@@ -34,8 +39,8 @@ use rustc_hir::definitions::DefKey;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_index::{Idx, IndexVec};
 use rustc_macros::{
-    BlobDecodable, Decodable, Encodable, LazyDecodable, MetadataEncodable, StableHash, TyDecodable,
-    TyEncodable,
+    BlobDecodable, Decodable, Decodable_NoContext, Encodable, Encodable_NoContext, LazyDecodable,
+    MetadataEncodable, StableHash, TyDecodable, TyEncodable,
 };
 use rustc_middle::metadata::{
     DefinitionState, MetadataDecodeLayoutId, MetadataSpanLayout, SelectedDefinitions,
@@ -68,6 +73,7 @@ use crate::rmeta::table::TableBuilderSingleIdx;
 mod decoder;
 mod def_path_hash_map;
 mod parameterized;
+mod rmeta_link;
 mod table;
 
 pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
@@ -86,7 +92,7 @@ const COARSE_METADATA_PAYLOAD_OFFSET: usize = METADATA_ENVELOPE_LEN + 8;
 const RDR_METADATA_LENGTH_OFFSET: usize = VERSION_OFFSET;
 const RDR_METADATA_PAYLOAD_OFFSET: usize = METADATA_ENVELOPE_LEN + 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Encodable_NoContext, Decodable_NoContext)]
 #[repr(u8)]
 pub(crate) enum MetadataFormatKind {
     Coarse = 0,
@@ -532,6 +538,7 @@ impl SpansArtifactHeader {
 pub(crate) struct CrateHeader {
     pub(crate) triple: TargetTuple,
     pub(crate) name: Symbol,
+    pub(crate) stable_crate_id: StableCrateId,
     /// Whether this is the header for a proc-macro crate.
     ///
     /// This is separate from [`ProcMacroData`] to avoid having to update [`METADATA_VERSION`] every
@@ -561,6 +568,7 @@ pub(crate) struct CrateRootUnhashed {
 struct CrateHeaderRecord {
     triple: TargetTuple,
     name: Symbol,
+    stable_crate_id: StableCrateId,
     is_proc_macro_crate: bool,
     is_stub: bool,
 }
@@ -854,17 +862,14 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for RawDefId {
     }
 }
 
-/// A dependency record, as stored in the hashed [`CrateRoot`].
-///
-/// Note the absence of the dependency's `-C extra-filename`: it lives in
-/// [`CrateRootUnhashed::dep_extra_filenames`] instead, deliberately outside the hash.
 #[derive(Encodable, BlobDecodable, StableHash)]
 pub(crate) struct CrateDep {
-    pub name: Symbol,
-    pub hash: Svh,
-    pub host_hash: Option<Svh>,
-    pub kind: CrateDepKind,
-    pub is_private: bool,
+    pub(crate) name: Symbol,
+    pub(crate) hash: Svh,
+    pub(crate) host_hash: Option<Svh>,
+    pub(crate) kind: CrateDepKind,
+    pub(crate) dylib_linkage: Option<LinkagePreference>,
+    pub(crate) is_private: bool,
 }
 
 #[derive(MetadataEncodable, LazyDecodable)]
@@ -1375,7 +1380,6 @@ pub(crate) struct CrateRoot {
     header: CrateHeader => [Semantic] position_by none,
     metadata_decode_layout_id: MetadataDecodeLayoutId => [SelfIdentity] position_by none,
 
-    stable_crate_id: StableCrateId => [Semantic, DecodeLayout] position_by none,
     required_panic_strategy: Option<PanicStrategy> => [Semantic] position_by none,
     panic_in_drop_strategy: PanicStrategy => [Semantic] position_by none,
     edition: Edition => [Semantic] position_by none,
@@ -1387,7 +1391,6 @@ pub(crate) struct CrateRoot {
         => [Semantic, DecodeLayout] position_by encode_externally_implementable_items,
 
     crate_deps: LazyArray<CrateDep> => [Semantic, DecodeLayout] position_by none,
-    dylib_dependency_formats: LazyArray<Option<LinkagePreference>> => [Semantic, DecodeLayout] position_by none,
     lib_features: LazyArray<(Symbol, FeatureStability)> => [Semantic, DecodeLayout] position_by none,
     stability_implications: LazyArray<(Symbol, Symbol)> => [Semantic, DecodeLayout] position_by none,
     lang_items: LazyArray<(DefIndex, LangItem)> => [Semantic, DecodeLayout] position_by none,

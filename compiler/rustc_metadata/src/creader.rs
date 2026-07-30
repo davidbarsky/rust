@@ -8,7 +8,7 @@ use std::{cmp, env, iter};
 use rustc_ast::expand::allocator::{ALLOC_ERROR_HANDLER, AllocatorKind, global_fn_name};
 use rustc_ast::{self as ast, *};
 use rustc_crate_store::{CrateDepKind, CrateSource, ExternCrate, ExternCrateSource};
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::owned_slice::OwnedSlice;
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{self, FreezeReadGuard, FreezeWriteGuard};
@@ -37,9 +37,10 @@ use rustc_target::spec::{PanicStrategy, Target};
 use tracing::{debug, info};
 
 use crate::diagnostics;
-use crate::locator::{CrateError, CrateLocator, CratePaths, CrateRejections};
+use crate::locator::{CrateError, CrateLocator, CrateLocatorRequest, CratePaths, CrateRejections};
 use crate::rmeta::{
-    CrateDep, CrateMetadata, CrateNumMap, CrateRoot, LoadedMetadata, MetadataBlob, TargetModifiers,
+    CrateDep, CrateMetadata, CrateNumMap, CrateRoot, LinkCrateDep, LinkCrateDepKind,
+    LoadedMetadata, MetadataBlob, RmetaLink, TargetModifiers,
 };
 
 /// The backend's way to give the crate store access to the metadata in a library.
@@ -49,6 +50,16 @@ use crate::rmeta::{
 pub trait MetadataLoader {
     fn get_rlib_metadata(&self, target: &Target, filename: &Path) -> Result<OwnedSlice, String>;
     fn get_dylib_metadata(&self, target: &Target, filename: &Path) -> Result<OwnedSlice, String>;
+    fn get_rlib_link_metadata(
+        &self,
+        target: &Target,
+        filename: &Path,
+    ) -> Result<OwnedSlice, String>;
+    fn get_dylib_link_metadata(
+        &self,
+        target: &Target,
+        filename: &Path,
+    ) -> Result<OwnedSlice, String>;
 }
 
 pub type MetadataLoaderDyn = dyn MetadataLoader + Send + Sync + sync::DynSend + sync::DynSync;
@@ -105,6 +116,12 @@ enum LoadResult {
     Loaded(Library),
 }
 
+#[derive(Clone, Copy)]
+enum IndirectCrateDependency<'a> {
+    Metadata { dep: &'a CrateDep, extra_filename: &'a str },
+    Link(&'a LinkCrateDep),
+}
+
 impl std::fmt::Debug for CStore {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(fmt, "resolved crates:")?;
@@ -141,20 +158,29 @@ enum CrateOrigin<'a> {
         dep_root_for_errors: &'a CratePaths,
         /// True if the parent is private, meaning the dependent should also be private.
         parent_private: bool,
-        /// Dependency info about this crate.
-        dep: &'a CrateDep,
-        /// The dependency's `-C extra-filename`, used to narrow the search for it on disk. Stored
-        /// separately from `dep` because it is encoded outside the hashed crate root; see
-        /// `CrateRootUnhashed::dep_extra_filenames`.
-        dep_extra_filename: &'a str,
+        /// Dependency identity for this crate.
+        dep: IndirectCrateDependency<'a>,
     },
     /// Injected by `rustc`.
-    Injected,
+    Injected { crate_name: Symbol },
     /// Provided by `extern crate foo` or as part of the extern prelude.
-    Extern,
+    Extern { crate_name: Symbol },
 }
 
 impl<'a> CrateOrigin<'a> {
+    fn crate_name(self) -> Symbol {
+        match self {
+            CrateOrigin::IndirectDependency {
+                dep: IndirectCrateDependency::Metadata { dep, .. },
+                ..
+            } => dep.name,
+            CrateOrigin::IndirectDependency { dep: IndirectCrateDependency::Link(dep), .. } => {
+                dep.name
+            }
+            CrateOrigin::Injected { crate_name } | CrateOrigin::Extern { crate_name } => crate_name,
+        }
+    }
+
     /// Return the dependency root, if any.
     fn dep_root_for_errors(&self) -> Option<&'a CratePaths> {
         match self {
@@ -165,18 +191,9 @@ impl<'a> CrateOrigin<'a> {
         }
     }
 
-    /// Return dependency information, if any.
-    fn dep(&self) -> Option<&'a CrateDep> {
+    fn dependency(self) -> Option<IndirectCrateDependency<'a>> {
         match self {
             CrateOrigin::IndirectDependency { dep, .. } => Some(dep),
-            _ => None,
-        }
-    }
-
-    /// Return the dependency's `-C extra-filename`, if any.
-    fn dep_extra_filename(&self) -> Option<&'a str> {
-        match self {
-            CrateOrigin::IndirectDependency { dep_extra_filename, .. } => Some(dep_extra_filename),
             _ => None,
         }
     }
@@ -186,9 +203,13 @@ impl<'a> CrateOrigin<'a> {
     fn private_dep(&self) -> Option<bool> {
         match self {
             CrateOrigin::IndirectDependency { parent_private, dep, .. } => {
-                Some(dep.is_private || *parent_private)
+                let private = match dep {
+                    IndirectCrateDependency::Metadata { dep, .. } => dep.is_private,
+                    IndirectCrateDependency::Link(dep) => dep.is_private,
+                };
+                Some(private || *parent_private)
             }
-            CrateOrigin::Injected => Some(true),
+            CrateOrigin::Injected { .. } => Some(true),
             _ => None,
         }
     }
@@ -551,11 +572,16 @@ impl CStore {
         }
     }
 
-    fn existing_match(&self, name: Symbol, hash: Option<Svh>) -> Option<CrateNum> {
-        let hash = hash?;
-        let cnum = *self.hash_to_cnum.get(&hash)?;
+    fn existing_metadata_match(&self, name: Symbol, dep: &CrateDep) -> Option<CrateNum> {
+        let cnum = *self.hash_to_cnum.get(&dep.hash)?;
         debug_assert_eq!(self.get_crate_data(cnum).name(), name);
         Some(cnum)
+    }
+
+    fn existing_link_match(&self, name: Symbol, dep: &LinkCrateDep) -> Option<CrateNum> {
+        self.iter_crate_data().find_map(|(cnum, data)| {
+            (data.name() == name && data.stable_crate_id() == dep.stable_crate_id).then_some(cnum)
+        })
     }
 
     /// Determine whether a dependency should be considered private.
@@ -595,7 +621,6 @@ impl CStore {
         let Library { source, metadata } = lib;
         let crate_root = metadata.get_root();
         let unhashed = metadata.get_root_unhashed();
-        let host_hash = host_lib.as_ref().map(|lib| lib.metadata.get_crate_hash());
         let private_dep = self.is_private_dep(&tcx.sess.opts.externs, name, private_dep);
 
         // Claim this crate number and cache it
@@ -629,6 +654,59 @@ impl CStore {
             private_dep,
         )?;
 
+        let mut link_dependencies = FxIndexMap::default();
+        if metadata.is_rdr()
+            && dep_kind != CrateDepKind::MacrosOnly
+            && tcx.sess.opts.output_types.should_link()
+            && tcx.crate_types().iter().any(|&crate_type| crate_type != CrateType::Rlib)
+        {
+            let link_data = match (&source.rlib, &source.dylib) {
+                (Some(path), _) => self
+                    .metadata_loader
+                    .get_rlib_link_metadata(&tcx.sess.target, path)
+                    .unwrap_or_else(|err| {
+                        tcx.dcx().fatal(format!(
+                            "failed to load RDR implementation closure for `{}` from `{}`: {err}",
+                            crate_root.name(),
+                            path.display(),
+                        ))
+                    }),
+                (None, Some(path)) => self
+                    .metadata_loader
+                    .get_dylib_link_metadata(&tcx.sess.target, path)
+                    .unwrap_or_else(|err| {
+                        tcx.dcx().fatal(format!(
+                            "failed to load RDR implementation closure for `{}` from `{}`: {err}",
+                            crate_root.name(),
+                            path.display(),
+                        ))
+                    }),
+                (None, None) => tcx.dcx().fatal(format!(
+                    "RDR crate `{}` has no object-code container for its implementation closure",
+                    crate_root.name(),
+                )),
+            };
+            let link_closure = RmetaLink::decode(&link_data);
+            for dep in link_closure.link_dependencies {
+                let dep_kind = match dep.kind {
+                    LinkCrateDepKind::Conditional => CrateDepKind::Conditional,
+                    LinkCrateDepKind::Unconditional => CrateDepKind::Unconditional,
+                };
+                let cnum = self.maybe_resolve_crate(
+                    tcx,
+                    dep_kind,
+                    CrateOrigin::IndirectDependency {
+                        dep_root_for_errors,
+                        parent_private: private_dep,
+                        dep: IndirectCrateDependency::Link(&dep),
+                    },
+                )?;
+                if !cnum_map.iter().any(|&metadata_cnum| metadata_cnum == cnum) {
+                    link_dependencies.insert(cnum, dep.dylib_linkage);
+                }
+            }
+        }
+
         let raw_proc_macros = if crate_root.is_proc_macro_crate() {
             let temp_root;
             let (dlsym_source, dlsym_root) = match &host_lib {
@@ -652,10 +730,11 @@ impl CStore {
             raw_proc_macros,
             cnum,
             cnum_map,
+            link_dependencies,
             dep_kind,
             source,
             private_dep,
-            host_hash,
+            host_lib.as_ref().map(|lib| lib.metadata.get_crate_hash()),
         );
 
         self.set_crate_data(cnum, crate_metadata);
@@ -669,7 +748,6 @@ impl CStore {
         locator: &mut CrateLocator<'b>,
         crate_rejections: &mut CrateRejections,
         path_kind: PathKind,
-        host_hash: Option<Svh>,
     ) -> Result<Option<(LoadResult, Option<Library>)>, CrateError>
     where
         'a: 'b,
@@ -698,8 +776,6 @@ impl CStore {
 
             // Load the proc macro crate for the host
             locator.for_proc_macro(sess, path_kind);
-
-            locator.hash = host_hash;
 
             let Some(host_result) = self.load(locator, crate_rejections)? else {
                 return Ok(None);
@@ -741,13 +817,13 @@ impl CStore {
     fn resolve_crate<'tcx>(
         &mut self,
         tcx: TyCtxt<'tcx>,
-        name: Symbol,
         span: Span,
         dep_kind: CrateDepKind,
         origin: CrateOrigin<'_>,
     ) -> Option<CrateNum> {
+        let name = origin.crate_name();
         self.used_extern_options.insert(name);
-        match self.maybe_resolve_crate(tcx, name, dep_kind, origin) {
+        match self.maybe_resolve_crate(tcx, dep_kind, origin) {
             Ok(cnum) => {
                 self.set_used_recursively(cnum);
                 Some(cnum)
@@ -764,9 +840,8 @@ impl CStore {
                 let missing_core = self
                     .maybe_resolve_crate(
                         tcx,
-                        sym::core,
                         CrateDepKind::Unconditional,
-                        CrateOrigin::Extern,
+                        CrateOrigin::Extern { crate_name: sym::core },
                     )
                     .is_err();
                 err.report(tcx.sess, span, missing_core);
@@ -778,60 +853,74 @@ impl CStore {
     fn maybe_resolve_crate<'b, 'tcx>(
         &'b mut self,
         tcx: TyCtxt<'tcx>,
-        name: Symbol,
         mut dep_kind: CrateDepKind,
         origin: CrateOrigin<'b>,
     ) -> Result<CrateNum, CrateError> {
+        let name = origin.crate_name();
         info!("resolving crate `{}`", name);
         if !name.as_str().is_ascii() {
             return Err(CrateError::NonAsciiName(name));
         }
 
         let dep_root_for_errors = origin.dep_root_for_errors();
-        let dep = origin.dep();
-        let hash = dep.map(|d| d.hash);
-        let host_hash = dep.map(|d| d.host_hash).flatten();
-        let extra_filename = origin.dep_extra_filename();
-        let path_kind = if dep.is_some() { PathKind::Dependency } else { PathKind::Crate };
+        let dependency = origin.dependency();
+        let request = match dependency {
+            Some(IndirectCrateDependency::Metadata { dep, extra_filename }) => {
+                CrateLocatorRequest::Metadata { dep, extra_filename }
+            }
+            Some(IndirectCrateDependency::Link(dep)) => CrateLocatorRequest::Link(dep),
+            None => CrateLocatorRequest::Extern { crate_name: name },
+        };
+        let path_kind = if dependency.is_some() { PathKind::Dependency } else { PathKind::Crate };
         let private_dep = origin.private_dep();
 
-        let result = if let Some(cnum) = self.existing_match(name, hash) {
+        let existing = match dependency {
+            Some(IndirectCrateDependency::Metadata { dep, .. }) => {
+                self.existing_metadata_match(name, dep)
+            }
+            Some(IndirectCrateDependency::Link(dep)) => self.existing_link_match(name, dep),
+            None => None,
+        };
+        let result = if let Some(cnum) = existing {
             (LoadResult::Previous(cnum), None)
         } else {
             info!("falling back to a load");
             let mut locator = CrateLocator::new(
                 tcx.sess,
                 &*self.metadata_loader,
-                name,
                 // The all loop is because `--crate-type=rlib --crate-type=rlib` is
                 // legal and produces both inside this type.
                 tcx.crate_types().iter().all(|c| *c == CrateType::Rlib),
-                hash,
-                extra_filename,
+                request,
                 path_kind,
             );
             let mut crate_rejections = CrateRejections::default();
 
             match self.load(&mut locator, &mut crate_rejections)? {
                 Some(res) => (res, None),
-                None => {
-                    info!("falling back to loading proc_macro");
-                    dep_kind = CrateDepKind::MacrosOnly;
-                    match self.load_proc_macro(
-                        tcx.sess,
-                        &mut locator,
-                        &mut crate_rejections,
-                        path_kind,
-                        host_hash,
-                    )? {
-                        Some(res) => res,
-                        None => {
-                            return Err(
-                                locator.into_error(crate_rejections, dep_root_for_errors.cloned())
-                            );
+                None => match dependency {
+                    Some(IndirectCrateDependency::Link(_)) => {
+                        return Err(
+                            locator.into_error(crate_rejections, dep_root_for_errors.cloned())
+                        );
+                    }
+                    Some(IndirectCrateDependency::Metadata { .. }) | None => {
+                        info!("falling back to loading proc_macro");
+                        dep_kind = CrateDepKind::MacrosOnly;
+                        match self.load_proc_macro(
+                            tcx.sess,
+                            &mut locator,
+                            &mut crate_rejections,
+                            path_kind,
+                        )? {
+                            Some(res) => res,
+                            None => {
+                                return Err(locator
+                                    .into_error(crate_rejections, dep_root_for_errors.cloned()));
+                            }
                         }
                     }
-                }
+                },
             }
         };
 
@@ -875,12 +964,13 @@ impl CStore {
         let root_name = library.metadata.get_root().name();
         let root_hash = library.metadata.get_crate_hash();
         let mut result = LoadResult::Loaded(library);
-        for (cnum, data) in self.iter_crate_data() {
-            if data.name() == root_name && data.hash() == root_hash {
-                assert!(locator.hash.is_none());
-                info!("load success, going to previous cnum: {}", cnum);
-                result = LoadResult::Previous(cnum);
-                break;
+        if locator.allows_metadata_hash_reuse() {
+            for (cnum, data) in self.iter_crate_data() {
+                if data.name() == root_name && root_hash == data.hash() {
+                    info!("load success, going to previous cnum: {}", cnum);
+                    result = LoadResult::Previous(cnum);
+                    break;
+                }
             }
         }
         Ok(Some(result))
@@ -938,13 +1028,14 @@ impl CStore {
             };
             let cnum = self.maybe_resolve_crate(
                 tcx,
-                dep.name,
                 dep_kind,
                 CrateOrigin::IndirectDependency {
                     dep_root_for_errors,
                     parent_private: parent_is_private,
-                    dep: &dep,
-                    dep_extra_filename,
+                    dep: IndirectCrateDependency::Metadata {
+                        dep: &dep,
+                        extra_filename: dep_extra_filename,
+                    },
                 },
             )?;
             crate_num_map.push(cnum);
@@ -1030,10 +1121,9 @@ impl CStore {
         // crate graph at the same time. One of them will later be activated in dependency_formats.
         let Some(cnum) = self.resolve_crate(
             tcx,
-            name,
             DUMMY_SP,
             CrateDepKind::Conditional,
-            CrateOrigin::Injected,
+            CrateOrigin::Injected { crate_name: name },
         ) else {
             return;
         };
@@ -1075,10 +1165,9 @@ impl CStore {
         let name = Symbol::intern(&tcx.sess.opts.unstable_opts.profiler_runtime);
         let Some(cnum) = self.resolve_crate(
             tcx,
-            name,
             DUMMY_SP,
             CrateDepKind::Conditional,
-            CrateOrigin::Injected,
+            CrateOrigin::Injected { crate_name: name },
         ) else {
             return;
         };
@@ -1201,10 +1290,9 @@ impl CStore {
                 if !self.used_extern_options.contains(&name_interned) {
                     self.resolve_crate(
                         tcx,
-                        name_interned,
                         DUMMY_SP,
                         CrateDepKind::Unconditional,
-                        CrateOrigin::Extern,
+                        CrateOrigin::Extern { crate_name: name_interned },
                     );
                 }
             }
@@ -1233,10 +1321,9 @@ impl CStore {
         // `compiler_builtins` is not yet in the graph; inject it. Error on resolution failure.
         let Some(cnum) = self.resolve_crate(
             tcx,
-            sym::compiler_builtins,
             krate.spans.inner_span.shrink_to_lo(),
             CrateDepKind::Unconditional,
-            CrateOrigin::Injected,
+            CrateOrigin::Injected { crate_name: sym::compiler_builtins },
         ) else {
             info!("`compiler_builtins` not resolved");
             return;
@@ -1355,8 +1442,12 @@ impl CStore {
                     CrateDepKind::Unconditional
                 };
 
-                let cnum =
-                    self.resolve_crate(tcx, name, item.span, dep_kind, CrateOrigin::Extern)?;
+                let cnum = self.resolve_crate(
+                    tcx,
+                    item.span,
+                    dep_kind,
+                    CrateOrigin::Extern { crate_name: name },
+                )?;
 
                 let def_path = definitions.def_path(def_id);
                 // An extern crate is only globally nameable if every segment in its path
@@ -1391,8 +1482,12 @@ impl CStore {
         name: Symbol,
         span: Span,
     ) -> Option<CrateNum> {
-        let cnum =
-            self.resolve_crate(tcx, name, span, CrateDepKind::Unconditional, CrateOrigin::Extern)?;
+        let cnum = self.resolve_crate(
+            tcx,
+            span,
+            CrateDepKind::Unconditional,
+            CrateOrigin::Extern { crate_name: name },
+        )?;
 
         self.update_extern_crate(
             cnum,
@@ -1410,7 +1505,12 @@ impl CStore {
     }
 
     pub fn maybe_process_path_extern(&mut self, tcx: TyCtxt<'_>, name: Symbol) -> Option<CrateNum> {
-        self.maybe_resolve_crate(tcx, name, CrateDepKind::Unconditional, CrateOrigin::Extern).ok()
+        self.maybe_resolve_crate(
+            tcx,
+            CrateDepKind::Unconditional,
+            CrateOrigin::Extern { crate_name: name },
+        )
+        .ok()
     }
 }
 
