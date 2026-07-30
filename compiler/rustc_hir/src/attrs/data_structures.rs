@@ -23,6 +23,7 @@ use thin_vec::ThinVec;
 pub use crate::attrs::canonical_symbols::{CanonicalSymbol, CanonicalSymbols};
 use crate::attrs::diagnostic::*;
 use crate::attrs::pretty_printing::PrintAttribute;
+use crate::def::NamespaceSet;
 use crate::{DefaultBodyStability, LangItem, PartialConstStability, Stability};
 
 #[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
@@ -302,16 +303,34 @@ impl Default for MacroUseArgs {
     }
 }
 
+/// Distinguishes stripped items that remain externally visible from restricted items.
+///
+/// This preserves enough identity for metadata selection without retaining the original visibility
+/// syntax or broadening a restricted item into the public metadata contract.
+#[derive(Clone, Copy, Debug, Decodable, Encodable, Eq, PartialEq, StableHash)]
+pub enum StrippedCfgItemVisibility {
+    Public,
+    Restricted,
+}
+
 #[derive(Debug, Clone, Encodable, Decodable, StableHash)]
 pub struct StrippedCfgItem<ScopeId = DefId> {
     pub parent_scope: ScopeId,
     pub ident: Ident,
     pub cfg: (CfgEntry, Span),
+    pub visibility: StrippedCfgItemVisibility,
+    pub namespaces: NamespaceSet,
 }
 
 impl<ScopeId> StrippedCfgItem<ScopeId> {
     pub fn map_scope_id<New>(self, f: impl FnOnce(ScopeId) -> New) -> StrippedCfgItem<New> {
-        StrippedCfgItem { parent_scope: f(self.parent_scope), ident: self.ident, cfg: self.cfg }
+        StrippedCfgItem {
+            parent_scope: f(self.parent_scope),
+            ident: self.ident,
+            cfg: self.cfg,
+            visibility: self.visibility,
+            namespaces: self.namespaces,
+        }
     }
 }
 

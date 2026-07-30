@@ -15,8 +15,8 @@ use rustc_data_structures::{Limit, sync};
 use rustc_errors::{BufferedEarlyLint, DiagCtxtHandle, ErrorGuaranteed, PResult};
 use rustc_feature::Features;
 use rustc_hir as hir;
-use rustc_hir::attrs::{CfgEntry, CollapseMacroDebuginfo, Deprecation};
-use rustc_hir::def::MacroKinds;
+use rustc_hir::attrs::{CfgEntry, CollapseMacroDebuginfo, Deprecation, StrippedCfgItemVisibility};
+use rustc_hir::def::{MacroKinds, NamespaceSet};
 use rustc_hir::{Stability, find_attr};
 use rustc_lint_defs::RegisteredTools;
 use rustc_parse::MACRO_ARGUMENTS;
@@ -1109,6 +1109,8 @@ pub trait ResolverExpand {
         ident: Ident,
         cfg: CfgEntry,
         cfg_span: Span,
+        visibility: StrippedCfgItemVisibility,
+        namespaces: NamespaceSet,
     );
 
     /// Tools registered with `#![register_tool]` or `#![register_attribute_tool]`.

@@ -3603,7 +3603,13 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         }
                         _ => None,
                     })?;
-                    Some(StrippedCfgItem { parent_scope, ident: item.ident, cfg: item.cfg.clone() })
+                    Some(StrippedCfgItem {
+                        parent_scope,
+                        ident: item.ident,
+                        cfg: item.cfg.clone(),
+                        visibility: item.visibility,
+                        namespaces: item.namespaces,
+                    })
                 })
                 .collect::<Vec<_>>();
             local_items.as_slice()
@@ -3611,7 +3617,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             self.tcx.stripped_cfg_items(module.krate)
         };
 
-        for &StrippedCfgItem { parent_scope, ident, ref cfg } in symbols {
+        for &StrippedCfgItem { parent_scope, ident, ref cfg, visibility: _, namespaces: _ } in
+            symbols
+        {
             if ident.name != *segment {
                 continue;
             }

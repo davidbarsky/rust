@@ -16,8 +16,8 @@ use rustc_expand::compile_declarative_macro;
 use rustc_expand::expand::{
     AstFragment, AstFragmentKind, Invocation, InvocationKind, SupportsMacroExpansion,
 };
-use rustc_hir::attrs::{AttributeKind, CfgEntry, StrippedCfgItem};
-use rustc_hir::def::{DefKind, MacroKinds, Namespace, NonMacroAttrKind};
+use rustc_hir::attrs::{AttributeKind, CfgEntry, StrippedCfgItem, StrippedCfgItemVisibility};
+use rustc_hir::def::{DefKind, MacroKinds, Namespace, NamespaceSet, NonMacroAttrKind};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_hir::{Attribute, StabilityLevel};
 use rustc_middle::middle::stability;
@@ -535,11 +535,15 @@ impl<'ra, 'tcx> ResolverExpand for Resolver<'ra, 'tcx> {
         ident: Ident,
         cfg: CfgEntry,
         cfg_span: Span,
+        visibility: StrippedCfgItemVisibility,
+        namespaces: NamespaceSet,
     ) {
         self.stripped_cfg_items.push(StrippedCfgItem {
             parent_scope: parent_node,
             ident,
             cfg: (cfg, cfg_span),
+            visibility,
+            namespaces,
         });
     }
 

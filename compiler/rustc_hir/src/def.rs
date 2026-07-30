@@ -656,6 +656,40 @@ pub enum Namespace {
     MacroNS,
 }
 
+/// A non-empty set of name-resolution namespaces.
+///
+/// The closed representation prevents item-like bindings from silently participating in no
+/// namespace or an unknown namespace.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Encodable, Decodable, StableHash)]
+pub enum NamespaceSet {
+    Type,
+    Value,
+    Macro,
+    TypeAndValue,
+    TypeAndMacro,
+    ValueAndMacro,
+    All,
+}
+
+impl NamespaceSet {
+    pub fn contains(self, namespace: Namespace) -> bool {
+        match namespace {
+            Namespace::TypeNS => match self {
+                Self::Type | Self::TypeAndValue | Self::TypeAndMacro | Self::All => true,
+                Self::Value | Self::Macro | Self::ValueAndMacro => false,
+            },
+            Namespace::ValueNS => match self {
+                Self::Value | Self::TypeAndValue | Self::ValueAndMacro | Self::All => true,
+                Self::Type | Self::Macro | Self::TypeAndMacro => false,
+            },
+            Namespace::MacroNS => match self {
+                Self::Macro | Self::TypeAndMacro | Self::ValueAndMacro | Self::All => true,
+                Self::Type | Self::Value | Self::TypeAndValue => false,
+            },
+        }
+    }
+}
+
 impl Namespace {
     /// The English description of the namespace.
     pub fn descr(self) -> &'static str {
