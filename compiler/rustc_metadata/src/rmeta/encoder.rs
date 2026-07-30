@@ -19,7 +19,9 @@ use rustc_data_structures::unord::UnordBag;
 use rustc_hir as hir;
 use rustc_hir::attrs::{AttributeKind, EncodeCrossCrate, StrippedCfgItemVisibility};
 use rustc_hir::def::Namespace;
-use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE, LocalDefId, LocalDefIdSet, LocalModId};
+use rustc_hir::def_id::{
+    CRATE_DEF_ID, CrateNum, LOCAL_CRATE, LocalDefId, LocalDefIdSet, LocalModId,
+};
 use rustc_hir::def_path_hash_map::DefPathHashMap;
 use rustc_hir::definitions::DefPathData;
 use rustc_hir::find_attr;
@@ -27,8 +29,8 @@ use rustc_hir_pretty::id_to_string;
 use rustc_middle::dep_graph::WorkProductId;
 use rustc_middle::metadata::{
     DefinitionProjection, MetadataContractHash, MetadataDecodeLayoutId, MetadataDefinitionLayout,
-    MetadataDefinitionSpans, MetadataProjection, MetadataSemantic, Reexport, ReferencedDefinitions,
-    SelectedDefinitions, TraceScope,
+    MetadataDefinitionSpans, MetadataProjection, MetadataReferences, MetadataSemantic,
+    MetadataTrace, Reexport, SelectedDefinitions, TraceScope,
 };
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
@@ -148,7 +150,7 @@ enum MetadataEncoding<'a, 'tcx> {
     RdrTrace {
         encoder: MemEncoder,
         selected: SelectedDefinitions<'a>,
-        references: ReferencedDefinitions,
+        references: MetadataReferences,
         scope: TraceScope,
         hygiene_ctxt: Arc<HygieneEncodeContext>,
         hygiene: &'a HygieneTrace,
@@ -157,6 +159,7 @@ enum MetadataEncoding<'a, 'tcx> {
         encoder: MemEncoder,
         projections: MetadataProjectionEncoder,
         layout: &'a MetadataDefinitionLayout,
+        metadata_dependencies: &'a FxIndexSet<CrateNum>,
         hygiene: &'a HygieneEncodeLayout,
     },
     RdrFull {
@@ -175,6 +178,7 @@ enum MetadataEncoding<'a, 'tcx> {
         encoder: opaque::FileEncoder<'static>,
         metadata_len: usize,
         definitions: MetadataDefinitionLayout,
+        metadata_dependencies: FxIndexSet<CrateNum>,
         hygiene: HygieneEncodeLayout,
     },
 }
@@ -455,6 +459,45 @@ impl MetadataEncoder<'_, '_> {
             MetadataEncoding::RdrSpans { definitions, .. } => definitions.encode(index),
         }
     }
+
+    fn encode_crate_num(&mut self, crate_num: CrateNum) -> CrateNum {
+        match &mut self.encoding {
+            MetadataEncoding::CoarseFull { .. } | MetadataEncoding::CoarseStub { .. } => crate_num,
+            MetadataEncoding::RdrTrace { references, .. } => {
+                if crate_num != LOCAL_CRATE {
+                    references.observe_external_crate(crate_num);
+                }
+                crate_num
+            }
+            MetadataEncoding::RdrProjection { metadata_dependencies, .. } => {
+                metadata_crate_num(metadata_dependencies, crate_num)
+            }
+            MetadataEncoding::RdrFull { projection, .. } => {
+                metadata_crate_num(&projection.metadata_dependencies, crate_num)
+            }
+            MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                metadata_crate_num(&reused_rmeta.metadata_dependencies, crate_num)
+            }
+            MetadataEncoding::RdrSpans { metadata_dependencies, .. } => {
+                metadata_crate_num(metadata_dependencies, crate_num)
+            }
+        }
+    }
+}
+
+fn metadata_crate_num(
+    metadata_dependencies: &FxIndexSet<CrateNum>,
+    crate_num: CrateNum,
+) -> CrateNum {
+    if crate_num == LOCAL_CRATE {
+        return crate_num;
+    }
+    CrateNum::new(
+        metadata_dependencies
+            .get_index_of(&crate_num)
+            .expect("RDR metadata trace omitted an encoded external crate")
+            + 1,
+    )
 }
 
 pub(crate) struct EncodeContext<'a, 'tcx> {
@@ -574,6 +617,7 @@ impl<'a, 'tcx> SpanEncoder for EncodeContext<'a, 'tcx> {
         if crate_num != LOCAL_CRATE && self.is_proc_macro() {
             panic!("Attempted to encode non-local CrateNum {crate_num:?} for proc-macro crate");
         }
+        let crate_num = self.opaque.encode_crate_num(crate_num);
         self.emit_u32(crate_num.as_u32());
     }
 
@@ -1394,7 +1438,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     fn encode_artifact_records(&mut self) {
         let _ = self.encode_externally_implementable_items();
         let _ = self.encode_crate_deps();
-        let _ = self.encode_dylib_dependency_formats();
         let _ = self.encode_lib_features();
         let _ = self.encode_stability_implications();
         let _ = self.encode_lang_items();
@@ -1508,8 +1551,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let externally_implementable_items = stat!("externally-implementable-items", || self
             .encode_externally_implementable_items());
 
-        let (crate_deps, dylib_dependency_formats) =
-            stat!("dep", || { (self.encode_crate_deps(), self.encode_dylib_dependency_formats()) });
+        let crate_deps = stat!("dep", || self.encode_crate_deps());
 
         let lib_features = stat!("lib-features", || self.encode_lib_features());
 
@@ -1603,6 +1645,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     triple: tcx.sess.opts.target_triple.clone(),
                     hash: contract_hash,
                     name: tcx.crate_name(LOCAL_CRATE),
+                    stable_crate_id: tcx.stable_crate_id(LOCAL_CRATE),
                     is_proc_macro_crate,
                     is_stub: false,
                 },
@@ -1610,6 +1653,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     triple: record.triple,
                     hash: record.hash,
                     name: record.name,
+                    stable_crate_id: record.stable_crate_id,
                     is_proc_macro_crate: record.is_proc_macro_crate,
                     is_stub: record.is_stub,
                 },
@@ -1618,8 +1662,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 self.extra_filename(tcx.sess.opts.cg.extra_filename.clone(), |_, value| value);
             let metadata_decode_layout_id =
                 self.metadata_decode_layout_id(metadata_decode_layout_id, |_, value| value);
-            let stable_crate_id =
-                self.stable_crate_id(tcx.stable_crate_id(LOCAL_CRATE), |_, value| value);
             let required_panic_strategy = self
                 .required_panic_strategy(tcx.required_panic_strategy(LOCAL_CRATE), |_, value| {
                     value
@@ -1664,7 +1706,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 header,
                 metadata_decode_layout_id,
                 extra_filename,
-                stable_crate_id,
                 required_panic_strategy,
                 panic_in_drop_strategy,
                 edition,
@@ -1684,7 +1725,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 symbol_mangling_version,
 
                 crate_deps,
-                dylib_dependency_formats,
                 lib_features,
                 stability_implications,
                 lang_items,
@@ -2128,7 +2168,7 @@ fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
     }
 
     let hygiene_ctxt = Arc::new(HygieneEncodeContext::default());
-    let (definitions, hygiene) = tcx.with_stable_hashing_context(|mut hcx| {
+    let (trace, hygiene) = tcx.with_stable_hashing_context(|mut hcx| {
         HygieneEncodeLayout::trace(&mut hcx, |hygiene| {
             MetadataDefinitionLayout::trace(tcx, semantic_roots, |scope, selected| {
                 let mut sink = MemEncoder::new();
@@ -2138,7 +2178,7 @@ fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
                     MetadataEncoding::RdrTrace {
                         encoder: sink,
                         selected,
-                        references: ReferencedDefinitions::default(),
+                        references: MetadataReferences::default(),
                         scope,
                         hygiene_ctxt: Arc::clone(&hygiene_ctxt),
                         hygiene,
@@ -2169,6 +2209,7 @@ fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
             })
         })
     });
+    let MetadataTrace { layout: definitions, metadata_dependencies } = trace;
     debug!("planned RDR metadata definition and hygiene closure");
     let mut encoder = EncodeContext::new(
         tcx,
@@ -2176,6 +2217,7 @@ fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
             encoder: MemEncoder::new(),
             projections: MetadataProjectionEncoder::new(),
             layout: &definitions,
+            metadata_dependencies: &metadata_dependencies,
             hygiene: &hygiene,
         },
     );
@@ -2196,7 +2238,14 @@ fn metadata_projection(tcx: TyCtxt<'_>, _: ()) -> MetadataProjection {
     };
     let (contract, decode_layout) = projections.finish();
     hygiene.assert_reached(encoded_hygiene);
-    MetadataProjection { contract, decode_layout, definitions, hygiene, span_layout }
+    MetadataProjection {
+        contract,
+        decode_layout,
+        definitions,
+        metadata_dependencies,
+        hygiene,
+        span_layout,
+    }
 }
 
 fn metadata_contract_hash(tcx: TyCtxt<'_>, _: ()) -> MetadataContractHash {
@@ -3490,40 +3539,46 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
     }
 
     fn encode_crate_deps(&mut self) -> LazyArray<CrateDep> {
-        let deps = if self.is_proc_macro() {
+        let crate_nums = if self.is_proc_macro() {
             Vec::new()
         } else {
-            self.tcx
-                .crates(())
-                .iter()
-                .map(|&cnum| {
-                    let dep = CrateDep {
-                        name: self.tcx.crate_name(cnum),
-                        hash: self.tcx.crate_hash(cnum),
-                        host_hash: self.tcx.crate_host_hash(cnum),
-                        kind: self.tcx.crate_dep_kind(cnum),
-                        extra_filename: self.tcx.extra_filename(cnum).clone(),
-                        is_private: self.tcx.is_private_dep(cnum),
-                    };
-                    (cnum, dep)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        {
-            // Sanity-check the crate numbers
-            let mut expected_cnum = 1;
-            for &(n, _) in &deps {
-                assert_eq!(n, CrateNum::new(expected_cnum));
-                expected_cnum += 1;
+            match &self.opaque.encoding {
+                MetadataEncoding::CoarseFull { .. }
+                | MetadataEncoding::CoarseStub { .. }
+                | MetadataEncoding::RdrTrace { .. } => self.tcx.crates(()).to_vec(),
+                MetadataEncoding::RdrProjection { metadata_dependencies, .. } => {
+                    metadata_dependencies.iter().copied().collect()
+                }
+                MetadataEncoding::RdrFull { projection, .. } => {
+                    projection.metadata_dependencies.iter().copied().collect()
+                }
+                MetadataEncoding::RdrReuse { reused_rmeta, .. } => {
+                    reused_rmeta.metadata_dependencies.iter().copied().collect()
+                }
+                MetadataEncoding::RdrSpans { metadata_dependencies, .. } => {
+                    metadata_dependencies.iter().copied().collect()
+                }
             }
-        }
+        };
+        let dylib_dependency_formats = self.tcx.dependency_formats(()).get(&CrateType::Dylib);
+        let deps = crate_nums
+            .into_iter()
+            .map(|cnum| CrateDep {
+                name: self.tcx.crate_name(cnum),
+                hash: self.tcx.crate_hash(cnum),
+                host_hash: self.tcx.crate_host_hash(cnum),
+                kind: self.tcx.crate_dep_kind(cnum),
+                dylib_linkage: dylib_dependency_formats.and_then(|formats| match formats[cnum] {
+                    Linkage::NotLinked | Linkage::IncludedFromDylib => None,
+                    Linkage::Dynamic => Some(LinkagePreference::RequireDynamic),
+                    Linkage::Static => Some(LinkagePreference::RequireStatic),
+                }),
+                extra_filename: self.tcx.extra_filename(cnum).clone().into(),
+                is_private: self.tcx.is_private_dep(cnum),
+            })
+            .collect::<Vec<_>>();
 
-        // We're just going to write a list of crate 'name-hash-version's, with
-        // the assumption that they are numbered 1 to n.
-        // FIXME (#2166): This is not nearly enough to support correct versioning
-        // but is enough to get transitive crate dependencies working.
-        self.crate_deps(deps, |encoder, deps| encoder.lazy_array(deps.iter().map(|(_, dep)| dep)))
+        self.crate_deps(deps, |encoder, deps| encoder.lazy_array(deps))
     }
 
     fn encode_target_modifiers(&mut self) -> LazyArray<TargetModifier> {
@@ -3813,25 +3868,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 .lazy_array(stable_order.into_iter().map(|(def_id, index)| (def_id.index, index)))
         })
     }
-
-    fn encode_dylib_dependency_formats(&mut self) -> LazyArray<Option<LinkagePreference>> {
-        let formats = if self.is_proc_macro() {
-            Vec::new()
-        } else {
-            self.tcx
-                .dependency_formats(())
-                .get(&CrateType::Dylib)
-                .map(|formats| formats.iter().skip(1).copied().collect())
-                .unwrap_or_default()
-        };
-        self.dylib_dependency_formats(formats, |encoder, formats| {
-            encoder.lazy_array(formats.into_iter().map(|linkage| match linkage {
-                Linkage::NotLinked | Linkage::IncludedFromDylib => None,
-                Linkage::Dynamic => Some(LinkagePreference::RequireDynamic),
-                Linkage::Static => Some(LinkagePreference::RequireStatic),
-            }))
-        })
-    }
 }
 
 /// Used to prefetch queries which will be needed later by metadata encoding.
@@ -3938,40 +3974,42 @@ impl<T> EncodedMetadataArtifacts<T> {
     }
 }
 
-pub(crate) struct EncodedMetadataFiles<T> {
-    pub(crate) artifacts: EncodedMetadataArtifacts<T>,
-    pub(crate) temp_dir: Option<MaybeTempDir>,
+pub(crate) enum EncodedMetadataFiles<T> {
+    Coarse {
+        metadata: T,
+        temp_dir: Option<MaybeTempDir>,
+    },
+    Rdr {
+        artifacts: RdrArtifactPair<T>,
+        temp_dir: Option<MaybeTempDir>,
+        link_dependencies: Vec<LinkCrateDep>,
+    },
 }
 
-struct EncodedMetadataBody {
-    storage: EncodedMetadataStorage,
+enum EncodedMetadataBody {
+    Coarse(CoarseMetadataBody),
+    Rdr(RdrMetadataBody),
+}
+
+struct CoarseMetadataBody {
+    storage: EncodedMetadataStorage<Mmap, EncodedMetadataFile>,
     stub: Option<Vec<u8>>,
 }
 
-enum EncodedMetadataStorage {
-    Memory(EncodedMetadataArtifacts<Mmap>),
-    Files(EncodedMetadataFiles<EncodedMetadataFile>),
+struct RdrMetadataBody {
+    storage: EncodedMetadataStorage<RdrArtifactPair<Mmap>, RdrArtifactPair<EncodedMetadataFile>>,
+    stub: Option<Vec<u8>>,
+    link_dependencies: Vec<LinkCrateDep>,
+}
+
+enum EncodedMetadataStorage<M, F> {
+    Memory(M),
+    Files { artifacts: F, _temp_dir: Option<MaybeTempDir> },
 }
 
 struct EncodedMetadataFile {
     bytes: Mmap,
     path: Box<Path>,
-}
-
-impl EncodedMetadataStorage {
-    fn bytes(&self) -> EncodedMetadataArtifacts<&[u8]> {
-        match self {
-            Self::Memory(artifacts) => artifacts.as_ref().map(|metadata| &metadata[..]),
-            Self::Files(files) => files.artifacts.as_ref().map(|file| &file.bytes[..]),
-        }
-    }
-
-    fn paths(&self) -> Option<EncodedMetadataArtifacts<&Path>> {
-        match self {
-            Self::Memory(_) => None,
-            Self::Files(files) => Some(files.artifacts.as_ref().map(|file| file.path.as_ref())),
-        }
-    }
 }
 
 impl EncodedMetadata {
@@ -3980,8 +4018,10 @@ impl EncodedMetadata {
         source: EncodedMetadataFiles<PathBuf>,
         stub_path: Option<PathBuf>,
     ) -> std::io::Result<Self> {
-        let EncodedMetadataFiles { artifacts, temp_dir } = source;
-        let path = artifacts.as_ref().metadata();
+        let path = match &source {
+            EncodedMetadataFiles::Coarse { metadata, .. } => metadata,
+            EncodedMetadataFiles::Rdr { artifacts, .. } => &artifacts.primary,
+        };
         let file = std::fs::File::open(&path)?;
         let file_metadata = file.metadata()?;
         if file_metadata.len() == 0 {
@@ -3990,33 +4030,38 @@ impl EncodedMetadata {
         let metadata = unsafe { Mmap::map(file)? };
         let stub =
             if let Some(stub_path) = stub_path { Some(std::fs::read(stub_path)?) } else { None };
-        let artifacts = match artifacts {
-            EncodedMetadataArtifacts::Coarse(path) => {
-                EncodedMetadataArtifacts::Coarse(EncodedMetadataFile {
-                    bytes: metadata,
-                    path: path.into(),
+        let body = match source {
+            EncodedMetadataFiles::Coarse { metadata: path, temp_dir } => {
+                EncodedMetadataBody::Coarse(CoarseMetadataBody {
+                    storage: EncodedMetadataStorage::Files {
+                        artifacts: EncodedMetadataFile { bytes: metadata, path: path.into() },
+                        _temp_dir: temp_dir,
+                    },
+                    stub,
                 })
             }
-            EncodedMetadataArtifacts::Rdr(artifacts) => {
+            EncodedMetadataFiles::Rdr { artifacts, temp_dir, link_dependencies } => {
                 let spans = unsafe { Mmap::map(std::fs::File::open(&artifacts.spans)?)? };
-                EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
-                    primary: EncodedMetadataFile {
-                        bytes: metadata,
-                        path: artifacts.primary.into(),
+                EncodedMetadataBody::Rdr(RdrMetadataBody {
+                    storage: EncodedMetadataStorage::Files {
+                        artifacts: RdrArtifactPair {
+                            primary: EncodedMetadataFile {
+                                bytes: metadata,
+                                path: artifacts.primary.into(),
+                            },
+                            spans: EncodedMetadataFile {
+                                bytes: spans,
+                                path: artifacts.spans.into(),
+                            },
+                        },
+                        _temp_dir: temp_dir,
                     },
-                    spans: EncodedMetadataFile { bytes: spans, path: artifacts.spans.into() },
+                    stub,
+                    link_dependencies,
                 })
             }
         };
-        Ok(Self {
-            body: Some(EncodedMetadataBody {
-                storage: EncodedMetadataStorage::Files(EncodedMetadataFiles {
-                    artifacts,
-                    temp_dir,
-                }),
-                stub,
-            }),
-        })
+        Ok(Self { body: Some(body) })
     }
 
     #[inline]
@@ -4024,115 +4069,177 @@ impl EncodedMetadata {
         let Some(body) = &self.body else {
             return EncodedMetadataArtifacts::Coarse(&[]);
         };
-        if let Some(stub) = &body.stub {
-            return EncodedMetadataArtifacts::Coarse(stub);
+        match body {
+            EncodedMetadataBody::Coarse(body) => {
+                if let Some(stub) = &body.stub {
+                    return EncodedMetadataArtifacts::Coarse(stub);
+                }
+                match &body.storage {
+                    EncodedMetadataStorage::Memory(metadata) => {
+                        EncodedMetadataArtifacts::Coarse(&metadata[..])
+                    }
+                    EncodedMetadataStorage::Files { artifacts, .. } => {
+                        EncodedMetadataArtifacts::Coarse(&artifacts.bytes[..])
+                    }
+                }
+            }
+            EncodedMetadataBody::Rdr(body) => {
+                if let Some(stub) = &body.stub {
+                    return EncodedMetadataArtifacts::Coarse(stub);
+                }
+                match &body.storage {
+                    EncodedMetadataStorage::Memory(artifacts) => {
+                        EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                            primary: &artifacts.primary[..],
+                            spans: &artifacts.spans[..],
+                        })
+                    }
+                    EncodedMetadataStorage::Files { artifacts, .. } => {
+                        EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                            primary: &artifacts.primary.bytes[..],
+                            spans: &artifacts.spans.bytes[..],
+                        })
+                    }
+                }
+            }
         }
-        body.storage.bytes()
+    }
+
+    /// Returns the complete emitted artifact set when publication must retain its format.
+    pub fn full(&self) -> EncodedMetadataArtifacts<&[u8]> {
+        let Some(body) = &self.body else {
+            return EncodedMetadataArtifacts::Coarse(&[]);
+        };
+        match body {
+            EncodedMetadataBody::Coarse(body) => match &body.storage {
+                EncodedMetadataStorage::Memory(metadata) => {
+                    EncodedMetadataArtifacts::Coarse(&metadata[..])
+                }
+                EncodedMetadataStorage::Files { artifacts, .. } => {
+                    EncodedMetadataArtifacts::Coarse(&artifacts.bytes[..])
+                }
+            },
+            EncodedMetadataBody::Rdr(body) => match &body.storage {
+                EncodedMetadataStorage::Memory(artifacts) => {
+                    EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                        primary: &artifacts.primary[..],
+                        spans: &artifacts.spans[..],
+                    })
+                }
+                EncodedMetadataStorage::Files { artifacts, .. } => {
+                    EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                        primary: &artifacts.primary.bytes[..],
+                        spans: &artifacts.spans.bytes[..],
+                    })
+                }
+            },
+        }
     }
 
     #[inline]
     pub fn paths(&self) -> Option<EncodedMetadataArtifacts<&Path>> {
-        self.body.as_ref().and_then(|body| body.storage.paths())
+        match self.body.as_ref()? {
+            EncodedMetadataBody::Coarse(body) => match &body.storage {
+                EncodedMetadataStorage::Memory(_) => None,
+                EncodedMetadataStorage::Files { artifacts, .. } => {
+                    Some(EncodedMetadataArtifacts::Coarse(artifacts.path.as_ref()))
+                }
+            },
+            EncodedMetadataBody::Rdr(body) => match &body.storage {
+                EncodedMetadataStorage::Memory(_) => None,
+                EncodedMetadataStorage::Files { artifacts, .. } => {
+                    Some(EncodedMetadataArtifacts::Rdr(RdrArtifactPair {
+                        primary: artifacts.primary.path.as_ref(),
+                        spans: artifacts.spans.path.as_ref(),
+                    }))
+                }
+            },
+        }
+    }
+
+    pub fn rmeta_link_data(&self, contents: RmetaLinkContents) -> RmetaLinkData {
+        let link_dependencies: &[LinkCrateDep] = match &self.body {
+            Some(EncodedMetadataBody::Rdr(body)) => &body.link_dependencies,
+            None | Some(EncodedMetadataBody::Coarse(_)) => &[],
+        };
+        RmetaLink::encode(contents, link_dependencies)
     }
 }
 
 impl<S: Encoder> Encodable<S> for EncodedMetadata {
     fn encode(&self, s: &mut S) {
-        self.body.as_ref().and_then(|body| body.stub.as_ref()).encode(s);
-        match self.body.as_ref().map(|body| body.storage.bytes()) {
-            None => {
-                (&[] as &[u8]).encode(s);
-                Option::<&[u8]>::None.encode(s);
-            }
-            Some(EncodedMetadataArtifacts::Coarse(metadata)) => {
+        let Some(body) = &self.body else {
+            false.encode(s);
+            return;
+        };
+        true.encode(s);
+        match body {
+            EncodedMetadataBody::Coarse(body) => {
+                MetadataFormatKind::Coarse.encode(s);
+                body.stub.encode(s);
+                let metadata = match &body.storage {
+                    EncodedMetadataStorage::Memory(metadata) => &metadata[..],
+                    EncodedMetadataStorage::Files { artifacts, .. } => &artifacts.bytes[..],
+                };
                 metadata.encode(s);
-                Option::<&[u8]>::None.encode(s);
             }
-            Some(EncodedMetadataArtifacts::Rdr(artifacts)) => {
+            EncodedMetadataBody::Rdr(body) => {
+                MetadataFormatKind::RdrV1.encode(s);
+                body.stub.encode(s);
+                let artifacts = match &body.storage {
+                    EncodedMetadataStorage::Memory(artifacts) => RdrArtifactPair {
+                        primary: &artifacts.primary[..],
+                        spans: &artifacts.spans[..],
+                    },
+                    EncodedMetadataStorage::Files { artifacts, .. } => RdrArtifactPair {
+                        primary: &artifacts.primary.bytes[..],
+                        spans: &artifacts.spans.bytes[..],
+                    },
+                };
                 artifacts.primary.encode(s);
-                Some(artifacts.spans).encode(s);
+                artifacts.spans.encode(s);
+                body.link_dependencies.encode(s);
             }
-        }
-    }
-}
-
-fn parse_encoded_metadata_artifacts(
-    metadata: Mmap,
-    spans: Option<Mmap>,
-) -> EncodedMetadataArtifacts<Mmap> {
-    let envelope = parse_metadata_envelope(metadata)
-        .unwrap_or_else(|err| panic!("invalid internally encoded metadata envelope: {err:?}"));
-    match (envelope.format, spans) {
-        (MetadataFormatKind::Coarse, None) => EncodedMetadataArtifacts::Coarse(envelope.bytes),
-        (MetadataFormatKind::RdrV1, Some(spans)) => {
-            EncodedMetadataArtifacts::Rdr(RdrArtifactPair { primary: envelope.bytes, spans })
-        }
-        (MetadataFormatKind::Coarse, Some(_)) => {
-            panic!("coarse metadata cannot include RDR spans")
-        }
-        (MetadataFormatKind::RdrV1, None) => {
-            panic!("RDR metadata must include its spans")
         }
     }
 }
 
 impl<D: Decoder> Decodable<D> for EncodedMetadata {
     fn decode(d: &mut D) -> Self {
+        if !bool::decode(d) {
+            return Self { body: None };
+        }
+        let format = MetadataFormatKind::decode(d);
         let stub = <Option<Vec<u8>>>::decode(d);
 
         let len = d.read_usize();
-        let metadata = if len > 0 {
-            let mut mmap = MmapMut::map_anon(len).unwrap();
-            mmap.copy_from_slice(d.read_raw_bytes(len));
-            Some(mmap.make_read_only().unwrap())
-        } else {
-            None
-        };
+        let mut metadata = MmapMut::map_anon(len).unwrap();
+        metadata.copy_from_slice(d.read_raw_bytes(len));
+        let metadata = metadata.make_read_only().unwrap();
 
-        let spans = <Option<Vec<u8>>>::decode(d);
-        let spans = spans.map(|spans| {
-            let mut mmap = MmapMut::map_anon(spans.len()).unwrap();
-            mmap.copy_from_slice(&spans);
-            mmap.make_read_only().unwrap()
-        });
-
-        let body = match (metadata, spans, stub) {
-            (None, None, None) => None,
-            (Some(metadata), spans, stub) => Some(EncodedMetadataBody {
-                storage: EncodedMetadataStorage::Memory(parse_encoded_metadata_artifacts(
-                    metadata, spans,
-                )),
+        let body = match format {
+            MetadataFormatKind::Coarse => EncodedMetadataBody::Coarse(CoarseMetadataBody {
+                storage: EncodedMetadataStorage::Memory(metadata),
                 stub,
             }),
-            (None, Some(_), _) | (None, None, Some(_)) => {
-                panic!("encoded metadata has auxiliary data without full metadata")
+            MetadataFormatKind::RdrV1 => {
+                let spans = Vec::<u8>::decode(d);
+                let mut spans_mmap = MmapMut::map_anon(spans.len()).unwrap();
+                spans_mmap.copy_from_slice(&spans);
+                let spans = spans_mmap.make_read_only().unwrap();
+                let link_dependencies = Vec::<LinkCrateDep>::decode(d);
+                EncodedMetadataBody::Rdr(RdrMetadataBody {
+                    storage: EncodedMetadataStorage::Memory(RdrArtifactPair {
+                        primary: metadata,
+                        spans,
+                    }),
+                    stub,
+                    link_dependencies,
+                })
             }
         };
-        Self { body }
+        Self { body: Some(body) }
     }
-}
-
-#[cfg(test)]
-#[test]
-#[should_panic(expected = "coarse metadata cannot include RDR spans")]
-fn parsed_coarse_metadata_rejects_spans() {
-    let mut metadata = MmapMut::map_anon(METADATA_ENVELOPE_LEN).unwrap();
-    metadata.copy_from_slice(&MetadataFormatKind::Coarse.header());
-    let metadata = metadata.make_read_only().unwrap();
-    let spans = MmapMut::map_anon(1).unwrap().make_read_only().unwrap();
-
-    parse_encoded_metadata_artifacts(metadata, Some(spans));
-}
-
-#[cfg(test)]
-#[test]
-#[should_panic(expected = "RDR metadata must include its spans")]
-fn parsed_rdr_metadata_requires_spans() {
-    let mut metadata = MmapMut::map_anon(METADATA_ENVELOPE_LEN).unwrap();
-    metadata.copy_from_slice(&MetadataFormatKind::RdrV1.header());
-    let metadata = metadata.make_read_only().unwrap();
-
-    parse_encoded_metadata_artifacts(metadata, None);
 }
 
 #[instrument(level = "trace", skip(tcx))]
@@ -4158,6 +4265,7 @@ pub(crate) fn encode_metadata(
                         name: tcx.crate_name(LOCAL_CRATE),
                         triple: tcx.sess.opts.target_triple.clone(),
                         hash: tcx.metadata_contract_hash(()),
+                        stable_crate_id: tcx.stable_crate_id(LOCAL_CRATE),
                         is_proc_macro_crate: false,
                         is_stub: true,
                     })
@@ -4201,6 +4309,7 @@ pub(crate) fn encode_metadata(
                 }))
                 .unwrap_or_else(|err| panic!("invalid saved RDR metadata: {err:?}"));
                 let definitions = blob.definition_layout(tcx);
+                let projection = tcx.metadata_projection(());
                 rmeta.truncate(
                     rmeta
                         .len()
@@ -4211,7 +4320,8 @@ pub(crate) fn encode_metadata(
                     ReusedRmeta {
                         prefix: rmeta,
                         definitions,
-                        hygiene: tcx.metadata_projection(()).hygiene.clone(),
+                        metadata_dependencies: projection.metadata_dependencies.clone(),
+                        hygiene: projection.hygiene.clone(),
                     },
                     artifacts.spans,
                 ))
@@ -4319,6 +4429,7 @@ pub(crate) fn encode_metadata(
 struct ReusedRmeta {
     prefix: Vec<u8>,
     definitions: MetadataDefinitionLayout,
+    metadata_dependencies: FxIndexSet<CrateNum>,
     hygiene: HygieneEncodeLayout,
 }
 
@@ -4391,6 +4502,7 @@ impl EncodeContext<'_, '_> {
                 encoder,
                 metadata_len,
                 definitions: reused_rmeta.definitions,
+                metadata_dependencies: reused_rmeta.metadata_dependencies,
                 hygiene: reused_rmeta.hygiene,
             },
             records,
@@ -4409,6 +4521,7 @@ impl EncodeContext<'_, '_> {
         };
         let metadata_len = encoder.position();
         let definitions = projection.definitions.clone();
+        let metadata_dependencies = projection.metadata_dependencies.clone();
         let hygiene = projection.hygiene.clone();
         encoder.finish().unwrap_or_else(|(path, err)| {
             self.tcx.dcx().emit_fatal(FailWriteFile { path: &path, err })
@@ -4429,7 +4542,13 @@ impl EncodeContext<'_, '_> {
         let encoder = opaque::FileEncoder::new(&spans_path)
             .unwrap_or_else(|err| self.tcx.dcx().emit_fatal(FailCreateFileEncoder { err }));
         self.opaque = MetadataEncoder {
-            encoding: MetadataEncoding::RdrSpans { encoder, metadata_len, definitions, hygiene },
+            encoding: MetadataEncoding::RdrSpans {
+                encoder,
+                metadata_len,
+                definitions,
+                metadata_dependencies,
+                hygiene,
+            },
             records,
         };
         self.begin_spans_artifact();

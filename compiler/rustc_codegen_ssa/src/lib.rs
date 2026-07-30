@@ -31,7 +31,7 @@ use rustc_middle::dep_graph::WorkProduct;
 use rustc_middle::lint::StableLevelSpec;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::Dependencies;
-use rustc_middle::middle::exported_symbols::SymbolExportKind;
+use rustc_middle::middle::exported_symbols::{MetadataSymbolName, SymbolExportKind};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
@@ -300,7 +300,7 @@ pub struct CrateInfo {
     pub windows_subsystem: Option<WindowsSubsystemKind>,
     pub natvis_debugger_visualizers: BTreeSet<DebuggerVisualizerFile>,
     pub lint_level_specs: CodegenLintLevelSpecs,
-    pub metadata_symbol: String,
+    pub metadata_symbol: MetadataSymbolName,
     pub symbol_rename_suffix: String,
     pub each_linked_rlib_file_for_lto: Vec<PathBuf>,
     pub exported_symbols_for_lto: Vec<String>,
@@ -346,7 +346,7 @@ pub fn provide(providers: &mut Providers) {
     providers.queries.global_backend_features = |_tcx: TyCtxt<'_>, ()| vec![];
 }
 
-const RLINK_VERSION: u32 = 1;
+const RLINK_VERSION: u32 = 2;
 const RLINK_MAGIC: &[u8] = b"rustlink";
 
 impl CompiledModules {

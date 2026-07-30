@@ -238,10 +238,30 @@ use crate::creader::{Library, MetadataLoader};
 use crate::diagnostics;
 use crate::fs::metadata_spans_path;
 use crate::rmeta::{
-    LoadedMetadata, METADATA_ROOT_POSITION_OFFSET, MetadataBlob, MetadataBlobError,
-    MetadataEnvelopeError, MetadataFormatKind, MetadataInput, ProcMacroKind, RdrArtifactPair,
-    SpansArtifactSource, parse_metadata_envelope, rustc_version,
+    CrateDep, LinkCrateDep, LoadedMetadata, METADATA_ROOT_POSITION_OFFSET, MetadataBlob,
+    MetadataBlobError, MetadataEnvelopeError, MetadataFormatKind, MetadataInput, ProcMacroKind,
+    RdrArtifactPair, SpansArtifactSource, parse_metadata_envelope, rustc_version,
 };
+
+#[derive(Clone, Copy)]
+pub(crate) enum CrateLocatorRequest<'a> {
+    Extern { crate_name: Symbol },
+    Metadata(&'a CrateDep),
+    Link(&'a LinkCrateDep),
+}
+
+#[derive(Clone)]
+enum CrateLocatorSearch<'a> {
+    Extern(Vec<CanonicalizedPath>),
+    Metadata(MetadataCrateLocatorSearch<'a>),
+    Link(&'a LinkCrateDep),
+}
+
+#[derive(Clone, Copy)]
+enum MetadataCrateLocatorSearch<'a> {
+    Target(&'a CrateDep),
+    Host(&'a CrateDep),
+}
 
 #[derive(Clone)]
 pub(crate) struct CrateLocator<'a> {
@@ -252,9 +272,7 @@ pub(crate) struct CrateLocator<'a> {
 
     // Immutable per-search configuration.
     crate_name: Symbol,
-    exact_paths: Vec<CanonicalizedPath>,
-    pub hash: Option<Svh>,
-    extra_filename: Option<&'a str>,
+    search: CrateLocatorSearch<'a>,
     target: &'a Target,
     tuple: TargetTuple,
     filesearch: &'a FileSearch,
@@ -314,10 +332,8 @@ impl<'a> CrateLocator<'a> {
     pub(crate) fn new(
         sess: &'a Session,
         metadata_loader: &'a dyn MetadataLoader,
-        crate_name: Symbol,
         is_rlib: bool,
-        hash: Option<Svh>,
-        extra_filename: Option<&'a str>,
+        request: CrateLocatorRequest<'a>,
         path_kind: PathKind,
     ) -> CrateLocator<'a> {
         let needs_object_code = sess.opts.output_types.should_codegen();
@@ -325,27 +341,31 @@ impl<'a> CrateLocator<'a> {
         // Or, if we're not producing object code, then we don't need it either
         // (e.g., if we're a cdylib but emitting just metadata).
         let only_needs_metadata = is_rlib || !needs_object_code;
+        let (crate_name, search) = match request {
+            CrateLocatorRequest::Extern { crate_name } => (
+                crate_name,
+                CrateLocatorSearch::Extern(
+                    sess.opts
+                        .externs
+                        .get(crate_name.as_str())
+                        .and_then(|entry| entry.files())
+                        .into_flat_iter()
+                        .cloned()
+                        .collect(),
+                ),
+            ),
+            CrateLocatorRequest::Metadata(dep) => {
+                (dep.name, CrateLocatorSearch::Metadata(MetadataCrateLocatorSearch::Target(dep)))
+            }
+            CrateLocatorRequest::Link(dep) => (dep.name, CrateLocatorSearch::Link(dep)),
+        };
 
         CrateLocator {
             only_needs_metadata,
             metadata_loader,
             cfg_version: sess.cfg_version,
             crate_name,
-            exact_paths: if hash.is_none() {
-                sess.opts
-                    .externs
-                    .get(crate_name.as_str())
-                    .and_then(|entry| entry.files())
-                    .into_flat_iter()
-                    .cloned()
-                    .collect()
-            } else {
-                // SVH being specified means this is a transitive dependency,
-                // so `--extern` options do not apply.
-                Vec::new()
-            },
-            hash,
-            extra_filename,
+            search,
             target: &sess.target,
             tuple: sess.opts.target_triple.clone(),
             filesearch: sess.target_filesearch(),
@@ -360,6 +380,13 @@ impl<'a> CrateLocator<'a> {
         self.tuple = TargetTuple::from_tuple(config::host_tuple());
         self.filesearch = sess.host_filesearch();
         self.path_kind = path_kind;
+        if let CrateLocatorSearch::Metadata(search) = &mut self.search {
+            *search = match *search {
+                MetadataCrateLocatorSearch::Target(dep) | MetadataCrateLocatorSearch::Host(dep) => {
+                    MetadataCrateLocatorSearch::Host(dep)
+                }
+            };
+        }
     }
 
     pub(crate) fn for_target_proc_macro(&mut self, sess: &'a Session, path_kind: PathKind) {
@@ -374,17 +401,35 @@ impl<'a> CrateLocator<'a> {
         &self,
         crate_rejections: &mut CrateRejections,
     ) -> Result<Option<Library>, CrateError> {
-        if !self.exact_paths.is_empty() {
-            return self.find_commandline_library(crate_rejections);
-        }
         let mut seen_paths = FxHashSet::default();
-        if let Some(extra_filename) = self.extra_filename
-            && let library @ Some(_) =
-                self.find_library_crate(crate_rejections, extra_filename, &mut seen_paths)?
-        {
-            return Ok(library);
+        match &self.search {
+            CrateLocatorSearch::Extern(exact_paths) if !exact_paths.is_empty() => {
+                return self.find_commandline_library(crate_rejections, exact_paths);
+            }
+            CrateLocatorSearch::Metadata(
+                MetadataCrateLocatorSearch::Target(dep) | MetadataCrateLocatorSearch::Host(dep),
+            ) => {
+                let extra_filename: &str = dep.extra_filename.as_ref();
+                if let library @ Some(_) =
+                    self.find_library_crate(crate_rejections, extra_filename, &mut seen_paths)?
+                {
+                    return Ok(library);
+                }
+            }
+            CrateLocatorSearch::Extern(_) | CrateLocatorSearch::Link(_) => {}
         }
         self.find_library_crate(crate_rejections, "", &mut seen_paths)
+    }
+
+    pub(crate) fn allows_metadata_hash_reuse(&self) -> bool {
+        match &self.search {
+            CrateLocatorSearch::Extern(_) => true,
+            CrateLocatorSearch::Metadata(MetadataCrateLocatorSearch::Host(dep)) => {
+                dep.host_hash.is_none()
+            }
+            CrateLocatorSearch::Metadata(MetadataCrateLocatorSearch::Target(_))
+            | CrateLocatorSearch::Link(_) => false,
+        }
     }
 
     fn find_library_crate(
@@ -728,9 +773,16 @@ impl<'a> CrateLocator<'a> {
             return None;
         }
 
-        if self.exact_paths.is_empty() && self.crate_name != header.name {
-            info!("Rejecting via crate name");
-            return None;
+        match &self.search {
+            CrateLocatorSearch::Extern(exact_paths) if !exact_paths.is_empty() => {}
+            CrateLocatorSearch::Extern(_)
+            | CrateLocatorSearch::Metadata(_)
+            | CrateLocatorSearch::Link(_) => {
+                if self.crate_name != header.name {
+                    info!("Rejecting via crate name");
+                    return None;
+                }
+            }
         }
 
         if header.triple != self.tuple {
@@ -743,13 +795,40 @@ impl<'a> CrateLocator<'a> {
         }
 
         let hash = header.hash.0;
-        if let Some(expected_hash) = self.hash {
-            if hash != expected_hash {
-                info!("Rejecting via hash: expected {} got {}", expected_hash, hash);
-                crate_rejections
-                    .via_hash
-                    .push(CrateMismatch { path: libpath.to_path_buf(), got: hash.to_string() });
-                return None;
+        match &self.search {
+            CrateLocatorSearch::Extern(_) => {}
+            CrateLocatorSearch::Metadata(MetadataCrateLocatorSearch::Target(dep)) => {
+                if hash != dep.hash {
+                    info!("Rejecting via hash: expected {} got {}", dep.hash, hash);
+                    crate_rejections
+                        .via_hash
+                        .push(CrateMismatch { path: libpath.to_path_buf(), got: hash.to_string() });
+                    return None;
+                }
+            }
+            CrateLocatorSearch::Metadata(MetadataCrateLocatorSearch::Host(dep)) => {
+                if let Some(host_hash) = dep.host_hash
+                    && hash != host_hash
+                {
+                    info!("Rejecting via hash: expected {} got {}", host_hash, hash);
+                    crate_rejections
+                        .via_hash
+                        .push(CrateMismatch { path: libpath.to_path_buf(), got: hash.to_string() });
+                    return None;
+                }
+            }
+            CrateLocatorSearch::Link(dep) => {
+                if header.stable_crate_id != dep.stable_crate_id {
+                    info!(
+                        "Rejecting via stable crate ID: expected {:?} got {:?}",
+                        dep.stable_crate_id, header.stable_crate_id,
+                    );
+                    crate_rejections.via_hash.push(CrateMismatch {
+                        path: libpath.to_path_buf(),
+                        got: format!("{:?}", header.stable_crate_id),
+                    });
+                    return None;
+                }
             }
         }
 
@@ -759,6 +838,7 @@ impl<'a> CrateLocator<'a> {
     fn find_commandline_library(
         &self,
         crate_rejections: &mut CrateRejections,
+        exact_paths: &[CanonicalizedPath],
     ) -> Result<Option<Library>, CrateError> {
         // First, filter out all libraries that look suspicious. We only accept
         // files which actually exist that have the correct naming scheme for
@@ -767,7 +847,7 @@ impl<'a> CrateLocator<'a> {
         let mut rmetas = FxIndexSet::default();
         let mut dylibs = FxIndexSet::default();
         let mut sdylib_interfaces = FxIndexSet::default();
-        for loc in &self.exact_paths {
+        for loc in exact_paths {
             let loc_canon = loc.canonicalized();
             let loc_orig = loc.original();
             if !loc_canon.exists() {
@@ -1068,7 +1148,7 @@ pub fn get_proc_macros(
         None,
     )
     .map_err(|err| io::Error::other(err.to_string()))?;
-    let stable_crate_id = metadata.get_root().stable_crate_id();
+    let stable_crate_id = metadata.get_header().stable_crate_id;
 
     let clients = crate::host_dylib::dlsym_proc_macros(path, stable_crate_id).map_err(|err| {
         let (crate::DylibError::DlOpen(path, err) | crate::DylibError::DlSym(path, err)) = err;

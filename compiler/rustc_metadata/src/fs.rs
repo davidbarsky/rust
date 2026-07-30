@@ -3,16 +3,18 @@ use std::{fs, io};
 
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_fs_util::TempDirBuilder;
+use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_session::config::{CrateType, OutFileName, OutputType};
+use rustc_session::cstore::{CrateDepKind, LinkagePreference};
 use rustc_session::output::filename_for_metadata;
 
 use crate::diagnostics::{
     BinaryOutputToTty, FailedCopyToStdout, FailedCreateEncodedMetadata, FailedCreateFile,
     FailedCreateTempdir, FailedWriteError,
 };
-use crate::rmeta::{EncodedMetadataFiles, encode_metadata};
+use crate::rmeta::{EncodedMetadataFiles, LinkCrateDep, LinkCrateDepKind, encode_metadata};
 use crate::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair};
 
 // FIXME(eddyb) maybe include the crate name in this?
@@ -153,13 +155,45 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
     };
 
     // Load metadata back to memory: codegen may need to include it in object files.
-    let metadata = EncodedMetadata::from_path(
-        EncodedMetadataFiles { artifacts, temp_dir: metadata_tmpdir },
-        metadata_stub_filename,
-    )
-    .unwrap_or_else(|err| {
-        tcx.dcx().emit_fatal(FailedCreateEncodedMetadata { err });
-    });
+    let metadata_files = match artifacts {
+        EncodedMetadataArtifacts::Coarse(metadata) => {
+            EncodedMetadataFiles::Coarse { metadata, temp_dir: metadata_tmpdir }
+        }
+        EncodedMetadataArtifacts::Rdr(artifacts) => {
+            let dylib_dependency_formats = tcx.dependency_formats(()).get(&CrateType::Dylib);
+            let link_dependencies = tcx
+                .crates(())
+                .iter()
+                .copied()
+                .filter_map(|cnum| {
+                    let kind = match tcx.crate_dep_kind(cnum) {
+                        CrateDepKind::MacrosOnly => return None,
+                        CrateDepKind::Conditional => LinkCrateDepKind::Conditional,
+                        CrateDepKind::Unconditional => LinkCrateDepKind::Unconditional,
+                    };
+                    Some(LinkCrateDep {
+                        name: tcx.crate_name(cnum),
+                        stable_crate_id: tcx.stable_crate_id(cnum),
+                        kind,
+                        dylib_linkage: dylib_dependency_formats.and_then(|formats| {
+                            match formats[cnum] {
+                                Linkage::NotLinked | Linkage::IncludedFromDylib => None,
+                                Linkage::Dynamic => Some(LinkagePreference::RequireDynamic),
+                                Linkage::Static => Some(LinkagePreference::RequireStatic),
+                            }
+                        }),
+                        is_private: tcx.is_private_dep(cnum),
+                    })
+                })
+                .collect();
+            EncodedMetadataFiles::Rdr { artifacts, temp_dir: metadata_tmpdir, link_dependencies }
+        }
+    };
+
+    let metadata = EncodedMetadata::from_path(metadata_files, metadata_stub_filename)
+        .unwrap_or_else(|err| {
+            tcx.dcx().emit_fatal(FailedCreateEncodedMetadata { err });
+        });
 
     metadata
 }

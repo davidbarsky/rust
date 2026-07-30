@@ -1,3 +1,4 @@
+use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::num::NonZero;
@@ -12,6 +13,11 @@ use encoder::EncodeContext;
 pub use encoder::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair, rendered_const};
 pub(crate) use encoder::{EncodedMetadataFiles, encode_metadata};
 pub(crate) use parameterized::ParameterizedOverTcx;
+pub use rmeta_link::{
+    DYLIB_RMETA_LINK_SECTION, RMETA_LINK_FILENAME, RMETA_LINK_SECTION, RmetaLink,
+    RmetaLinkContents, RmetaLinkData,
+};
+pub(crate) use rmeta_link::{LinkCrateDep, LinkCrateDepKind};
 use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
 use rustc_ast as ast;
 #[cfg(test)]
@@ -33,8 +39,8 @@ use rustc_hir::{PreciseCapturingArgKind, attrs};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_index::{Idx, IndexVec};
 use rustc_macros::{
-    BlobDecodable, Decodable, Encodable, LazyDecodable, MetadataEncodable, StableHash, TyDecodable,
-    TyEncodable,
+    BlobDecodable, Decodable, Decodable_NoContext, Encodable, Encodable_NoContext, LazyDecodable,
+    MetadataEncodable, StableHash, TyDecodable, TyEncodable,
 };
 use rustc_middle::metadata::{
     AmbigModChild, DefinitionState, MetadataContractHash, MetadataDecodeLayoutId,
@@ -67,6 +73,7 @@ use crate::eii::EiiMapEncodedKeyValue;
 mod decoder;
 mod def_path_hash_map;
 mod parameterized;
+mod rmeta_link;
 mod table;
 
 pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
@@ -76,7 +83,7 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
 /// Metadata encoding version.
 /// N.B., increment this if you change the format of metadata such that
 /// the rustc version can't be found to compare with `rustc_version()`.
-const METADATA_VERSION: u8 = 10;
+const METADATA_VERSION: u8 = 11;
 
 const METADATA_ENVELOPE_VERSION: u8 = 0;
 const METADATA_ENVELOPE_LEN: usize = 8;
@@ -85,7 +92,7 @@ const COARSE_METADATA_PAYLOAD_OFFSET: usize = METADATA_ENVELOPE_LEN + 8;
 const RDR_METADATA_LENGTH_OFFSET: usize = METADATA_ENVELOPE_LEN + 8;
 const RDR_METADATA_PAYLOAD_OFFSET: usize = METADATA_ENVELOPE_LEN + 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Encodable_NoContext, Decodable_NoContext)]
 #[repr(u8)]
 pub(crate) enum MetadataFormatKind {
     Coarse = 0,
@@ -335,6 +342,7 @@ impl_metadata_semantic_tuple!(A, B, C, D);
 impl_metadata_semantic_value! {
     CrateHeaderRecord,
     CrateDep,
+    ExtraFilename,
     DefPathHash,
     StableCrateId,
     ReprOptions,
@@ -514,6 +522,7 @@ pub(crate) struct CrateHeader {
     pub(crate) triple: TargetTuple,
     pub(crate) hash: MetadataContractHash,
     pub(crate) name: Symbol,
+    pub(crate) stable_crate_id: StableCrateId,
     /// Whether this is the header for a proc-macro crate.
     ///
     /// This is separate from [`ProcMacroData`] to avoid having to update [`METADATA_VERSION`] every
@@ -533,6 +542,7 @@ struct CrateHeaderRecord {
     #[stable_hash(ignore)]
     hash: MetadataContractHash,
     name: Symbol,
+    stable_crate_id: StableCrateId,
     is_proc_macro_crate: bool,
     is_stub: bool,
 }
@@ -826,14 +836,37 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for RawDefId {
     }
 }
 
+/// Represents the opaque `-C extra-filename` suffix of one dependency artifact.
+#[derive(Encodable, BlobDecodable, StableHash)]
+pub(crate) struct ExtraFilename(String);
+
+impl From<String> for ExtraFilename {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ExtraFilename {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExtraFilename {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 #[derive(Encodable, BlobDecodable, StableHash)]
 pub(crate) struct CrateDep {
-    pub name: Symbol,
-    pub hash: Svh,
-    pub host_hash: Option<Svh>,
-    pub kind: CrateDepKind,
-    pub extra_filename: String,
-    pub is_private: bool,
+    pub(crate) name: Symbol,
+    pub(crate) hash: Svh,
+    pub(crate) host_hash: Option<Svh>,
+    pub(crate) kind: CrateDepKind,
+    pub(crate) dylib_linkage: Option<LinkagePreference>,
+    pub(crate) extra_filename: ExtraFilename,
+    pub(crate) is_private: bool,
 }
 
 #[derive(MetadataEncodable, LazyDecodable)]
@@ -1358,7 +1391,6 @@ pub(crate) struct CrateRoot {
     metadata_decode_layout_id: MetadataDecodeLayoutId => [SelfIdentity] position_by none,
 
     extra_filename: String => [DecodeLayout] position_by none,
-    stable_crate_id: StableCrateId => [Semantic, DecodeLayout] position_by none,
     required_panic_strategy: Option<PanicStrategy> => [Semantic] position_by none,
     panic_in_drop_strategy: PanicStrategy => [Semantic] position_by none,
     edition: Edition => [Semantic] position_by none,
@@ -1370,7 +1402,6 @@ pub(crate) struct CrateRoot {
         => [Semantic, DecodeLayout] position_by encode_externally_implementable_items,
 
     crate_deps: LazyArray<CrateDep> => [Semantic, DecodeLayout] position_by none,
-    dylib_dependency_formats: LazyArray<Option<LinkagePreference>> => [Semantic, DecodeLayout] position_by none,
     lib_features: LazyArray<(Symbol, FeatureStability)> => [Semantic, DecodeLayout] position_by none,
     stability_implications: LazyArray<(Symbol, Symbol)> => [Semantic, DecodeLayout] position_by none,
     lang_items: LazyArray<(DefIndex, LangItem)> => [Semantic, DecodeLayout] position_by none,

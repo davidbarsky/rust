@@ -1816,7 +1816,17 @@ pub(crate) fn exported_symbols(tcx: TyCtxt<'_>, crate_type: CrateType) -> Vec<Sy
         let metadata_symbol_name = exported_symbols::metadata_symbol_name(tcx);
         symbols.push(symbol_export_from_raw_name(
             tcx,
-            metadata_symbol_name,
+            metadata_symbol_name.into(),
+            SymbolExportKind::Data,
+        ));
+    }
+    if crate_type == CrateType::Dylib
+        && tcx.sess.opts.unstable_opts.rdr
+        && !tcx.sess.target.is_like_wasm
+    {
+        symbols.push(symbol_export_from_raw_name(
+            tcx,
+            exported_symbols::metadata_symbol_name(tcx).rmeta_link_symbol().into(),
             SymbolExportKind::Data,
         ));
     }

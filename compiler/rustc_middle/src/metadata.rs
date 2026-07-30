@@ -6,7 +6,7 @@ use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet, IndexEntry};
 use rustc_data_structures::stable_hash::{SpanHashMode, StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::svh::Svh;
 use rustc_hir::def::Res;
-use rustc_hir::def_id::{CRATE_DEF_ID, DefIndex, DefPathHash, LocalDefId};
+use rustc_hir::def_id::{CRATE_DEF_ID, CrateNum, DefIndex, DefPathHash, LocalDefId};
 use rustc_macros::{
     Decodable_NoContext, Encodable_NoContext, StableHash, TyDecodable, TyEncodable,
 };
@@ -93,17 +93,18 @@ pub enum TraceScope {
     Hygiene,
 }
 
-/// Collects local definition references without exposing scheduler state.
+/// Collects the local definitions and external metadata providers reached by one trace scope.
 #[derive(Default)]
-pub struct ReferencedDefinitions {
-    references: FxIndexMap<LocalDefId, DefinitionProjection>,
+pub struct MetadataReferences {
+    definitions: FxIndexMap<LocalDefId, DefinitionProjection>,
     selection_queries: FxIndexSet<LocalDefId>,
+    metadata_dependencies: FxIndexSet<CrateNum>,
 }
 
-impl ReferencedDefinitions {
+impl MetadataReferences {
     /// Joins repeated observations so traversal order cannot weaken an existing reference.
     pub fn observe(&mut self, def_id: LocalDefId, projection: DefinitionProjection) {
-        match self.references.entry(def_id) {
+        match self.definitions.entry(def_id) {
             IndexEntry::Occupied(mut entry) => {
                 *entry.get_mut() = (*entry.get()).max(projection);
             }
@@ -121,6 +122,11 @@ impl ReferencedDefinitions {
         }
         included
     }
+
+    /// Records an external crate whose definitions belong to this metadata projection.
+    pub fn observe_external_crate(&mut self, crate_num: CrateNum) {
+        self.metadata_dependencies.insert(crate_num);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +143,7 @@ struct DefinitionTrace {
     pending: VecDeque<LocalDefId>,
     selection_dependents: FxHashMap<LocalDefId, FxIndexSet<TraceScope>>,
     pending_retraces: FxIndexSet<TraceScope>,
+    metadata_dependencies: FxIndexSet<CrateNum>,
 }
 
 impl DefinitionTrace {
@@ -211,7 +218,7 @@ impl DefinitionTrace {
     fn drain(
         &mut self,
         owner: impl Fn(LocalDefId) -> DefPathHash,
-        mut encode: impl FnMut(TraceScope, SelectedDefinitions<'_>) -> ReferencedDefinitions,
+        mut encode: impl FnMut(TraceScope, SelectedDefinitions<'_>) -> MetadataReferences,
     ) {
         self.trace_scope(TraceScope::Artifact, &owner, &mut encode);
 
@@ -249,14 +256,15 @@ impl DefinitionTrace {
         &mut self,
         scope: TraceScope,
         owner: &impl Fn(LocalDefId) -> DefPathHash,
-        encode: &mut impl FnMut(TraceScope, SelectedDefinitions<'_>) -> ReferencedDefinitions,
+        encode: &mut impl FnMut(TraceScope, SelectedDefinitions<'_>) -> MetadataReferences,
     ) {
-        let ReferencedDefinitions { references, selection_queries } =
+        let MetadataReferences { definitions, selection_queries, metadata_dependencies } =
             encode(scope, self.selected());
+        self.metadata_dependencies.extend(metadata_dependencies);
         for def_id in selection_queries {
             self.selection_dependents.entry(def_id).or_default().insert(scope);
         }
-        for (def_id, projection) in references {
+        for (def_id, projection) in definitions {
             self.observe(def_id, owner(def_id), projection);
         }
     }
@@ -274,6 +282,13 @@ pub struct MetadataDefinitionLayout {
     indices: FxHashMap<DefIndex, DefIndex>,
     owners: FxHashMap<DefIndex, DefPathHash>,
     order: Vec<LocalDefId>,
+}
+
+/// Carries the closed definition layout and its metadata providers together.
+#[derive(Debug)]
+pub struct MetadataTrace {
+    pub layout: MetadataDefinitionLayout,
+    pub metadata_dependencies: FxIndexSet<CrateNum>,
 }
 
 /// Describes why a decoded definition table cannot be parsed as an artifact-local layout.
@@ -294,8 +309,8 @@ impl MetadataDefinitionLayout {
     pub fn trace(
         tcx: TyCtxt<'_>,
         semantic_roots: impl IntoIterator<Item = LocalDefId>,
-        mut encode: impl FnMut(TraceScope, SelectedDefinitions<'_>) -> ReferencedDefinitions,
-    ) -> Self {
+        mut encode: impl FnMut(TraceScope, SelectedDefinitions<'_>) -> MetadataReferences,
+    ) -> MetadataTrace {
         let mut trace = DefinitionTrace::default();
         let observe =
             |trace: &mut DefinitionTrace, def_id: LocalDefId, projection: DefinitionProjection| {
@@ -327,6 +342,7 @@ impl MetadataDefinitionLayout {
             pending: _,
             selection_dependents: _,
             pending_retraces: _,
+            metadata_dependencies,
         } = trace;
         let mut definition_ids = Vec::with_capacity(definitions.len());
         for (&hash, &MetadataDefinition { def_id, projection: _ }) in &definitions {
@@ -349,7 +365,10 @@ impl MetadataDefinitionLayout {
             );
         }
         let order = definition_ids.into_iter().map(|(def_id, _, _)| def_id).collect();
-        Self { definitions, indices, owners, order }
+        MetadataTrace {
+            layout: Self { definitions, indices, owners, order },
+            metadata_dependencies,
+        }
     }
 
     /// Preserves the compact addresses recorded by an existing metadata artifact.
@@ -493,7 +512,7 @@ fn hygiene_promotion_retraces_semantics_and_reopens_definition_processing() {
     trace.drain(
         |def_id| DefPathHash(Fingerprint::new(u64::from(def_id.local_def_index.as_u32()), 0)),
         |scope, selected| {
-            let mut references = ReferencedDefinitions::default();
+            let mut references = MetadataReferences::default();
             match scope {
                 TraceScope::Artifact => {
                     references.observe(promoted, DefinitionProjection::DecodeLayout);
@@ -537,11 +556,37 @@ fn hygiene_promotion_retraces_semantics_and_reopens_definition_processing() {
 #[test]
 fn observations_join_to_the_strongest_projection() {
     let def_id = LocalDefId { local_def_index: DefIndex::from_u32(1) };
-    let mut references = ReferencedDefinitions::default();
+    let mut references = MetadataReferences::default();
     references.observe(def_id, DefinitionProjection::Semantic);
     references.observe(def_id, DefinitionProjection::DecodeLayout);
 
-    assert_eq!(references.references[&def_id], DefinitionProjection::Semantic);
+    assert_eq!(references.definitions[&def_id], DefinitionProjection::Semantic);
+}
+
+#[test]
+fn external_metadata_dependencies_survive_the_complete_trace() {
+    let mut trace = DefinitionTrace::default();
+
+    trace.drain(
+        |def_id| DefPathHash(Fingerprint::new(u64::from(def_id.local_def_index.as_u32()), 0)),
+        |scope, _| {
+            let mut references = MetadataReferences::default();
+            match scope {
+                TraceScope::Artifact => references.observe_external_crate(CrateNum::new(1)),
+                TraceScope::Definition { def_id: _, projection: _ } => {}
+                TraceScope::Hygiene => {
+                    references.observe_external_crate(CrateNum::new(1));
+                    references.observe_external_crate(CrateNum::new(2));
+                }
+            }
+            references
+        },
+    );
+
+    assert_eq!(
+        trace.metadata_dependencies.into_iter().collect::<Vec<_>>(),
+        [CrateNum::new(1), CrateNum::new(2)]
+    );
 }
 
 #[test]
@@ -564,6 +609,7 @@ pub struct MetadataProjection {
     pub contract: MetadataContractHash,
     pub decode_layout: MetadataDecodeLayoutId,
     pub definitions: MetadataDefinitionLayout,
+    pub metadata_dependencies: FxIndexSet<CrateNum>,
     pub hygiene: HygieneEncodeLayout,
     pub span_layout: MetadataSpanLayout,
 }

@@ -33,7 +33,7 @@ use rustc_serialize::opaque::{MAGIC_END_BYTES, MemDecoder};
 use rustc_serialize::{Decodable, Decoder};
 use rustc_session::config::TargetModifier;
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
-use rustc_session::cstore::{CrateSource, ExternCrate};
+use rustc_session::cstore::{CrateSource, ExternCrate, LinkagePreference};
 use rustc_span::def_id::ModId;
 use rustc_span::hygiene::HygieneDecodeContext;
 use rustc_span::{
@@ -106,6 +106,13 @@ impl std::ops::Deref for LoadedMetadata {
 }
 
 impl LoadedMetadata {
+    pub(crate) fn is_rdr(&self) -> bool {
+        match &self.positions {
+            MetadataPositions::Coarse => false,
+            MetadataPositions::Rdr { .. } => true,
+        }
+    }
+
     pub(crate) fn new(input: MetadataInput) -> Result<Self, MetadataBlobError> {
         match input {
             MetadataInput::Coarse(bytes) => {
@@ -284,6 +291,8 @@ pub(crate) struct CrateMetadata {
     /// Maps crate IDs as they are were seen from this crate's compilation sessions into
     /// IDs as they are seen from the current compilation session.
     cnum_map: CrateNumMap,
+    /// Implementation dependencies that final linking needs but metadata decoding does not.
+    link_dependencies: FxIndexMap<CrateNum, Option<LinkagePreference>>,
     /// How to link (or not link) this crate to the currently compiled crate.
     dep_kind: CrateDepKind,
     /// Filesystem location of this crate.
@@ -964,7 +973,7 @@ impl MetadataBlob {
                         out,
                         "hash {} stable_crate_id {:?}",
                         root.hash(),
-                        root.stable_crate_id
+                        root.stable_crate_id()
                     )?;
                     writeln!(out, "proc_macro {:?}", root.proc_macro_data.is_some())?;
                     writeln!(out, "triple {}", root.header.triple.tuple())?;
@@ -995,22 +1004,25 @@ impl MetadataBlob {
                     )?;
 
                     writeln!(out, "=External Dependencies=")?;
-                    let dylib_dependency_formats =
-                        root.dylib_dependency_formats.decode(self).collect::<Vec<_>>();
                     for (i, dep) in root.crate_deps.decode(self).enumerate() {
-                        let CrateDep { name, extra_filename, hash, host_hash, kind, is_private } =
-                            dep;
+                        let CrateDep {
+                            name,
+                            extra_filename,
+                            hash,
+                            host_hash,
+                            kind,
+                            dylib_linkage,
+                            is_private,
+                        } = dep;
                         let number = i + 1;
 
                         writeln!(
                             out,
                             "{number} {name}{extra_filename} hash {hash} host_hash {host_hash:?} kind {kind:?} {privacy}{linkage}",
                             privacy = if is_private { "private" } else { "public" },
-                            linkage = if dylib_dependency_formats.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" linkage {:?}", dylib_dependency_formats[i])
-                            }
+                            linkage = dylib_linkage
+                                .map(|linkage| format!(" linkage {linkage:?}"))
+                                .unwrap_or_default(),
                         )?;
                     }
                     write!(out, "\n")?;
@@ -1176,7 +1188,7 @@ impl CrateRoot {
     }
 
     pub(crate) fn stable_crate_id(&self) -> StableCrateId {
-        self.stable_crate_id
+        self.header.stable_crate_id
     }
 
     pub(crate) fn decode_crate_deps<'a>(
@@ -1747,12 +1759,19 @@ impl CrateMetadata {
         tcx: TyCtxt<'tcx>,
     ) -> &'tcx [(CrateNum, LinkagePreference)] {
         tcx.arena.alloc_from_iter(
-            self.root.dylib_dependency_formats.decode((self, tcx)).enumerate().flat_map(
-                |(i, link)| {
+            self.root
+                .crate_deps
+                .decode((self, tcx))
+                .enumerate()
+                .flat_map(|(i, dep)| {
                     let cnum = CrateNum::new(i + 1); // We skipped LOCAL_CRATE when encoding
-                    link.map(|link| (self.cnum_map[cnum], link))
-                },
-            ),
+                    dep.dylib_linkage.map(|linkage| (self.cnum_map[cnum], linkage))
+                })
+                .chain(
+                    self.link_dependencies
+                        .iter()
+                        .filter_map(|(&cnum, linkage)| linkage.map(|linkage| (cnum, linkage))),
+                ),
         )
     }
 
@@ -1826,10 +1845,10 @@ impl CrateMetadata {
         // into the FixedSizeEncoding, as Hash64 lacks a Default impl. A future refactor to
         // relax the Default restriction will likely fix this.
         let fingerprint = Fingerprint::new(
-            self.root.stable_crate_id.as_u64(),
+            self.root.stable_crate_id().as_u64(),
             self.root.tables.def_path_hashes.get(&self.blob, index),
         );
-        DefPathHash::new(self.root.stable_crate_id, fingerprint.split().1)
+        DefPathHash::new(self.root.stable_crate_id(), fingerprint.split().1)
     }
 
     #[inline]
@@ -2163,6 +2182,7 @@ impl CrateMetadata {
         raw_proc_macros: Option<&'static [ProcMacroClient]>,
         cnum: CrateNum,
         cnum_map: CrateNumMap,
+        link_dependencies: FxIndexMap<CrateNum, Option<LinkagePreference>>,
         dep_kind: CrateDepKind,
         source: CrateSource,
         private_dep: bool,
@@ -2199,6 +2219,7 @@ impl CrateMetadata {
             alloc_decoding_state,
             cnum,
             cnum_map,
+            link_dependencies,
             dep_kind,
             source: Arc::new(source),
             private_dep,
@@ -2222,7 +2243,7 @@ impl CrateMetadata {
     }
 
     pub(crate) fn dependencies(&self) -> impl Iterator<Item = CrateNum> {
-        self.cnum_map.iter().copied()
+        self.cnum_map.iter().copied().chain(self.link_dependencies.keys().copied())
     }
 
     pub(crate) fn target_modifiers(&self) -> TargetModifiers {
@@ -2332,6 +2353,10 @@ impl CrateMetadata {
 
     pub(crate) fn hash(&self) -> Svh {
         self.root.header.hash.0
+    }
+
+    pub(crate) fn stable_crate_id(&self) -> StableCrateId {
+        self.root.stable_crate_id()
     }
 
     pub(crate) fn has_async_drops(&self) -> bool {

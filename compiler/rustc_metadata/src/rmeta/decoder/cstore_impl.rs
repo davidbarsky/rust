@@ -748,7 +748,7 @@ impl CrateStore for CStore {
     }
 
     fn stable_crate_id(&self, cnum: CrateNum) -> StableCrateId {
-        self.get_crate_data(cnum).root.stable_crate_id
+        self.get_crate_data(cnum).root.stable_crate_id()
     }
 
     /// Returns the `DefKey` for a given `DefId`. This indicates the

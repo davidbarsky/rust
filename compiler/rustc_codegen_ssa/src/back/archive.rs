@@ -15,7 +15,8 @@ use object::read::macho::FatArch;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_fs_util::TempDirBuilder;
-use rustc_metadata::EncodedMetadata;
+use rustc_metadata::{EncodedMetadata, RmetaLinkData};
+use rustc_middle::middle::exported_symbols::{MetadataSymbolName, RmetaLinkSymbolName};
 use rustc_session::Session;
 use rustc_span::Symbol;
 use rustc_target::spec::Arch;
@@ -45,6 +46,12 @@ pub struct ImportLibraryItem {
     pub is_data: bool,
 }
 
+/// Compiler-owned data that must survive in a Rust dylib.
+pub enum DylibMetadataArtifact<'a> {
+    CrateMetadata { metadata: &'a EncodedMetadata, symbol_name: &'a MetadataSymbolName },
+    RmetaLink { data: &'a RmetaLinkData, symbol_name: &'a RmetaLinkSymbolName },
+}
+
 impl ImportLibraryItem {
     fn into_coff_short_export(self, sess: &Session) -> COFFShortExport {
         let import_name = (sess.target.arch == Arch::Arm64EC).then(|| self.name.clone());
@@ -69,10 +76,9 @@ pub trait ArchiveBuilderBuilder {
     fn create_dylib_metadata_wrapper(
         &self,
         sess: &Session,
-        metadata: &EncodedMetadata,
-        symbol_name: &str,
+        artifact: DylibMetadataArtifact<'_>,
     ) -> Vec<u8> {
-        create_compressed_metadata_file(sess, metadata, symbol_name)
+        create_compressed_metadata_file(sess, artifact)
     }
 
     /// Creates a DLL Import Library <https://docs.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-creation#creating-an-import-library>.

@@ -29,7 +29,10 @@ use rustc_metadata::fs::{
     METADATA_FILENAME, METADATA_SPANS_FILENAME, copy_to_stdout, emit_wrapper_file,
     non_durable_rename,
 };
-use rustc_metadata::{EncodedMetadata, EncodedMetadataArtifacts, RdrArtifactPair};
+use rustc_metadata::{
+    EncodedMetadata, EncodedMetadataArtifacts, RMETA_LINK_FILENAME, RMETA_LINK_SECTION,
+    RdrArtifactPair, RmetaLinkContents,
+};
 use rustc_middle::bug;
 use rustc_middle::error::DuplicateEiiImpls;
 use rustc_middle::lint::emit_lint_base;
@@ -57,13 +60,14 @@ use tracing::{debug, info, warn};
 
 use super::archive::{
     AddArchiveKind, ArchiveBuilder, ArchiveBuilderBuilder, ArchiveEntryKind, ArchiveSymbols,
+    DylibMetadataArtifact,
 };
 use super::command::Command;
 use super::linker::{self, Linker};
 use super::metadata::{MetadataPosition, create_wrapper_file};
 use super::rmeta_link::RmetaLinkCache;
 use super::rpath::{self, RPathConfig};
-use super::{apple, rmeta_link, versioned_llvm_target};
+use super::{apple, versioned_llvm_target};
 use crate::base::needs_allocator_shim_for_linking;
 use crate::{
     CodegenLintLevelSpecs, CompiledModule, CompiledModules, CrateInfo, NativeLib, SymbolExport,
@@ -363,7 +367,7 @@ pub fn link_binary(
             let crate_name = format!("{}", crate_info.local_crate_name);
             let out_filename = output.file_for_writing(outputs, OutputType::Exe, &crate_name);
             let rdr_spans = if crate_type == CrateType::Rlib || crate_type == CrateType::Dylib {
-                match metadata.stub_or_full() {
+                match metadata.full() {
                     EncodedMetadataArtifacts::Coarse(_) => None,
                     EncodedMetadataArtifacts::Rdr(artifacts) => Some(artifacts.spans),
                 }
@@ -622,11 +626,11 @@ fn link_rlib<'a>(
     let metadata_link_file = if matches!(flavor, RlibFlavor::Normal) {
         let native_lib_filenames: Vec<Option<String>> =
             native_lib_filenames.iter().map(|f| f.map(|s| s.to_string())).collect();
-        let metadata_link = rmeta_link::RmetaLink { rust_object_files, native_lib_filenames };
-        let metadata_link_data = metadata_link.encode();
+        let metadata_link_data = metadata
+            .rmeta_link_data(RmetaLinkContents::Rlib { rust_object_files, native_lib_filenames });
         let (wrapper, _) =
-            create_wrapper_file(sess, rmeta_link::SECTION.to_string(), &metadata_link_data);
-        Some(emit_wrapper_file(sess, &wrapper, tmpdir.as_ref(), rmeta_link::FILENAME))
+            create_wrapper_file(sess, RMETA_LINK_SECTION.to_string(), metadata_link_data.as_ref());
+        Some(emit_wrapper_file(sess, &wrapper, tmpdir.as_ref(), RMETA_LINK_FILENAME))
     } else {
         None
     };
@@ -845,7 +849,7 @@ fn link_staticlib(
             path,
             AddArchiveKind::Rlib(rmeta_link_cache, &|fname: &str, entry_kind| {
                 // Ignore metadata and rmeta-link files.
-                if fname == METADATA_FILENAME || fname == rmeta_link::FILENAME {
+                if fname == METADATA_FILENAME || fname == RMETA_LINK_FILENAME {
                     return true;
                 }
 
@@ -2719,12 +2723,32 @@ fn add_local_crate_metadata_objects(
     if matches!(crate_type, CrateType::Dylib | CrateType::ProcMacro) {
         let data = archive_builder_builder.create_dylib_metadata_wrapper(
             sess,
-            &metadata,
-            &crate_info.metadata_symbol,
+            DylibMetadataArtifact::CrateMetadata {
+                metadata,
+                symbol_name: &crate_info.metadata_symbol,
+            },
         );
         let obj = emit_wrapper_file(sess, &data, tmpdir, "rmeta.o");
 
         cmd.add_object(&obj);
+    }
+    match metadata.full() {
+        EncodedMetadataArtifacts::Coarse(_) => {}
+        EncodedMetadataArtifacts::Rdr(_) if crate_type == CrateType::Dylib => {
+            let link_data = metadata.rmeta_link_data(RmetaLinkContents::Dylib);
+            let rmeta_link_symbol = crate_info.metadata_symbol.rmeta_link_symbol();
+            let data = archive_builder_builder.create_dylib_metadata_wrapper(
+                sess,
+                DylibMetadataArtifact::RmetaLink {
+                    data: &link_data,
+                    symbol_name: &rmeta_link_symbol,
+                },
+            );
+            let obj = emit_wrapper_file(sess, &data, tmpdir, "rmeta-link.o");
+
+            cmd.add_object(&obj);
+        }
+        EncodedMetadataArtifacts::Rdr(_) => {}
     }
 }
 
@@ -3791,7 +3815,7 @@ fn add_static_crate(
         if let Err(error) = archive.add_archive(
             cratepath,
             AddArchiveKind::Rlib(rmeta_link_cache, &|f, entry_kind| {
-                if f == METADATA_FILENAME || f == rmeta_link::FILENAME {
+                if f == METADATA_FILENAME || f == RMETA_LINK_FILENAME {
                     return true;
                 }
 

@@ -14,9 +14,9 @@ use object::{
 use rustc_abi::Endian;
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::owned_slice::{OwnedSlice, try_slice_owned};
-use rustc_metadata::EncodedMetadata;
 use rustc_metadata::creader::MetadataLoader;
 use rustc_metadata::fs::METADATA_FILENAME;
+use rustc_metadata::{DYLIB_RMETA_LINK_SECTION, RMETA_LINK_FILENAME, RMETA_LINK_SECTION};
 use rustc_middle::bug;
 use rustc_session::Session;
 use rustc_span::sym;
@@ -24,6 +24,7 @@ use rustc_target::spec::{CfgAbi, LlvmAbi, Os, RelocModel, Target, ef_avr_arch};
 use tracing::debug;
 
 use super::apple;
+use super::archive::DylibMetadataArtifact;
 use crate::diagnostics;
 
 /// The default metadata loader. This is used by cg_llvm and cg_clif.
@@ -39,7 +40,8 @@ use crate::diagnostics;
 #[derive(Debug)]
 pub struct DefaultMetadataLoader;
 
-static AIX_METADATA_SYMBOL_NAME: &'static str = "__aix_rust_metadata";
+pub(super) const AIX_METADATA_SYMBOL_NAME: &str = "__aix_rust_metadata";
+const AIX_RMETA_LINK_SYMBOL_NAME: &str = "__aix_rust_rmeta_link";
 
 fn load_metadata_with(
     path: &Path,
@@ -68,7 +70,7 @@ impl MetadataLoader for DefaultMetadataLoader {
                         .data(data)
                         .map_err(|e| format!("failed to parse rlib '{}': {}", path.display(), e))?;
                     if target.is_like_aix {
-                        return get_metadata_xcoff(path, data);
+                        return get_metadata_xcoff(path, data, AIX_METADATA_SYMBOL_NAME);
                     } else {
                         return search_for_section(path, data, ".rmeta");
                     }
@@ -95,7 +97,7 @@ impl MetadataLoader for DefaultMetadataLoader {
                         let data = lib.data(data).map_err(|e| {
                             format!("failed to parse aix dylib '{}': {}", path.display(), e)
                         })?;
-                        get_metadata_xcoff(path, data)
+                        get_metadata_xcoff(path, data, AIX_METADATA_SYMBOL_NAME)
                     }
                     Err(e) => Err(format!("failed to parse aix dylib '{}': {}", path.display(), e)),
                 }
@@ -104,6 +106,67 @@ impl MetadataLoader for DefaultMetadataLoader {
             load_metadata_with(path, |data| search_for_section(path, data, ".rustc"))
         }
     }
+
+    fn get_rlib_link_metadata(&self, target: &Target, path: &Path) -> Result<OwnedSlice, String> {
+        debug!("getting rlib link metadata for {}", path.display());
+        load_metadata_with(path, |data| {
+            let archive = object::read::archive::ArchiveFile::parse(&*data)
+                .map_err(|e| format!("failed to parse rlib '{}': {}", path.display(), e))?;
+
+            for entry_result in archive.members() {
+                let entry = entry_result
+                    .map_err(|e| format!("failed to parse rlib '{}': {}", path.display(), e))?;
+                if entry.name() == RMETA_LINK_FILENAME.as_bytes() {
+                    let data = entry
+                        .data(data)
+                        .map_err(|e| format!("failed to parse rlib '{}': {}", path.display(), e))?;
+                    if target.is_like_aix {
+                        return get_required_metadata_xcoff(path, data, AIX_METADATA_SYMBOL_NAME);
+                    }
+                    return required_section(path, data, RMETA_LINK_SECTION);
+                }
+            }
+
+            Err(format!("link metadata not found in rlib '{}'", path.display()))
+        })
+    }
+
+    fn get_dylib_link_metadata(&self, target: &Target, path: &Path) -> Result<OwnedSlice, String> {
+        debug!("getting dylib link metadata for {}", path.display());
+        if target.is_like_aix {
+            load_metadata_with(path, |data| {
+                let archive = object::read::archive::ArchiveFile::parse(&*data).map_err(|e| {
+                    format!("failed to parse aix dylib '{}': {}", path.display(), e)
+                })?;
+
+                match archive.members().exactly_one() {
+                    Ok(lib) => {
+                        let lib = lib.map_err(|e| {
+                            format!("failed to parse aix dylib '{}': {}", path.display(), e)
+                        })?;
+                        let data = lib.data(data).map_err(|e| {
+                            format!("failed to parse aix dylib '{}': {}", path.display(), e)
+                        })?;
+                        get_required_metadata_xcoff(path, data, AIX_RMETA_LINK_SYMBOL_NAME)
+                    }
+                    Err(e) => Err(format!("failed to parse aix dylib '{}': {}", path.display(), e)),
+                }
+            })
+        } else {
+            load_metadata_with(path, |data| required_section(path, data, DYLIB_RMETA_LINK_SECTION))
+        }
+    }
+}
+
+fn section_data<'a>(
+    path: &Path,
+    file: &object::File<'a>,
+    section: &str,
+) -> Result<&'a [u8], String> {
+    file.section_by_name(section)
+        .ok_or_else(|| format!("no `{}` section in '{}'", section, path.display()))?
+        .data()
+        .map_err(|e| format!("failed to read {} section in '{}': {}", section, path.display(), e))
 }
 
 pub(super) fn search_for_section<'a>(
@@ -120,10 +183,14 @@ pub(super) fn search_for_section<'a>(
         // not forward the error along here.
         return Ok(bytes);
     };
-    file.section_by_name(section)
-        .ok_or_else(|| format!("no `{}` section in '{}'", section, path.display()))?
-        .data()
-        .map_err(|e| format!("failed to read {} section in '{}': {}", section, path.display(), e))
+    section_data(path, &file, section)
+}
+
+fn required_section<'a>(path: &Path, bytes: &'a [u8], section: &str) -> Result<&'a [u8], String> {
+    let file = object::File::parse(bytes).map_err(|err| {
+        format!("failed to parse object '{}' while reading `{section}`: {err}", path.display())
+    })?;
+    section_data(path, &file, section)
 }
 
 fn add_gnu_property_note(
@@ -174,13 +241,38 @@ fn add_gnu_property_note(
     file.append_section_data(section, &data, 8);
 }
 
-pub(super) fn get_metadata_xcoff<'a>(path: &Path, data: &'a [u8]) -> Result<&'a [u8], String> {
+pub(super) fn get_metadata_xcoff<'a>(
+    path: &Path,
+    data: &'a [u8],
+    metadata_symbol_name: &str,
+) -> Result<&'a [u8], String> {
     let Ok(file) = object::File::parse(data) else {
         return Ok(data);
     };
-    let info_data = search_for_section(path, data, ".info")?;
-    if let Some(metadata_symbol) =
-        file.symbols().find(|sym| sym.name() == Ok(AIX_METADATA_SYMBOL_NAME))
+    xcoff_metadata_data(path, &file, metadata_symbol_name)
+}
+
+fn get_required_metadata_xcoff<'a>(
+    path: &Path,
+    data: &'a [u8],
+    metadata_symbol_name: &str,
+) -> Result<&'a [u8], String> {
+    let file = object::File::parse(data).map_err(|err| {
+        format!(
+            "failed to parse XCOFF object '{}' while reading `{metadata_symbol_name}`: {err}",
+            path.display(),
+        )
+    })?;
+    xcoff_metadata_data(path, &file, metadata_symbol_name)
+}
+
+fn xcoff_metadata_data<'a>(
+    path: &Path,
+    file: &object::File<'a>,
+    metadata_symbol_name: &str,
+) -> Result<&'a [u8], String> {
+    let info_data = section_data(path, file, ".info")?;
+    if let Some(metadata_symbol) = file.symbols().find(|sym| sym.name() == Ok(metadata_symbol_name))
     {
         let offset = metadata_symbol.address() as usize;
         // The offset specifies the location of rustc metadata in the .info section of XCOFF.
@@ -197,7 +289,7 @@ pub(super) fn get_metadata_xcoff<'a>(path: &Path, data: &'a [u8]) -> Result<&'a 
         }
         Ok(&info_data[offset..(offset + len)])
     } else {
-        Err(format!("Unable to find symbol {AIX_METADATA_SYMBOL_NAME}"))
+        Err(format!("Unable to find symbol {metadata_symbol_name}"))
     }
 }
 
@@ -573,26 +665,57 @@ pub(crate) fn create_wrapper_file(
 // https://github.com/llvm/llvm-project/blob/llvmorg-12.0.0/lld/COFF/Writer.cpp#L1190-L1197
 pub fn create_compressed_metadata_file(
     sess: &Session,
-    metadata: &EncodedMetadata,
-    symbol_name: &str,
+    artifact: DylibMetadataArtifact<'_>,
 ) -> Vec<u8> {
-    let metadata = metadata.stub_or_full().metadata();
-    let mut packed_metadata = rustc_metadata::METADATA_HEADER.to_vec();
-    packed_metadata.write_all(&(metadata.len() as u64).to_le_bytes()).unwrap();
-    packed_metadata.extend(metadata);
+    match artifact {
+        DylibMetadataArtifact::CrateMetadata { metadata, symbol_name } => {
+            let metadata = metadata.stub_or_full().metadata();
+            let mut packed_metadata = rustc_metadata::METADATA_HEADER.to_vec();
+            packed_metadata.write_all(&(metadata.len() as u64).to_le_bytes()).unwrap();
+            packed_metadata.extend(metadata);
+            create_dylib_metadata_file(
+                sess,
+                &packed_metadata,
+                ".rustc",
+                symbol_name.as_ref(),
+                AIX_METADATA_SYMBOL_NAME,
+            )
+        }
+        DylibMetadataArtifact::RmetaLink { data, symbol_name } => create_dylib_metadata_file(
+            sess,
+            data.as_ref(),
+            DYLIB_RMETA_LINK_SECTION,
+            symbol_name.as_ref(),
+            AIX_RMETA_LINK_SYMBOL_NAME,
+        ),
+    }
+}
 
+fn create_dylib_metadata_file(
+    sess: &Session,
+    data: &[u8],
+    section_name: &str,
+    symbol_name: &str,
+    aix_metadata_symbol_name: &str,
+) -> Vec<u8> {
     let Some(mut file) = create_object_file(sess) else {
         if sess.target.is_like_wasm {
-            return create_metadata_file_for_wasm(sess, &packed_metadata, ".rustc");
+            return create_metadata_file_for_wasm(sess, data, section_name);
         }
-        return packed_metadata.to_vec();
+        return data.to_vec();
     };
     if file.format() == BinaryFormat::Xcoff {
-        return create_compressed_metadata_file_for_xcoff(file, &packed_metadata, symbol_name);
+        return create_compressed_metadata_file_for_xcoff(
+            file,
+            data,
+            section_name,
+            symbol_name,
+            aix_metadata_symbol_name,
+        );
     }
     let section = file.add_section(
         file.segment_name(StandardSegment::Data).to_vec(),
-        b".rustc".to_vec(),
+        section_name.as_bytes().to_vec(),
         SectionKind::ReadOnlyData,
     );
     match file.format() {
@@ -602,14 +725,14 @@ pub fn create_compressed_metadata_file(
         }
         _ => {}
     };
-    let offset = file.append_section_data(section, &packed_metadata, 1);
+    let offset = file.append_section_data(section, data, 1);
 
     // For MachO and probably PE this is necessary to prevent the linker from throwing away the
     // .rustc section. For ELF this isn't necessary, but it also doesn't harm.
     file.add_symbol(Symbol {
         name: symbol_name.as_bytes().to_vec(),
         value: offset,
-        size: packed_metadata.len() as u64,
+        size: data.len() as u64,
         kind: SymbolKind::Data,
         scope: SymbolScope::Dynamic,
         weak: false,
@@ -636,14 +759,16 @@ pub fn create_compressed_metadata_file(
 pub fn create_compressed_metadata_file_for_xcoff(
     mut file: write::Object<'_>,
     data: &[u8],
+    file_name: &str,
     symbol_name: &str,
+    metadata_symbol_name: &str,
 ) -> Vec<u8> {
     assert!(file.format() == BinaryFormat::Xcoff);
     // AIX system linker may aborts if it meets a valid XCOFF file in archive with no .text, no .data and no .bss.
     file.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
     let data_section = file.add_section(Vec::new(), b".data".to_vec(), SectionKind::Data);
     let section = file.add_section(Vec::new(), b".info".to_vec(), SectionKind::Debug);
-    file.add_file_symbol("lib.rmeta".into());
+    file.add_file_symbol(file_name.as_bytes().into());
     file.section_mut(section).flags = SectionFlags::Xcoff { s_flags: xcoff::STYP_INFO as u32 };
     // Add a global symbol to data_section.
     file.add_symbol(Symbol {
@@ -660,7 +785,7 @@ pub fn create_compressed_metadata_file_for_xcoff(
     let offset = file.append_section_data(section, &len.to_be_bytes(), 1);
     // Add a symbol referring to the rustc metadata.
     file.add_symbol(Symbol {
-        name: AIX_METADATA_SYMBOL_NAME.into(),
+        name: metadata_symbol_name.into(),
         value: offset + 4, // The metadata is preceded by a 4-byte length field.
         size: 0,
         kind: SymbolKind::Unknown,
