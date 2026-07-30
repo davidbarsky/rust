@@ -726,7 +726,7 @@ impl<T, I: Iterator<Item = T>> From<UnordItems<T, I>> for UnordBag<T> {
     }
 }
 
-impl<V: Hash + Eq + StableHash> StableHash for UnordBag<V> {
+impl<V: StableHash> StableHash for UnordBag<V> {
     #[inline]
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         hash_iter_order_independent(self.inner.iter(), hcx, hasher);

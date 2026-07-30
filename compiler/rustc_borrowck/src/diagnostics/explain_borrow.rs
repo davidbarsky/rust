@@ -466,7 +466,9 @@ impl<'tcx> BorrowExplanation<'tcx> {
                                 re_static
                             }
                             ObjectLifetimeDefault::Param(param_def_id) => {
-                                let index = generics.param_def_id_to_index[&param_def_id] as usize;
+                                let index = generics.own_param_index(param_def_id).expect(
+                                    "object lifetime parameter must be owned by its generics",
+                                ) as usize;
                                 args.get(index).and_then(|arg| arg.as_region()).unwrap_or_else(
                                     || {
                                         failed = true;

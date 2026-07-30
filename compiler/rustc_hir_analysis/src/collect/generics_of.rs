@@ -52,14 +52,10 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         trait_fn_params.extend(own_params);
         own_params = trait_fn_params;
 
-        let param_def_id_to_index =
-            own_params.iter().map(|param| (param.def_id, param.index)).collect();
-
         return ty::Generics {
             parent: Some(trait_def_id),
             parent_count,
             own_params,
-            param_def_id_to_index,
             has_self: opaque_ty_generics.has_self,
             has_late_bound_regions: opaque_ty_generics.has_late_bound_regions,
         };
@@ -141,12 +137,11 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     // see `explicit_clauses_of` for more information on this
                     let parent_def_id = tcx.local_parent(param_id);
                     let generics = tcx.generics_of(parent_def_id);
-                    let param_def_idx = generics.param_def_id_to_index[&param_id.to_def_id()];
+                    let param_def_idx = generics
+                        .own_param_index(param_id.to_def_id())
+                        .expect("const parameter must be owned by its generics");
                     // In the above example this would be .params[..N#0]
                     let own_params = generics.params_to(param_def_idx as usize, tcx).to_owned();
-                    let param_def_id_to_index =
-                        own_params.iter().map(|param| (param.def_id, param.index)).collect();
-
                     return ty::Generics {
                         // we set the parent of these generics to be our parent's parent so that we
                         // dont end up with args: [N, M, N] for the const default on a struct like this:
@@ -154,7 +149,6 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                         parent: generics.parent,
                         parent_count: generics.parent_count,
                         own_params,
-                        param_def_id_to_index,
                         has_self: generics.has_self,
                         has_late_bound_regions: generics.has_late_bound_regions,
                     };
@@ -386,14 +380,10 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         }))
     }
 
-    let param_def_id_to_index =
-        own_params.iter().map(|param| (param.def_id, param.index)).collect();
-
     ty::Generics {
         parent: parent_def_id.map(LocalDefId::to_def_id),
         parent_count,
         own_params,
-        param_def_id_to_index,
         has_self: has_self || parent_has_self,
         has_late_bound_regions: has_late_bound_regions(tcx, node),
     }

@@ -62,32 +62,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-              (
-                  DefId(..),
-                  5,
-              ),
-          ],
           has_self: true,
           has_late_bound_regions: None,
       }
@@ -160,32 +134,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-              (
-                  DefId(..),
-                  5,
-              ),
-          ],
           has_self: true,
           has_late_bound_regions: None,
       }
@@ -248,28 +196,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-          ],
           has_self: false,
           has_late_bound_regions: None,
       }
@@ -332,28 +258,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-          ],
           has_self: false,
           has_late_bound_regions: None,
       }
@@ -416,28 +320,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-          ],
           has_self: false,
           has_late_bound_regions: None,
       }
@@ -492,24 +374,6 @@ note: Generics {
                       synthetic: false,
                   },
               },
-          ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
           ],
           has_self: false,
           has_late_bound_regions: Some(
@@ -585,32 +449,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-              (
-                  DefId(..),
-                  5,
-              ),
-          ],
           has_self: true,
           has_late_bound_regions: None,
       }
@@ -673,28 +511,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  0,
-              ),
-              (
-                  DefId(..),
-                  1,
-              ),
-              (
-                  DefId(..),
-                  2,
-              ),
-              (
-                  DefId(..),
-                  3,
-              ),
-              (
-                  DefId(..),
-                  4,
-              ),
-          ],
           has_self: false,
           has_late_bound_regions: None,
       }
@@ -713,7 +529,6 @@ note: Generics {
           parent: None,
           parent_count: 0,
           own_params: [],
-          param_def_id_to_index: [],
           has_self: false,
           has_late_bound_regions: None,
       }
@@ -745,12 +560,6 @@ note: Generics {
                   },
               },
           ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  6,
-              ),
-          ],
           has_self: true,
           has_late_bound_regions: None,
       }
@@ -771,7 +580,6 @@ note: Generics {
           ),
           parent_count: 6,
           own_params: [],
-          param_def_id_to_index: [],
           has_self: true,
           has_late_bound_regions: None,
       }
@@ -805,12 +613,6 @@ note: Generics {
                       has_default: false,
                   },
               },
-          ],
-          param_def_id_to_index: [
-              (
-                  DefId(..),
-                  6,
-              ),
           ],
           has_self: true,
           has_late_bound_regions: Some(
