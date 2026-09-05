@@ -1,6 +1,7 @@
 //! Types and functions shared across tools in this workspace.
 
 pub mod ci;
+pub mod dep_info;
 pub mod drop_bomb;
 pub mod fs;
 pub mod git;
