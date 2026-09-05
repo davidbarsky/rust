@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::common::{Config, PassFailMode, TestMode};
 use crate::directives::{
-    DirectiveLine, NormalizeKind, NormalizeRule, TestProps, parse_and_update_aux,
+    ByteExpectation, DirectiveLine, NormalizeKind, NormalizeRule, TestProps, parse_and_update_aux,
     parse_edition_range, split_flags,
 };
 use crate::errors::ErrorKind;
@@ -146,6 +146,17 @@ fn make_directive_handlers_map() -> HashMap<&'static str, Handler> {
         }),
         handler(NO_PREFER_DYNAMIC, |config, ln, props| {
             config.set_name_directive(ln, NO_PREFER_DYNAMIC, &mut props.no_prefer_dynamic);
+        }),
+        handler(RUSTC_NOT_INVOKED, |config, ln, props| {
+            config.set_name_directive(ln, RUSTC_NOT_INVOKED, &mut props.rustc_not_invoked);
+        }),
+        handler(EXPECT_RMETA, |config, ln, props| {
+            config.set_name_value_directive(ln, EXPECT_RMETA, &mut props.expect_rmeta, |value| {
+                let value = value.trim();
+                value.parse::<ByteExpectation>().unwrap_or_else(|()| {
+                    panic!("`//@ {EXPECT_RMETA}` expects `same` or `different`, found `{value}`")
+                })
+            });
         }),
         handler(PRETTY_MODE, |config, ln, props| {
             if let Some(m) = config.parse_name_value_directive(ln, PRETTY_MODE) {

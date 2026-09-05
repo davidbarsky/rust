@@ -80,6 +80,32 @@ impl EarlyProps {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ByteExpectation {
+    Same,
+    Different,
+}
+
+impl std::str::FromStr for ByteExpectation {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "same" => Ok(Self::Same),
+            "different" => Ok(Self::Different),
+            _ => Err(()),
+        }
+    }
+}
+
+fn parse_revision_source(value: String) -> Utf8PathBuf {
+    let value = value.trim();
+    if value.is_empty() {
+        panic!("`//@ revision-source` expects a physical source path");
+    }
+    Utf8PathBuf::from(value)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TestProps {
     // Lines that should be expected, in order, on standard out
@@ -140,6 +166,7 @@ pub(crate) struct TestProps {
     pub(crate) forbid_output: Vec<String>,
     // Revisions to test for incremental compilation.
     pub(crate) revisions: Vec<String>,
+    pub(crate) test_revisions: Vec<String>,
     // Directory (if any) to use for incremental compilation.  This is
     // not set by end-users; rather it is set by the incremental
     // testing harness and used when generating compilation
@@ -160,6 +187,12 @@ pub(crate) struct TestProps {
     // empty before the test starts. Incremental mode tests will reuse the
     // incremental directory between passes in the same test.
     pub(crate) incremental: bool,
+    // Whether invoking rustc for this crate is a test failure.
+    pub(crate) rustc_not_invoked: bool,
+    pub(crate) expect_rmeta: Option<ByteExpectation>,
+    pub(crate) withhold_revision_cfg: bool,
+    pub(crate) revision_source: Option<Utf8PathBuf>,
+    pub(crate) revision_source_candidates: Vec<Utf8PathBuf>,
     // If `true`, this test is a known bug.
     //
     // When set, some requirements are relaxed. Currently, this only means no
@@ -256,6 +289,9 @@ mod directives {
     pub(crate) const ASSEMBLY_OUTPUT: &str = "assembly-output";
     pub(crate) const STDERR_PER_BITWIDTH: &str = "stderr-per-bitwidth";
     pub(crate) const INCREMENTAL: &str = "incremental";
+    pub(crate) const RUSTC_NOT_INVOKED: &str = "rustc-not-invoked";
+    pub(crate) const EXPECT_RMETA: &str = "expect-rmeta";
+    pub(crate) const REVISION_SOURCE: &str = "revision-source";
     pub(crate) const KNOWN_BUG: &str = "known-bug";
     pub(crate) const TEST_MIR_PASS: &str = "test-mir-pass";
     pub(crate) const REMAP_SRC_BASE: &str = "remap-src-base";
@@ -281,6 +317,7 @@ impl TestProps {
             pp_exact: None,
             aux: Default::default(),
             revisions: vec![],
+            test_revisions: vec![],
             rustc_env: vec![
                 ("RUSTC_ICE".to_string(), "0".to_string()),
                 ("RUST_BACKTRACE".to_string(), "short".to_string()),
@@ -301,6 +338,11 @@ impl TestProps {
             forbid_output: vec![],
             incremental_dir: None,
             incremental: false,
+            rustc_not_invoked: false,
+            expect_rmeta: None,
+            withhold_revision_cfg: false,
+            revision_source: None,
+            revision_source_candidates: vec![],
             known_bug: false,
             pass_fail_mode: None,
             no_pass_override: false,
@@ -340,14 +382,37 @@ impl TestProps {
         // copy over select properties to the aux build:
         props.incremental_dir = self.incremental_dir.clone();
         props.no_pass_override = true;
-        props.load_from(testfile, revision, config);
+        props.test_revisions = self.test_revisions.clone();
+        let file_contents =
+            if testfile.is_dir() { String::new() } else { fs::read_to_string(testfile).unwrap() };
+        let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
+        props.load_from(&file_directives, revision, config);
+        props.withhold_revision_cfg = file_directives.lines.iter().any(|line| {
+            (line.name == directives::RUSTC_NOT_INVOKED || line.name == directives::EXPECT_RMETA)
+                && props
+                    .test_revisions
+                    .iter()
+                    .any(|revision| line.applies_to_test_revision(Some(revision)))
+        });
 
         props
     }
 
     pub(crate) fn from_file(testfile: &Utf8Path, revision: Option<&str>, config: &Config) -> Self {
         let mut props = TestProps::new();
-        props.load_from(testfile, revision, config);
+        let file_contents =
+            if testfile.is_dir() { String::new() } else { fs::read_to_string(testfile).unwrap() };
+        let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
+        props.load_from(&file_directives, revision, config);
+        props.test_revisions = props.revisions.clone();
+        props.withhold_revision_cfg = config.mode == TestMode::Incremental
+            && file_directives.lines.iter().any(|line| {
+                line.name == directives::RUSTC_NOT_INVOKED
+                    && props
+                        .revisions
+                        .iter()
+                        .any(|revision| line.applies_to_test_revision(Some(revision)))
+            });
         props.exec_env.push(("RUSTC".to_string(), config.rustc_path.to_string()));
 
         // UI tests default to `//@ check-fail` if unspecified.
@@ -362,25 +427,38 @@ impl TestProps {
     /// tied to a particular revision `foo` (indicated by writing
     /// `//@[foo]`), then the property is ignored unless `test_revision` is
     /// `Some("foo")`.
-    fn load_from(&mut self, testfile: &Utf8Path, test_revision: Option<&str>, config: &Config) {
+    fn load_from(
+        &mut self,
+        file_directives: &FileDirectives<'_>,
+        test_revision: Option<&str>,
+        config: &Config,
+    ) {
+        let testfile = file_directives.path;
         if !testfile.is_dir() {
-            let file_contents = fs::read_to_string(testfile).unwrap();
-            let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
-
-            iter_directives(
-                config,
-                &file_directives,
-                // (dummy comment to force args into vertical layout)
-                &mut |ln: &DirectiveLine<'_>| {
-                    if !ln.applies_to_test_revision(test_revision) {
+            iter_directives(config, file_directives, &mut |line: &DirectiveLine<'_>| {
+                if line.name == directives::REVISION_SOURCE {
+                    let Some(source) = config
+                        .parse_name_value_directive(line, directives::REVISION_SOURCE)
+                        .map(parse_revision_source)
+                    else {
                         return;
+                    };
+                    self.revision_source_candidates.push(source.clone());
+                    if line.applies_to_test_revision(test_revision)
+                        && self.revision_source.is_none()
+                    {
+                        self.revision_source = Some(source);
                     }
+                    return;
+                }
 
-                    if let Some(handler) = DIRECTIVE_HANDLERS_MAP.get(ln.name) {
-                        handler.handle(config, ln, self);
-                    }
-                },
-            );
+                if !line.applies_to_test_revision(test_revision) {
+                    return;
+                }
+                if let Some(handler) = DIRECTIVE_HANDLERS_MAP.get(line.name) {
+                    handler.handle(config, line, self);
+                }
+            });
         }
 
         if config.mode == TestMode::Incremental {
@@ -410,7 +488,6 @@ impl TestProps {
         // to rustc last.
         self.compile_flags.insert(0, format!("--edition={edition}"));
     }
-
     fn update_pass_fail_mode(&mut self, ln: &DirectiveLine<'_>, config: &Config) {
         let name = ln.name;
         if config.mode != TestMode::Ui {

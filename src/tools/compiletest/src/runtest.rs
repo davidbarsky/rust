@@ -1,18 +1,29 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, create_dir_all};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::prelude::*;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::{env, fmt, io, iter, str};
 
-use build_helper::fs::remove_and_create_dir_all;
+use build_helper::dep_info::MakeDepInfo;
+use build_helper::fs::{ignore_not_found, recursive_remove, remove_and_create_dir_all};
 use camino::{Utf8Path, Utf8PathBuf};
 use colored::{Color, Colorize};
 use regex::{Captures, Regex};
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::*;
 
+use self::artifacts::{
+    ArtifactPath, ArtifactProvider, ArtifactSnapshot, AuxiliaryBuild, ProviderArtifacts,
+    ProviderDelta, ProviderDeltas, check_byte_expectations, logical_source_layout, should_rerun,
+};
 use crate::common::{
     CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TestMode, TestPaths,
     TestSuite, UI_EXTENSIONS, UI_FIXED, UI_RUN_STDERR, UI_RUN_STDOUT, UI_STDERR, UI_STDOUT, UI_SVG,
@@ -45,6 +56,7 @@ mod rustdoc_json;
 mod ui;
 // tidy-alphabetical-end
 
+mod artifacts;
 mod compute_diff;
 mod debugger;
 #[cfg(test)]
@@ -109,6 +121,35 @@ fn dylib_name(name: &str) -> String {
     format!("{}{name}.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION)
 }
 
+fn build_key<T: Hash + ?Sized>(identity: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn command_fingerprint(
+    command: &Command,
+    revision_source: Option<(&Utf8Path, &Utf8Path)>,
+) -> String {
+    let mut fingerprint = String::new();
+    for arg in command.get_args() {
+        let arg = match revision_source {
+            Some((physical, logical)) if arg == physical.as_os_str() => logical.as_os_str(),
+            Some(_) | None => arg,
+        };
+        fingerprint.push_str(&arg.to_string_lossy());
+        fingerprint.push('\0');
+    }
+    let mut envs: Vec<String> =
+        command.get_envs().map(|(key, value)| format!("{key:?}={value:?}")).collect();
+    envs.sort();
+    for env in envs {
+        fingerprint.push_str(&env);
+        fingerprint.push('\0');
+    }
+    fingerprint
+}
+
 pub(crate) fn run(
     config: &Config,
     stdout: &dyn ConsoleOut,
@@ -142,7 +183,16 @@ pub(crate) fn run(
         props.incremental_dir = Some(incremental_dir(&config, testpaths, variant));
     }
 
-    let cx = TestCx { config: &config, stdout, stderr, props: &props, testpaths, variant };
+    let aux_builds = RefCell::new(FxHashMap::default());
+    let cx = TestCx {
+        config: &config,
+        stdout,
+        stderr,
+        props: &props,
+        testpaths,
+        variant,
+        aux_builds: &aux_builds,
+    };
 
     if let Err(e) = create_dir_all(&cx.output_base_dir()) {
         panic!("failed to create output base directory {}: {e}", cx.output_base_dir());
@@ -159,6 +209,7 @@ pub(crate) fn run(
         for revision in &props.revisions {
             let mut revision_props = TestProps::from_file(&testpaths.file, Some(revision), &config);
             revision_props.incremental_dir = props.incremental_dir.clone();
+            let aux_builds = RefCell::new(FxHashMap::default());
             let rev_cx = TestCx {
                 config: &config,
                 stdout,
@@ -169,6 +220,7 @@ pub(crate) fn run(
                     revision: Some(revision.clone()),
                     debugger: variant.debugger,
                 },
+                aux_builds: &aux_builds,
             };
             rev_cx.run_revision();
         }
@@ -222,6 +274,7 @@ struct TestCx<'test> {
     props: &'test TestProps,
     testpaths: &'test TestPaths,
     variant: &'test TestVariant,
+    aux_builds: &'test RefCell<FxHashMap<(ArtifactProvider, Option<AuxType>), AuxiliaryBuild>>,
 }
 
 enum ReadFrom {
@@ -246,6 +299,7 @@ enum WillExecute {
 #[derive(Copy, Clone)]
 enum Emit {
     None,
+    LinkAndMetadata,
     Metadata,
     LlvmIr,
     Mir,
@@ -478,7 +532,9 @@ impl<'test> TestCx<'test> {
         // Otherwise the `--cfg` flag is not valid.
         let normalize_revision = |revision: &str| revision.to_lowercase().replace("-", "_");
 
-        if let Some(revision) = self.variant.revision() {
+        if let Some(revision) = self.variant.revision()
+            && !self.props.withhold_revision_cfg
+        {
             let normalized_revision = normalize_revision(revision);
             let cfg_arg = ["--cfg", &normalized_revision];
             let arg = format!("--cfg={normalized_revision}");
@@ -509,13 +565,18 @@ impl<'test> TestCx<'test> {
             // since it is extensively used in the testsuite, as well as the `test`
             // cfg since we have tests that uses it.
             check_cfg.push_str("cfg(test,FALSE");
-            for revision in &self.props.revisions {
-                check_cfg.push(',');
-                check_cfg.push_str(&normalize_revision(revision));
+            if !self.props.withhold_revision_cfg {
+                for revision in &self.props.revisions {
+                    check_cfg.push(',');
+                    check_cfg.push_str(&normalize_revision(revision));
+                }
             }
             check_cfg.push(')');
 
             cmd.args(&["--check-cfg", &check_cfg]);
+            if self.props.withhold_revision_cfg {
+                cmd.args(&["-D", "unexpected_cfgs"]);
+            }
         }
     }
 
@@ -956,6 +1017,7 @@ impl<'test> TestCx<'test> {
         let rustc = self.make_compile_args(
             compiler_kind,
             &self.testpaths.file,
+            None,
             output_file,
             emit,
             allow_unused,
@@ -995,6 +1057,7 @@ impl<'test> TestCx<'test> {
                     props: &props_for_aux,
                     testpaths: self.testpaths,
                     variant: self.variant,
+                    aux_builds: self.aux_builds,
                 };
                 // Create the directory for the stdout/stderr files.
                 create_dir_all(aux_cx.output_base_dir()).unwrap();
@@ -1251,6 +1314,17 @@ impl<'test> TestCx<'test> {
 
     fn aux_output_dir(&self) -> Utf8PathBuf {
         let aux_dir = self.aux_output_dir_name();
+        if self.config.mode == TestMode::Incremental {
+            create_dir_all(&aux_dir)
+                .unwrap_or_else(|e| panic!("failed to create output directory `{aux_dir}`: {e}"));
+            if !self.props.aux.bins.is_empty() {
+                let aux_bin_dir = self.aux_bin_output_dir_name();
+                create_dir_all(&aux_bin_dir).unwrap_or_else(|e| {
+                    panic!("failed to create output directory `{aux_bin_dir}`: {e}")
+                });
+            }
+            return aux_dir;
+        }
 
         if !self.props.aux.builds.is_empty() {
             remove_and_create_dir_all(&aux_dir).unwrap_or_else(|e| {
@@ -1271,13 +1345,29 @@ impl<'test> TestCx<'test> {
         aux_dir
     }
 
-    fn build_all_auxiliary(&self, aux_dir: &Utf8Path, rustc: &mut Command) {
+    fn build_all_auxiliary(&self, aux_dir: &Utf8Path, rustc: &mut Command) -> ProviderDeltas {
+        let mut provider_deltas = ProviderDeltas::default();
+
         for rel_ab in &self.props.aux.builds {
-            self.build_auxiliary(rel_ab, &aux_dir, None);
+            let AuxiliaryBuild { aux_type, provider, own_delta, transitive_deltas, rmeta_path: _ } =
+                self.build_auxiliary(rel_ab, &aux_dir, None);
+            match aux_type {
+                AuxType::Lib | AuxType::Dylib | AuxType::ProcMacro => {
+                    provider_deltas.extend(transitive_deltas.0);
+                    provider_deltas.extend([(provider, own_delta)]);
+                }
+                AuxType::Bin => {}
+            }
         }
 
         for rel_ab in &self.props.aux.bins {
-            self.build_auxiliary(rel_ab, &aux_dir, Some(AuxType::Bin));
+            let AuxiliaryBuild {
+                aux_type: _,
+                provider: _,
+                own_delta: _,
+                transitive_deltas: _,
+                rmeta_path: _,
+            } = self.build_auxiliary(rel_ab, &aux_dir, Some(AuxType::Bin));
         }
 
         let path_to_crate_name = |path: &str| -> String {
@@ -1291,7 +1381,8 @@ impl<'test> TestCx<'test> {
                           extern_modifiers: Option<&str>,
                           aux_name: &str,
                           aux_path: &str,
-                          aux_type: AuxType| {
+                          aux_type: AuxType,
+                          rmeta_path: Option<&Utf8Path>| {
             let lib_name =
                 get_lib_name(&path_to_crate_name(aux_path), aux_type, self.config.wasm_proc_macros);
             if let Some(lib_name) = lib_name {
@@ -1299,31 +1390,58 @@ impl<'test> TestCx<'test> {
                     Some(modifiers) => format!("{modifiers}:{aux_name}"),
                     None => aux_name.to_string(),
                 };
-                rustc.arg("--extern").arg(format!("{modifiers_and_name}={aux_dir}/{lib_name}"));
+                if let Some(rmeta_path) = rmeta_path {
+                    rustc.arg("--extern").arg(format!("{modifiers_and_name}={rmeta_path}"));
+                }
+                rustc
+                    .arg("--extern")
+                    .arg(format!("{modifiers_and_name}={}", aux_dir.join(lib_name)));
             }
         };
 
         for AuxCrate { extern_modifiers, name, path } in &self.props.aux.crates {
-            let aux_type = self.build_auxiliary(&path, &aux_dir, None);
-            add_extern(rustc, extern_modifiers.as_deref(), name, path, aux_type);
+            let AuxiliaryBuild { aux_type, provider, own_delta, transitive_deltas, rmeta_path } =
+                self.build_auxiliary(&path, &aux_dir, None);
+            match aux_type {
+                AuxType::Lib | AuxType::Dylib | AuxType::ProcMacro => {
+                    provider_deltas.extend(transitive_deltas.0);
+                    provider_deltas.extend([(provider, own_delta)]);
+                }
+                AuxType::Bin => {}
+            }
+            add_extern(
+                rustc,
+                extern_modifiers.as_deref(),
+                name,
+                path,
+                aux_type,
+                rmeta_path.as_deref(),
+            );
         }
 
         for proc_macro in &self.props.aux.proc_macros {
-            self.build_auxiliary(&proc_macro.path, &aux_dir, Some(AuxType::ProcMacro));
+            let AuxiliaryBuild { aux_type, provider, own_delta, transitive_deltas, rmeta_path } =
+                self.build_auxiliary(&proc_macro.path, &aux_dir, Some(AuxType::ProcMacro));
+            provider_deltas.extend(transitive_deltas.0);
+            provider_deltas.extend([(provider, own_delta)]);
             let crate_name = path_to_crate_name(&proc_macro.path);
             add_extern(
                 rustc,
                 proc_macro.extern_modifiers.as_deref(),
                 &crate_name,
                 &proc_macro.path,
-                AuxType::ProcMacro,
+                aux_type,
+                rmeta_path.as_deref(),
             );
         }
 
         // Build any `//@ aux-codegen-backend`, and pass the resulting library
         // to `-Zcodegen-backend` when compiling the test file.
         if let Some(aux_file) = &self.props.aux.codegen_backend {
-            let aux_type = self.build_auxiliary(aux_file, aux_dir, None);
+            let AuxiliaryBuild { aux_type, provider, own_delta, transitive_deltas, rmeta_path: _ } =
+                self.build_auxiliary(aux_file, aux_dir, None);
+            provider_deltas.extend(transitive_deltas.0);
+            provider_deltas.extend([(provider, own_delta)]);
             if let Some(lib_name) = get_lib_name(
                 aux_file.trim_end_matches(".rs"),
                 aux_type,
@@ -1333,6 +1451,22 @@ impl<'test> TestCx<'test> {
                 rustc.arg(format!("-Zcodegen-backend={}", lib_path));
             }
         }
+
+        provider_deltas
+    }
+
+    fn dep_info_path(&self, build_key: u64) -> Utf8PathBuf {
+        self.props.incremental_dir.as_ref().unwrap().join(format!("dep-info-{build_key:016x}.d"))
+    }
+
+    fn dep_info(&self, build_key: u64) -> MakeDepInfo {
+        let dep_info_path = self.dep_info_path(build_key);
+        let dep_info = fs::read_to_string(&dep_info_path).unwrap_or_else(|err| {
+            self.fatal(&format!("failed to read dependency information `{dep_info_path}`: {err}"))
+        });
+        dep_info.parse::<MakeDepInfo>().unwrap_or_else(|err| {
+            self.fatal(&format!("failed to parse dependency information `{dep_info_path}`: {err}"))
+        })
     }
 
     /// `root_testpaths` refers to the path of the original test. the auxiliary and the test with an
@@ -1345,16 +1479,81 @@ impl<'test> TestCx<'test> {
         }
 
         let aux_dir = self.aux_output_dir();
-        self.build_all_auxiliary(&aux_dir, &mut rustc);
+        let provider_deltas = self.build_all_auxiliary(&aux_dir, &mut rustc);
 
         rustc.envs(self.props.rustc_env.clone());
         self.props.unset_rustc_env.iter().fold(&mut rustc, Command::env_remove);
-        self.compose_and_run(
+        let build_key = build_key(self.testpaths.file.as_path());
+        let validation = self.validation_path(build_key);
+        let command = command_fingerprint(&rustc, None);
+
+        if self.props.rustc_not_invoked {
+            let rerun = should_rerun(&provider_deltas, &self.dep_info(build_key))
+                .unwrap_or_else(|message| self.fatal(&message));
+            if !rerun && self.validated_by_previous_revision(validation.as_deref(), &command) {
+                self.record_validation(validation.as_deref(), &command);
+                return ProcRes {
+                    status: ExitStatus::from_raw(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    truncated: Truncated::No,
+                    cmdline: "rustc invocation skipped because observed artifacts are unchanged"
+                        .to_owned(),
+                };
+            }
+            self.fatal(&format!("rustc was invoked for `{}`", self.testpaths.file));
+        }
+
+        self.clear_validation(validation.as_deref());
+        let proc_res = self.compose_and_run(
             rustc,
             self.config.host_compile_lib_path.as_path(),
             Some(aux_dir.as_path()),
             input,
-        )
+        );
+        if proc_res.status.success() {
+            self.record_validation(validation.as_deref(), &command);
+        }
+        proc_res
+    }
+
+    fn validation_path(&self, build_key: u64) -> Option<Utf8PathBuf> {
+        (self.config.mode == TestMode::Incremental).then(|| {
+            self.props
+                .incremental_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("snapshot-{build_key:016x}.validation"))
+        })
+    }
+
+    fn validated_by_previous_revision(&self, validation: Option<&Utf8Path>, command: &str) -> bool {
+        let (Some(validation), Some(current)) = (validation, self.variant.revision()) else {
+            return false;
+        };
+        let Some(position) = self.props.test_revisions.iter().position(|r| r == current) else {
+            return false;
+        };
+        let Some(previous) = position.checked_sub(1).map(|p| &self.props.test_revisions[p]) else {
+            return false;
+        };
+        fs::read_to_string(validation).ok() == Some(format!("{previous}\n{command}"))
+    }
+
+    fn record_validation(&self, validation: Option<&Utf8Path>, command: &str) {
+        let (Some(validation), Some(current)) = (validation, self.variant.revision()) else {
+            return;
+        };
+        fs::write(validation, format!("{current}\n{command}"))
+            .unwrap_or_else(|err| self.fatal(&format!("failed to snapshot `{validation}`: {err}")));
+    }
+
+    fn clear_validation(&self, validation: Option<&Utf8Path>) {
+        let Some(validation) = validation else {
+            return;
+        };
+        ignore_not_found(|| fs::remove_file(validation))
+            .unwrap_or_else(|err| self.fatal(&format!("failed to snapshot `{validation}`: {err}")));
     }
 
     /// Builds `minicore`. Returns the path to the minicore rlib within the base test output
@@ -1364,6 +1563,7 @@ impl<'test> TestCx<'test> {
         let mut rustc = self.make_compile_args(
             CompilerKind::Rustc,
             &self.config.minicore_path,
+            None,
             TargetLocation::ThisFile(output_file_path.clone()),
             Emit::None,
             AllowUnused::Yes,
@@ -1395,8 +1595,23 @@ impl<'test> TestCx<'test> {
         source_path: &str,
         aux_dir: &Utf8Path,
         aux_type: Option<AuxType>,
-    ) -> AuxType {
+    ) -> AuxiliaryBuild {
         let aux_path = self.resolve_aux_path(source_path);
+        let mut aux_dir = aux_dir.to_path_buf();
+        if aux_type == Some(AuxType::Bin) {
+            // On unix, the binary of `auxiliary/foo.rs` will be named
+            // `auxiliary/foo` which clashes with the _dir_ `auxiliary/foo`, so
+            // put bins in a `bin` subfolder.
+            aux_dir.push("bin");
+        }
+        let provider = ArtifactProvider { source: aux_path.clone(), out_dir: aux_dir.clone() };
+        let memo_key = (provider.clone(), aux_type);
+        if self.config.mode == TestMode::Incremental
+            && let Some(build) = self.aux_builds.borrow().get(&memo_key).cloned()
+        {
+            return build;
+        }
+        let build_key = build_key(&memo_key);
         let mut aux_props =
             self.props.from_aux_file(&aux_path, self.variant.revision(), self.config);
         if aux_type == Some(AuxType::ProcMacro) {
@@ -1422,13 +1637,21 @@ impl<'test> TestCx<'test> {
                 aux_props.force_host = true;
             }
         }
-        let mut aux_dir = aux_dir.to_path_buf();
-        if aux_type == Some(AuxType::Bin) {
-            // On unix, the binary of `auxiliary/foo.rs` will be named
-            // `auxiliary/foo` which clashes with the _dir_ `auxiliary/foo`, so
-            // put bins in a `bin` subfolder.
-            aux_dir.push("bin");
-        }
+        let source_root = aux_path.parent().expect("auxiliary source file has no parent");
+        let input_path = match &aux_props.revision_source {
+            Some(revision_source) => source_root.join(revision_source),
+            None => aux_path.clone(),
+        };
+        let emits_metadata = self.config.mode == TestMode::Incremental
+            && !aux_props
+                .compile_flags
+                .iter()
+                .any(|flag| flag == "--emit" || flag.starts_with("--emit="));
+        let crate_name = source_path
+            .rsplit_once('/')
+            .map_or(source_path, |(_, tail)| tail)
+            .trim_end_matches(".rs")
+            .replace('-', "_");
         let aux_output = TargetLocation::ThisDirectory(aux_dir.clone());
         let aux_cx = TestCx {
             config: self.config,
@@ -1437,20 +1660,26 @@ impl<'test> TestCx<'test> {
             props: &aux_props,
             testpaths: self.testpaths,
             variant: self.variant,
+            aux_builds: self.aux_builds,
         };
         // Create the directory for the stdout/stderr files.
         create_dir_all(aux_cx.output_base_dir()).unwrap();
         let mut aux_rustc = aux_cx.make_compile_args(
             // Always use `rustc` for aux crates, even in rustdoc tests.
             CompilerKind::Rustc,
-            &aux_path,
+            &input_path,
+            Some(build_key),
             aux_output,
-            Emit::None,
+            if emits_metadata { Emit::LinkAndMetadata } else { Emit::None },
             AllowUnused::No,
             LinkToAux::No,
             Vec::new(),
         );
-        aux_cx.build_all_auxiliary(&aux_dir, &mut aux_rustc);
+        for revision_source in &aux_props.revision_source_candidates {
+            let physical_source = source_root.join(revision_source);
+            aux_rustc.arg(format!("--remap-path-prefix={physical_source}={aux_path}"));
+        }
+        let transitive_deltas = aux_cx.build_all_auxiliary(&aux_dir, &mut aux_rustc);
 
         aux_rustc.envs(aux_props.rustc_env.clone());
         for key in &aux_props.unset_rustc_env {
@@ -1474,7 +1703,8 @@ impl<'test> TestCx<'test> {
             || self.is_vxworks_pure_static()
             || self.config.target.contains("bpf")
             || !self.config.target_cfg().dynamic_linking
-            || matches!(self.config.mode, TestMode::CoverageMap | TestMode::CoverageRun)
+            || self.config.mode == TestMode::CoverageMap
+            || self.config.mode == TestMode::CoverageRun
         {
             // We primarily compile all auxiliary libraries as dynamic libraries
             // to avoid code size bloat and large binaries as much as possible
@@ -1497,6 +1727,9 @@ impl<'test> TestCx<'test> {
         if let Some(crate_type) = crate_type {
             aux_rustc.args(&["--crate-type", crate_type]);
         }
+        if aux_props.revision_source.is_some() {
+            aux_rustc.args(&["--crate-name", &crate_name]);
+        }
 
         if aux_type == AuxType::ProcMacro {
             // For convenience, but this only works on 2018.
@@ -1511,26 +1744,219 @@ impl<'test> TestCx<'test> {
             aux_rustc.arg(&format!("minicore={}", minicore_path));
         }
 
-        let auxres = aux_cx.compose_and_run(
-            aux_rustc,
-            aux_cx.config.host_compile_lib_path.as_path(),
-            Some(aux_dir.as_path()),
-            None,
+        let inputs_snapshot = (self.config.mode == TestMode::Incremental).then(|| {
+            self.props
+                .incremental_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("snapshot-{build_key:016x}.inputs"))
+        });
+        let validation = self.validation_path(build_key);
+        let command = command_fingerprint(
+            &aux_rustc,
+            aux_props.revision_source.as_ref().map(|_| (input_path.as_path(), aux_path.as_path())),
         );
-        if !auxres.status.success() {
-            if !aux_props.error_patterns.is_empty() || !aux_props.regex_error_patterns.is_empty() {
-                aux_cx.check_correct_failure_status(&auxres);
-                aux_cx.check_all_error_patterns(&aux_cx.get_output(&auxres), &auxres);
-                self.fatal(&format!(
-                    "auxiliary build of {aux_path} failed with expected diagnostics"
-                ));
+        let provider_artifacts = match (emits_metadata, aux_type) {
+            (true, AuxType::Lib | AuxType::Dylib) => {
+                let link = get_lib_name(&crate_name, aux_type, self.config.wasm_proc_macros)
+                    .expect("library auxiliaries have a linked artifact");
+                let snapshot_root = self.props.incremental_dir.as_ref().unwrap();
+                Some(ProviderArtifacts {
+                    rmeta: aux_dir.join(format!("lib{crate_name}.rmeta")),
+                    snapshot_rmeta: snapshot_root.join(format!("snapshot-{build_key:016x}.rmeta")),
+                    link: aux_dir.join(link),
+                    snapshot_link: snapshot_root.join(format!("snapshot-{build_key:016x}.link")),
+                })
             }
-            self.fatal_proc_rec(
-                &format!("auxiliary build of {aux_path} failed to compile:"),
-                &auxres,
-            );
+            (true, AuxType::Bin | AuxType::ProcMacro) | (false, _) => None,
+        };
+
+        let mut expectations = Vec::new();
+        match (&provider_artifacts, aux_props.expect_rmeta) {
+            (Some(provider_artifacts), Some(expectation)) => {
+                expectations
+                    .push((ArtifactPath::Rmeta(provider_artifacts.rmeta.clone()), expectation));
+            }
+            (None, Some(_)) => self.fatal(&format!(
+                "`//@ expect-rmeta` on `{input_path}` requires an incremental-mode library \
+                 auxiliary without its own `--emit`"
+            )),
+            (Some(_), None) | (None, None) => {}
         }
-        aux_type
+
+        let tracked = provider_artifacts.as_ref().map(|provider_artifacts| {
+            [
+                (
+                    ArtifactPath::Rmeta(provider_artifacts.rmeta.clone()),
+                    &provider_artifacts.snapshot_rmeta,
+                ),
+                (
+                    ArtifactPath::Link(provider_artifacts.link.clone()),
+                    &provider_artifacts.snapshot_link,
+                ),
+            ]
+        });
+        let mut previous = ArtifactSnapshot::default();
+        for (artifact, snapshot) in tracked.iter().flatten() {
+            match fs::read(snapshot) {
+                Ok(bytes) => {
+                    previous.0.insert(artifact.clone(), bytes);
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    aux_cx.fatal(&format!("failed to read artifact snapshot `{snapshot}`: {err}"))
+                }
+            }
+        }
+
+        let skip = if aux_props.rustc_not_invoked {
+            let dep_info = aux_cx.dep_info(build_key);
+            let rerun = should_rerun(&transitive_deltas, &dep_info)
+                .unwrap_or_else(|message| self.fatal(&message));
+            if rerun || !self.validated_by_previous_revision(validation.as_deref(), &command) {
+                self.fatal(&format!("rustc was invoked for `{input_path}`"));
+            }
+            if let Some(inputs_snapshot) = &inputs_snapshot {
+                let layout = logical_source_layout(
+                    &dep_info,
+                    source_root,
+                    &aux_props.revision_source_candidates,
+                    &aux_path,
+                )
+                .unwrap_or_else(|message| aux_cx.fatal(&message));
+                let crate_name =
+                    aux_path.file_name().expect("auxiliary source file has a file name");
+                for (logical, physical) in &layout {
+                    let physical = if logical == crate_name { &input_path } else { physical };
+                    let current = fs::read(physical).unwrap_or_else(|err| {
+                        aux_cx.fatal(&format!("failed to read own input `{physical}`: {err}"))
+                    });
+                    let snapshot = inputs_snapshot.join(logical);
+                    let snapshot = fs::read(&snapshot).unwrap_or_else(|err| {
+                        aux_cx.fatal(&format!("failed to read input snapshot `{snapshot}`: {err}"))
+                    });
+                    if current != snapshot {
+                        self.fatal(&format!(
+                            "`//@ rustc-not-invoked` on `{aux_path}`, but its own input `{logical}` \
+                             changed since the previous build"
+                        ));
+                    }
+                }
+            }
+            self.record_validation(validation.as_deref(), &command);
+            true
+        } else {
+            false
+        };
+
+        let own_delta = if skip {
+            if let Err(message) = check_byte_expectations(&expectations, &previous, &previous) {
+                aux_cx.fatal(&message);
+            }
+            ProviderDelta::Measured(FxHashSet::default())
+        } else {
+            self.clear_validation(validation.as_deref());
+            let auxres = aux_cx.compose_and_run(
+                aux_rustc,
+                aux_cx.config.host_compile_lib_path.as_path(),
+                Some(aux_dir.as_path()),
+                None,
+            );
+            if !auxres.status.success() {
+                if !aux_props.error_patterns.is_empty()
+                    || !aux_props.regex_error_patterns.is_empty()
+                {
+                    aux_cx.check_correct_failure_status(&auxres);
+                    aux_cx.check_all_error_patterns(&aux_cx.get_output(&auxres), &auxres);
+                    self.fatal(&format!(
+                        "auxiliary build of {input_path} failed with expected diagnostics"
+                    ));
+                }
+                self.fatal_proc_rec(
+                    &format!("auxiliary build of {input_path} failed to compile:"),
+                    &auxres,
+                );
+            }
+
+            if let Some(inputs_snapshot) = &inputs_snapshot {
+                let layout = logical_source_layout(
+                    &aux_cx.dep_info(build_key),
+                    source_root,
+                    &aux_props.revision_source_candidates,
+                    &aux_path,
+                )
+                .unwrap_or_else(|message| aux_cx.fatal(&message));
+                ignore_not_found(|| recursive_remove(inputs_snapshot)).unwrap_or_else(|err| {
+                    aux_cx.fatal(&format!(
+                        "failed to clear input snapshot `{inputs_snapshot}`: {err}"
+                    ))
+                });
+                for (logical, physical) in &layout {
+                    let staged = inputs_snapshot.join(logical);
+                    if let Some(parent) = staged.parent() {
+                        create_dir_all(parent).unwrap_or_else(|err| {
+                            aux_cx.fatal(&format!("failed to create `{parent}`: {err}"))
+                        });
+                    }
+                    fs::copy(physical, &staged).unwrap_or_else(|err| {
+                        aux_cx
+                            .fatal(&format!("failed to snapshot `{physical}` as `{staged}`: {err}"))
+                    });
+                }
+            }
+            self.record_validation(validation.as_deref(), &command);
+
+            match &provider_artifacts {
+                Some(provider_artifacts) => {
+                    let tracked = [
+                        (
+                            ArtifactPath::Rmeta(provider_artifacts.rmeta.clone()),
+                            &provider_artifacts.snapshot_rmeta,
+                        ),
+                        (
+                            ArtifactPath::Link(provider_artifacts.link.clone()),
+                            &provider_artifacts.snapshot_link,
+                        ),
+                    ];
+                    let mut current = ArtifactSnapshot::default();
+                    for (artifact, _) in &tracked {
+                        let path = AsRef::<Utf8Path>::as_ref(artifact);
+                        let bytes = fs::read(path).unwrap_or_else(|err| {
+                            aux_cx.fatal(&format!("failed to read artifact `{path}`: {err}"))
+                        });
+                        current.0.insert(artifact.clone(), bytes);
+                    }
+
+                    let own_delta = current.changed_paths_since(&previous);
+                    if let Err(message) =
+                        check_byte_expectations(&expectations, &previous, &current)
+                    {
+                        aux_cx.fatal(&message);
+                    }
+
+                    for (artifact, snapshot) in &tracked {
+                        fs::write(snapshot, &current.0[artifact]).unwrap_or_else(|err| {
+                            aux_cx.fatal(&format!(
+                                "failed to write artifact snapshot `{snapshot}`: {err}"
+                            ))
+                        });
+                    }
+
+                    ProviderDelta::Measured(own_delta)
+                }
+                None => ProviderDelta::Unmeasured,
+            }
+        };
+
+        let rmeta_path = match provider_artifacts {
+            Some(provider_artifacts) => Some(provider_artifacts.rmeta),
+            None => None,
+        };
+        let build = AuxiliaryBuild { aux_type, provider, own_delta, transitive_deltas, rmeta_path };
+        if self.config.mode == TestMode::Incremental {
+            self.aux_builds.borrow_mut().insert(memo_key, build.clone());
+        }
+        build
     }
 
     fn read2_abbreviated(&self, child: Child) -> (Output, Truncated) {
@@ -1637,6 +2063,7 @@ impl<'test> TestCx<'test> {
         &self,
         compiler_kind: CompilerKind,
         input_file: &Utf8Path,
+        dep_info_key: Option<u64>,
         output_file: TargetLocation,
         emit: Emit,
         allow_unused: AllowUnused,
@@ -1727,6 +2154,25 @@ impl<'test> TestCx<'test> {
             if let Some(ref incremental_dir) = self.props.incremental_dir {
                 compiler.args(&["-C", &format!("incremental={}", incremental_dir)]);
                 compiler.args(&["-Z", "incremental-verify-ich"]);
+            }
+            if self.config.mode == TestMode::Incremental {
+                compiler.arg("-Zbinary-dep-depinfo");
+                if !self
+                    .props
+                    .compile_flags
+                    .iter()
+                    .any(|flag| flag == "--emit" || flag.starts_with("--emit="))
+                {
+                    let output = match emit {
+                        Emit::None => "link",
+                        Emit::LinkAndMetadata => "link,metadata",
+                        Emit::Metadata => "metadata",
+                        Emit::LlvmIr | Emit::Mir | Emit::Asm | Emit::LinkArgsAsm => {
+                            unreachable!("incremental tests only emit linked or metadata artifacts")
+                        }
+                    };
+                    compiler.arg(format!("--emit={output}"));
+                }
             }
 
             if self.config.mode == TestMode::CodegenUnits {
@@ -1894,7 +2340,7 @@ impl<'test> TestCx<'test> {
 
         if compiler_kind == CompilerKind::Rustc {
             match emit {
-                Emit::None => {}
+                Emit::None | Emit::LinkAndMetadata => {}
                 Emit::Metadata => {
                     compiler.args(&["--emit", "metadata"]);
                 }
@@ -2023,6 +2469,13 @@ impl<'test> TestCx<'test> {
         }
 
         compiler.args(&self.props.compile_flags);
+
+        if compiler_kind == CompilerKind::Rustc && self.config.mode == TestMode::Incremental {
+            compiler.arg(format!(
+                "--emit=dep-info={}",
+                self.dep_info_path(dep_info_key.unwrap_or_else(|| build_key(input_file)))
+            ));
+        }
 
         compiler
     }
@@ -2244,6 +2697,7 @@ impl<'test> TestCx<'test> {
         let rustc = self.make_compile_args(
             CompilerKind::Rustc,
             input_file,
+            None,
             TargetLocation::ThisFile(output_path.clone()),
             Emit::LlvmIr,
             AllowUnused::No,
@@ -3085,6 +3539,7 @@ impl<'test> TestCx<'test> {
             fs::remove_dir_all(canonicalized).unwrap();
         }
         fs::create_dir_all(&incremental_dir).unwrap();
+        ignore_not_found(|| recursive_remove(self.aux_output_dir_name())).unwrap();
 
         if self.config.verbose {
             writeln!(self.stdout, "init_incremental_test: incremental_dir={incremental_dir}");
@@ -3150,7 +3605,7 @@ enum LinkToAux {
     No,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum AuxType {
     Bin,
     Lib,

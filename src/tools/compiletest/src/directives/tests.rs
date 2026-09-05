@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
 
 use crate::common::{Config, Debugger, TestMode};
 use crate::directives::{
-    self, AuxProps, DIRECTIVE_HANDLERS_MAP, DirectivesCache, EarlyProps, Edition, EditionRange,
-    FileDirectives, KNOWN_DIRECTIVE_NAMES_SET, LineNumber, TestProps, extract_llvm_version,
-    extract_version_range, line_directive, parse_edition, parse_normalize_rule,
+    self, AuxProps, ByteExpectation, DIRECTIVE_HANDLERS_MAP, DirectivesCache, EarlyProps, Edition,
+    EditionRange, FileDirectives, KNOWN_DIRECTIVE_NAMES_SET, LineNumber, TestProps,
+    extract_llvm_version, extract_version_range, line_directive, parse_edition,
+    parse_normalize_rule,
 };
 use crate::executor::{CollectedTestDesc, ShouldFail, TestVariant};
 
@@ -348,6 +349,19 @@ fn revisions() {
 }
 
 #[test]
+fn rustc_not_invoked() {
+    let config = cfg().mode("incremental").build();
+    let line =
+        line_directive(Utf8Path::new("auxiliary/b.rs"), LineNumber::ZERO, "//@ rustc-not-invoked")
+            .unwrap();
+    let mut props = TestProps::new();
+
+    DIRECTIVE_HANDLERS_MAP["rustc-not-invoked"].handle(&config, &line, &mut props);
+
+    assert!(props.rustc_not_invoked);
+}
+
+#[test]
 fn should_fail_with_message() {
     let config = cfg().build();
     let line = line_directive(
@@ -361,6 +375,54 @@ fn should_fail_with_message() {
     DIRECTIVE_HANDLERS_MAP["should-fail"].handle(&config, &line, &mut props);
 
     assert!(props.should_fail);
+}
+
+#[test]
+fn byte_expectations_are_revision_scoped() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] expect-rmeta: different
+//@ [bpass2] expect-rmeta: same
+"#,
+    );
+
+    for (revision, rmeta) in
+        [("bpass1", ByteExpectation::Different), ("bpass2", ByteExpectation::Same)]
+    {
+        let mut props = TestProps::new();
+        crate::directives::iter_directives(&config, &file_directives, &mut |line| {
+            if line.applies_to_test_revision(Some(revision)) {
+                DIRECTIVE_HANDLERS_MAP[line.name].handle(&config, line, &mut props);
+            }
+        });
+
+        assert_eq!(props.expect_rmeta, Some(rmeta));
+    }
+}
+
+#[test]
+fn revision_source_is_revision_scoped() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] revision-source: a_first.rs
+//@ [bpass2] revision-source: a_second.rs
+"#,
+    );
+
+    for (revision, expected) in [("bpass1", "a_first.rs"), ("bpass2", "a_second.rs")] {
+        let mut props = TestProps::new();
+        props.load_from(&file_directives, Some(revision), &config);
+
+        assert_eq!(props.revision_source.as_deref(), Some(Utf8Path::new(expected)));
+        assert_eq!(
+            props.revision_source_candidates,
+            vec![Utf8PathBuf::from("a_first.rs"), Utf8PathBuf::from("a_second.rs")]
+        );
+    }
 }
 
 #[test]

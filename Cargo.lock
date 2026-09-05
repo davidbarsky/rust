@@ -871,6 +871,7 @@ dependencies = [
  "miropt-test-tools",
  "rayon",
  "regex",
+ "rustc-hash 2.1.1",
  "rustfix",
  "semver",
  "serde",
