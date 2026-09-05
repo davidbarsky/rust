@@ -1,4 +1,7 @@
 use std::collections::hash_map::Entry;
+use std::process::Command;
+use std::str::FromStr;
+use std::{fmt, fs};
 
 use build_helper::dep_info::MakeDepInfo;
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
@@ -11,6 +14,143 @@ use crate::runtest::AuxType;
 mod tests;
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommandFingerprint(String);
+
+impl CommandFingerprint {
+    pub(crate) fn from_command(
+        command: &Command,
+        revision_source: Option<(&Utf8Path, &Utf8Path)>,
+    ) -> Self {
+        let mut fingerprint = String::new();
+        for arg in command.get_args() {
+            let arg = match revision_source {
+                Some((physical, logical)) if arg == physical.as_os_str() => logical.as_os_str(),
+                Some(_) | None => arg,
+            };
+            fingerprint.push_str(&arg.to_string_lossy());
+            fingerprint.push('\0');
+        }
+        let mut envs: Vec<String> =
+            command.get_envs().map(|(key, value)| format!("{key:?}={value:?}")).collect();
+        envs.sort();
+        for env in envs {
+            fingerprint.push_str(&env);
+            fingerprint.push('\0');
+        }
+        Self(fingerprint)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BuildRecord {
+    pub(crate) revision: String,
+    pub(crate) command: CommandFingerprint,
+}
+
+impl FromStr for BuildRecord {
+    type Err = ();
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let (revision, command) = input.split_once('\n').ok_or(())?;
+        Ok(Self { revision: revision.to_owned(), command: CommandFingerprint(command.to_owned()) })
+    }
+}
+
+impl fmt::Display for BuildRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}\n{}", self.revision, self.command.0)
+    }
+}
+
+pub(crate) struct RevisionInputs<'a> {
+    pub(crate) source_root: &'a Utf8Path,
+    pub(crate) revision_source_candidates: &'a [Utf8PathBuf],
+    pub(crate) crate_source: &'a Utf8Path,
+    pub(crate) input_path: &'a Utf8Path,
+    pub(crate) snapshot_root: &'a Utf8Path,
+}
+
+pub(crate) struct ReuseRequest<'a> {
+    pub(crate) current_revision: Option<&'a str>,
+    pub(crate) previous_revision: Option<&'a str>,
+    pub(crate) command: &'a CommandFingerprint,
+    pub(crate) inputs: Option<RevisionInputs<'a>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReusePlan {
+    record: BuildRecord,
+}
+
+impl ReusePlan {
+    pub(crate) fn into_record(self) -> BuildRecord {
+        self.record
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum BuildPlan {
+    Invoke,
+    Reuse(ReusePlan),
+}
+
+impl BuildPlan {
+    pub(crate) fn parse(
+        record: Option<BuildRecord>,
+        dep_info: MakeDepInfo,
+        provider_deltas: &ProviderDeltas,
+        request: ReuseRequest<'_>,
+    ) -> Result<Self, String> {
+        if should_rerun(provider_deltas, &dep_info)? {
+            return Ok(Self::Invoke);
+        }
+        let ReuseRequest { current_revision, previous_revision, command, inputs } = request;
+        let (Some(record), Some(previous_revision), Some(current_revision)) =
+            (record, previous_revision, current_revision)
+        else {
+            return Ok(Self::Invoke);
+        };
+        if record.revision != previous_revision || record.command != *command {
+            return Ok(Self::Invoke);
+        }
+        if let Some(RevisionInputs {
+            source_root,
+            revision_source_candidates,
+            crate_source,
+            input_path,
+            snapshot_root,
+        }) = inputs
+        {
+            let layout = logical_source_layout(
+                &dep_info,
+                source_root,
+                revision_source_candidates,
+                crate_source,
+            )?;
+            let crate_name =
+                crate_source.file_name().expect("auxiliary source file has a file name");
+            for (logical, physical) in &layout {
+                let physical = if logical == crate_name { input_path } else { physical };
+                let current = fs::read(physical)
+                    .map_err(|err| format!("failed to read own input `{physical}`: {err}"))?;
+                let snapshot = snapshot_root.join(logical);
+                let snapshot = fs::read(&snapshot)
+                    .map_err(|err| format!("failed to read input snapshot `{snapshot}`: {err}"))?;
+                if current != snapshot {
+                    return Err(format!(
+                        "`//@ rustc-not-invoked` on `{crate_source}`, but its own input `{logical}` \
+                         changed since the previous build"
+                    ));
+                }
+            }
+        }
+        Ok(Self::Reuse(ReusePlan {
+            record: BuildRecord { revision: current_revision.to_owned(), command: record.command },
+        }))
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ArtifactProvider {

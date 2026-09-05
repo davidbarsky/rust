@@ -1,6 +1,231 @@
 use crate::runtest::artifacts::*;
 
 #[test]
+fn build_records_preserve_the_complete_command_fingerprint() {
+    let record = BuildRecord {
+        revision: "bpass1".to_owned(),
+        command: CommandFingerprint("--cfg\0feature=\"first\nsecond\"\0λ\0".to_owned()),
+    };
+
+    assert_eq!(record.to_string().parse::<BuildRecord>(), Ok(record));
+    for record in ["", "bpass1", "bpass1\0command"] {
+        assert_eq!(record.parse::<BuildRecord>(), Err(()));
+    }
+    let record =
+        BuildRecord { revision: "bpass1".to_owned(), command: CommandFingerprint(String::new()) };
+    assert_eq!(record.to_string().parse::<BuildRecord>(), Ok(record));
+}
+
+#[test]
+fn command_fingerprints_use_logical_sources_and_ordered_environment_changes() {
+    let mut first = Command::new("rustc");
+    first.arg("auxiliary/first.rs").arg("--crate-type=rlib");
+    first.env("COMPILETEST_B", "two").env_remove("COMPILETEST_A");
+    let mut second = Command::new("rustc");
+    second.arg("auxiliary/second.rs").arg("--crate-type=rlib");
+    second.env_remove("COMPILETEST_A").env("COMPILETEST_B", "two");
+    let first = CommandFingerprint::from_command(
+        &first,
+        Some((Utf8Path::new("auxiliary/first.rs"), Utf8Path::new("auxiliary/provider.rs"))),
+    );
+    let second_fingerprint = CommandFingerprint::from_command(
+        &second,
+        Some((Utf8Path::new("auxiliary/second.rs"), Utf8Path::new("auxiliary/provider.rs"))),
+    );
+    assert_eq!(first, second_fingerprint);
+    assert_ne!(first, CommandFingerprint::from_command(&second, None));
+
+    second.env("COMPILETEST_A", "one");
+    assert_ne!(
+        first,
+        CommandFingerprint::from_command(
+            &second,
+            Some((Utf8Path::new("auxiliary/second.rs"), Utf8Path::new("auxiliary/provider.rs"))),
+        )
+    );
+    second.env_remove("COMPILETEST_A").arg("--cfg=changed");
+    assert_ne!(
+        first,
+        CommandFingerprint::from_command(
+            &second,
+            Some((Utf8Path::new("auxiliary/second.rs"), Utf8Path::new("auxiliary/provider.rs"))),
+        )
+    );
+}
+
+#[test]
+fn reuse_requires_a_matching_record_from_the_immediate_predecessor() {
+    let command = CommandFingerprint("--crate-type=rlib\0".to_owned());
+    for (record, current_revision, previous_revision) in [
+        (None, Some("bpass2"), Some("bpass1")),
+        (Some("malformed"), Some("bpass2"), Some("bpass1")),
+        (Some("bpass0\n--crate-type=rlib\0"), Some("bpass2"), Some("bpass1")),
+        (Some("bpass2\n--crate-type=rlib\0"), Some("bpass2"), Some("bpass1")),
+        (Some("bpass1\n--crate-type=dylib\0"), Some("bpass2"), Some("bpass1")),
+        (Some("bpass1\n--crate-type=rlib\0"), Some("bpass1"), None),
+        (Some("bpass1\n--crate-type=rlib\0"), None, Some("bpass1")),
+    ] {
+        let plan = BuildPlan::parse(
+            record.and_then(|record| record.parse().ok()),
+            "build/consumer.o: build/liba.rmeta\n".parse().unwrap(),
+            &ProviderDeltas::default(),
+            ReuseRequest { current_revision, previous_revision, command: &command, inputs: None },
+        )
+        .unwrap();
+        match plan {
+            BuildPlan::Invoke => {}
+            BuildPlan::Reuse(_) => panic!(),
+        }
+    }
+}
+
+#[test]
+fn reuse_advances_the_record_across_consecutive_skipped_revisions() {
+    let command = CommandFingerprint("--crate-type=rlib\0".to_owned());
+    let mut record = BuildRecord { revision: "bpass1".to_owned(), command: command.clone() };
+    for (current, previous) in [("bpass2", "bpass1"), ("bpass3", "bpass2")] {
+        let plan = BuildPlan::parse(
+            Some(record),
+            "build/consumer.o: build/liba.rmeta\n".parse().unwrap(),
+            &ProviderDeltas::default(),
+            ReuseRequest {
+                current_revision: Some(current),
+                previous_revision: Some(previous),
+                command: &command,
+                inputs: None,
+            },
+        )
+        .unwrap();
+        let BuildPlan::Reuse(plan) = plan else { panic!() };
+        record = plan.into_record();
+        assert_eq!(record, BuildRecord { revision: current.to_owned(), command: command.clone() });
+        record = record.to_string().parse().unwrap();
+    }
+}
+
+#[test]
+fn reuse_rejects_observed_changes_and_unmeasured_providers() {
+    let command = CommandFingerprint("--crate-type=rlib\0".to_owned());
+    for delta in [
+        ProviderDelta::Measured(FxHashSet::from_iter([ArtifactPath::Rmeta(Utf8PathBuf::from(
+            "build/liba.rmeta",
+        ))])),
+        ProviderDelta::Unmeasured,
+    ] {
+        let plan = BuildPlan::parse(
+            Some(BuildRecord { revision: "bpass1".to_owned(), command: command.clone() }),
+            "build/consumer.o: build/liba.rmeta\n".parse().unwrap(),
+            &ProviderDeltas(FxHashMap::from_iter([(
+                ArtifactProvider {
+                    source: Utf8PathBuf::from("auxiliary/a.rs"),
+                    out_dir: Utf8PathBuf::from("build"),
+                },
+                delta.clone(),
+            )])),
+            ReuseRequest {
+                current_revision: Some("bpass2"),
+                previous_revision: Some("bpass1"),
+                command: &command,
+                inputs: None,
+            },
+        );
+        match (plan, delta) {
+            (Ok(BuildPlan::Invoke), ProviderDelta::Measured(_)) => {}
+            (Err(error), ProviderDelta::Unmeasured) => assert!(error.contains("auxiliary/a.rs")),
+            (Ok(BuildPlan::Reuse(_)), _)
+            | (Ok(BuildPlan::Invoke), ProviderDelta::Unmeasured)
+            | (Err(_), ProviderDelta::Measured(_)) => {
+                panic!()
+            }
+        }
+    }
+}
+
+#[test]
+fn reuse_compares_logical_revision_sources_and_other_own_inputs() {
+    enum InputChange {
+        None,
+        Root,
+        Sibling,
+        MissingSource,
+        MissingSnapshot,
+    }
+
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("compiletest-reuse-inputs-{}", std::process::id()));
+    let source_root = root.join("sources");
+    let snapshot_root = root.join("snapshots");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::create_dir_all(&snapshot_root).unwrap();
+    fs::write(source_root.join("first.rs"), b"source").unwrap();
+    let crate_source = source_root.join("a.rs");
+    let input_path = source_root.join("second.rs");
+    let candidates = vec![Utf8PathBuf::from("first.rs"), Utf8PathBuf::from("second.rs")];
+    let command = CommandFingerprint("a.rs\0".to_owned());
+    for change in [
+        InputChange::None,
+        InputChange::Root,
+        InputChange::Sibling,
+        InputChange::MissingSource,
+        InputChange::MissingSnapshot,
+    ] {
+        fs::write(&input_path, b"source").unwrap();
+        fs::write(source_root.join("sibling.rs"), b"sibling").unwrap();
+        fs::write(snapshot_root.join("a.rs"), b"source").unwrap();
+        fs::write(snapshot_root.join("sibling.rs"), b"sibling").unwrap();
+        match change {
+            InputChange::None => {}
+            InputChange::Root => fs::write(&input_path, b"changed").unwrap(),
+            InputChange::Sibling => fs::write(source_root.join("sibling.rs"), b"changed").unwrap(),
+            InputChange::MissingSource => fs::remove_file(&input_path).unwrap(),
+            InputChange::MissingSnapshot => fs::remove_file(snapshot_root.join("a.rs")).unwrap(),
+        }
+        let plan = BuildPlan::parse(
+            Some(BuildRecord { revision: "bpass1".to_owned(), command: command.clone() }),
+            format!(
+                "build/liba.rmeta: {} {}\n",
+                source_root.join("first.rs"),
+                source_root.join("sibling.rs"),
+            )
+            .parse()
+            .unwrap(),
+            &ProviderDeltas::default(),
+            ReuseRequest {
+                current_revision: Some("bpass2"),
+                previous_revision: Some("bpass1"),
+                command: &command,
+                inputs: Some(RevisionInputs {
+                    source_root: &source_root,
+                    revision_source_candidates: &candidates,
+                    crate_source: &crate_source,
+                    input_path: &input_path,
+                    snapshot_root: &snapshot_root,
+                }),
+            },
+        );
+        match (plan, change) {
+            (Ok(BuildPlan::Reuse(plan)), InputChange::None) => {
+                assert_eq!(
+                    plan.into_record(),
+                    BuildRecord { revision: "bpass2".to_owned(), command: command.clone() }
+                );
+            }
+            (Err(error), InputChange::Sibling) => assert!(error.contains("`sibling.rs`")),
+            (Err(error), InputChange::Root) => assert!(error.contains("`a.rs`")),
+            (Err(error), InputChange::MissingSource) => {
+                assert!(error.contains(input_path.as_str()));
+            }
+            (Err(error), InputChange::MissingSnapshot) => {
+                assert!(error.contains(snapshot_root.join("a.rs").as_str()));
+            }
+            _ => panic!(),
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn provider_deltas_union_exact_artifacts_under_their_provider() {
     let mut deltas = ProviderDeltas::default();
 

@@ -21,8 +21,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::*;
 
 use self::artifacts::{
-    ArtifactPath, ArtifactProvider, ArtifactSnapshot, AuxiliaryBuild, ProviderArtifacts,
-    ProviderDelta, ProviderDeltas, check_byte_expectations, logical_source_layout, should_rerun,
+    ArtifactPath, ArtifactProvider, ArtifactSnapshot, AuxiliaryBuild, BuildPlan, BuildRecord,
+    CommandFingerprint, ProviderArtifacts, ProviderDelta, ProviderDeltas, ReuseRequest,
+    RevisionInputs, check_byte_expectations, logical_source_layout,
 };
 use crate::common::{
     CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TestMode, TestPaths,
@@ -125,29 +126,6 @@ fn build_key<T: Hash + ?Sized>(identity: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     identity.hash(&mut hasher);
     hasher.finish()
-}
-
-fn command_fingerprint(
-    command: &Command,
-    revision_source: Option<(&Utf8Path, &Utf8Path)>,
-) -> String {
-    let mut fingerprint = String::new();
-    for arg in command.get_args() {
-        let arg = match revision_source {
-            Some((physical, logical)) if arg == physical.as_os_str() => logical.as_os_str(),
-            Some(_) | None => arg,
-        };
-        fingerprint.push_str(&arg.to_string_lossy());
-        fingerprint.push('\0');
-    }
-    let mut envs: Vec<String> =
-        command.get_envs().map(|(key, value)| format!("{key:?}={value:?}")).collect();
-    envs.sort();
-    for env in envs {
-        fingerprint.push_str(&env);
-        fingerprint.push('\0');
-    }
-    fingerprint
 }
 
 pub(crate) fn run(
@@ -1484,76 +1462,95 @@ impl<'test> TestCx<'test> {
         rustc.envs(self.props.rustc_env.clone());
         self.props.unset_rustc_env.iter().fold(&mut rustc, Command::env_remove);
         let build_key = build_key(self.testpaths.file.as_path());
-        let validation = self.validation_path(build_key);
-        let command = command_fingerprint(&rustc, None);
+        let build_record = self.build_record_path(build_key);
+        let command = CommandFingerprint::from_command(&rustc, None);
 
         if self.props.rustc_not_invoked {
-            let rerun = should_rerun(&provider_deltas, &self.dep_info(build_key))
-                .unwrap_or_else(|message| self.fatal(&message));
-            if !rerun && self.validated_by_previous_revision(validation.as_deref(), &command) {
-                self.record_validation(validation.as_deref(), &command);
-                return ProcRes {
-                    status: ExitStatus::from_raw(0),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    truncated: Truncated::No,
-                    cmdline: "rustc invocation skipped because observed artifacts are unchanged"
-                        .to_owned(),
-                };
-            }
-            self.fatal(&format!("rustc was invoked for `{}`", self.testpaths.file));
+            let BuildPlan::Reuse(plan) =
+                self.reuse_plan(build_key, &command, &provider_deltas, None)
+            else {
+                self.fatal(&format!("rustc was invoked for `{}`", self.testpaths.file));
+            };
+            self.record_build(build_record.as_deref(), plan.into_record());
+            return ProcRes {
+                status: ExitStatus::from_raw(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: Truncated::No,
+                cmdline: "rustc invocation skipped because observed artifacts are unchanged"
+                    .to_owned(),
+            };
         }
 
-        self.clear_validation(validation.as_deref());
+        self.discard_build_record(build_record.as_deref());
         let proc_res = self.compose_and_run(
             rustc,
             self.config.host_compile_lib_path.as_path(),
             Some(aux_dir.as_path()),
             input,
         );
-        if proc_res.status.success() {
-            self.record_validation(validation.as_deref(), &command);
+        if proc_res.status.success()
+            && let Some(current) = self.variant.revision()
+        {
+            self.record_build(
+                build_record.as_deref(),
+                BuildRecord { revision: current.to_owned(), command },
+            );
         }
         proc_res
     }
 
-    fn validation_path(&self, build_key: u64) -> Option<Utf8PathBuf> {
+    fn build_record_path(&self, build_key: u64) -> Option<Utf8PathBuf> {
         (self.config.mode == TestMode::Incremental).then(|| {
             self.props
                 .incremental_dir
                 .as_ref()
                 .unwrap()
-                .join(format!("snapshot-{build_key:016x}.validation"))
+                .join(format!("snapshot-{build_key:016x}.build-record"))
         })
     }
 
-    fn validated_by_previous_revision(&self, validation: Option<&Utf8Path>, command: &str) -> bool {
-        let (Some(validation), Some(current)) = (validation, self.variant.revision()) else {
-            return false;
-        };
-        let Some(position) = self.props.test_revisions.iter().position(|r| r == current) else {
-            return false;
-        };
-        let Some(previous) = position.checked_sub(1).map(|p| &self.props.test_revisions[p]) else {
-            return false;
-        };
-        fs::read_to_string(validation).ok() == Some(format!("{previous}\n{command}"))
+    fn reuse_plan(
+        &self,
+        build_key: u64,
+        command: &CommandFingerprint,
+        provider_deltas: &ProviderDeltas,
+        inputs: Option<RevisionInputs<'_>>,
+    ) -> BuildPlan {
+        let current_revision = self.variant.revision();
+        let previous_revision = current_revision.and_then(|current| {
+            let position = self.props.test_revisions.iter().position(|r| r == current)?;
+            position.checked_sub(1).map(|p| self.props.test_revisions[p].as_str())
+        });
+        let record = self
+            .build_record_path(build_key)
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|record| record.parse().ok());
+        BuildPlan::parse(
+            record,
+            self.dep_info(build_key),
+            provider_deltas,
+            ReuseRequest { current_revision, previous_revision, command, inputs },
+        )
+        .unwrap_or_else(|message| self.fatal(&message))
     }
 
-    fn record_validation(&self, validation: Option<&Utf8Path>, command: &str) {
-        let (Some(validation), Some(current)) = (validation, self.variant.revision()) else {
+    fn record_build(&self, build_record: Option<&Utf8Path>, record: BuildRecord) {
+        let Some(build_record) = build_record else {
             return;
         };
-        fs::write(validation, format!("{current}\n{command}"))
-            .unwrap_or_else(|err| self.fatal(&format!("failed to snapshot `{validation}`: {err}")));
+        fs::write(build_record, record.to_string()).unwrap_or_else(|err| {
+            self.fatal(&format!("failed to snapshot `{build_record}`: {err}"))
+        });
     }
 
-    fn clear_validation(&self, validation: Option<&Utf8Path>) {
-        let Some(validation) = validation else {
+    fn discard_build_record(&self, build_record: Option<&Utf8Path>) {
+        let Some(build_record) = build_record else {
             return;
         };
-        ignore_not_found(|| fs::remove_file(validation))
-            .unwrap_or_else(|err| self.fatal(&format!("failed to snapshot `{validation}`: {err}")));
+        ignore_not_found(|| fs::remove_file(build_record)).unwrap_or_else(|err| {
+            self.fatal(&format!("failed to snapshot `{build_record}`: {err}"))
+        });
     }
 
     /// Builds `minicore`. Returns the path to the minicore rlib within the base test output
@@ -1751,8 +1748,8 @@ impl<'test> TestCx<'test> {
                 .unwrap()
                 .join(format!("snapshot-{build_key:016x}.inputs"))
         });
-        let validation = self.validation_path(build_key);
-        let command = command_fingerprint(
+        let build_record = self.build_record_path(build_key);
+        let command = CommandFingerprint::from_command(
             &aux_rustc,
             aux_props.revision_source.as_ref().map(|_| (input_path.as_path(), aux_path.as_path())),
         );
@@ -1809,142 +1806,123 @@ impl<'test> TestCx<'test> {
             }
         }
 
-        let skip = if aux_props.rustc_not_invoked {
-            let dep_info = aux_cx.dep_info(build_key);
-            let rerun = should_rerun(&transitive_deltas, &dep_info)
-                .unwrap_or_else(|message| self.fatal(&message));
-            if rerun || !self.validated_by_previous_revision(validation.as_deref(), &command) {
-                self.fatal(&format!("rustc was invoked for `{input_path}`"));
-            }
-            if let Some(inputs_snapshot) = &inputs_snapshot {
-                let layout = logical_source_layout(
-                    &dep_info,
+        let plan = if aux_props.rustc_not_invoked {
+            match aux_cx.reuse_plan(
+                build_key,
+                &command,
+                &transitive_deltas,
+                inputs_snapshot.as_deref().map(|snapshot_root| RevisionInputs {
                     source_root,
-                    &aux_props.revision_source_candidates,
-                    &aux_path,
-                )
-                .unwrap_or_else(|message| aux_cx.fatal(&message));
-                let crate_name =
-                    aux_path.file_name().expect("auxiliary source file has a file name");
-                for (logical, physical) in &layout {
-                    let physical = if logical == crate_name { &input_path } else { physical };
-                    let current = fs::read(physical).unwrap_or_else(|err| {
-                        aux_cx.fatal(&format!("failed to read own input `{physical}`: {err}"))
-                    });
-                    let snapshot = inputs_snapshot.join(logical);
-                    let snapshot = fs::read(&snapshot).unwrap_or_else(|err| {
-                        aux_cx.fatal(&format!("failed to read input snapshot `{snapshot}`: {err}"))
-                    });
-                    if current != snapshot {
-                        self.fatal(&format!(
-                            "`//@ rustc-not-invoked` on `{aux_path}`, but its own input `{logical}` \
-                             changed since the previous build"
-                        ));
-                    }
-                }
+                    revision_source_candidates: &aux_props.revision_source_candidates,
+                    crate_source: &aux_path,
+                    input_path: &input_path,
+                    snapshot_root,
+                }),
+            ) {
+                BuildPlan::Invoke => self.fatal(&format!("rustc was invoked for `{input_path}`")),
+                plan @ BuildPlan::Reuse(_) => plan,
             }
-            self.record_validation(validation.as_deref(), &command);
-            true
         } else {
-            false
+            BuildPlan::Invoke
         };
 
-        let own_delta = if skip {
-            if let Err(message) = check_byte_expectations(&expectations, &previous, &previous) {
-                aux_cx.fatal(&message);
-            }
-            ProviderDelta::Measured(FxHashSet::default())
-        } else {
-            self.clear_validation(validation.as_deref());
-            let auxres = aux_cx.compose_and_run(
-                aux_rustc,
-                aux_cx.config.host_compile_lib_path.as_path(),
-                Some(aux_dir.as_path()),
-                None,
-            );
-            if !auxres.status.success() {
-                if !aux_props.error_patterns.is_empty()
-                    || !aux_props.regex_error_patterns.is_empty()
-                {
-                    aux_cx.check_correct_failure_status(&auxres);
-                    aux_cx.check_all_error_patterns(&aux_cx.get_output(&auxres), &auxres);
-                    self.fatal(&format!(
-                        "auxiliary build of {input_path} failed with expected diagnostics"
-                    ));
+        let own_delta = match plan {
+            BuildPlan::Reuse(plan) => {
+                if let Err(message) = check_byte_expectations(&expectations, &previous, &previous) {
+                    aux_cx.fatal(&message);
                 }
-                self.fatal_proc_rec(
-                    &format!("auxiliary build of {input_path} failed to compile:"),
-                    &auxres,
+                self.record_build(build_record.as_deref(), plan.into_record());
+                ProviderDelta::Measured(FxHashSet::default())
+            }
+            BuildPlan::Invoke => {
+                self.discard_build_record(build_record.as_deref());
+                let auxres = aux_cx.compose_and_run(
+                    aux_rustc,
+                    aux_cx.config.host_compile_lib_path.as_path(),
+                    Some(aux_dir.as_path()),
+                    None,
                 );
-            }
-
-            if let Some(inputs_snapshot) = &inputs_snapshot {
-                let layout = logical_source_layout(
-                    &aux_cx.dep_info(build_key),
-                    source_root,
-                    &aux_props.revision_source_candidates,
-                    &aux_path,
-                )
-                .unwrap_or_else(|message| aux_cx.fatal(&message));
-                ignore_not_found(|| recursive_remove(inputs_snapshot)).unwrap_or_else(|err| {
-                    aux_cx.fatal(&format!(
-                        "failed to clear input snapshot `{inputs_snapshot}`: {err}"
-                    ))
-                });
-                for (logical, physical) in &layout {
-                    let staged = inputs_snapshot.join(logical);
-                    if let Some(parent) = staged.parent() {
-                        create_dir_all(parent).unwrap_or_else(|err| {
-                            aux_cx.fatal(&format!("failed to create `{parent}`: {err}"))
-                        });
-                    }
-                    fs::copy(physical, &staged).unwrap_or_else(|err| {
-                        aux_cx
-                            .fatal(&format!("failed to snapshot `{physical}` as `{staged}`: {err}"))
-                    });
-                }
-            }
-            self.record_validation(validation.as_deref(), &command);
-
-            match &provider_artifacts {
-                Some(provider_artifacts) => {
-                    let tracked = [
-                        (
-                            ArtifactPath::Rmeta(provider_artifacts.rmeta.clone()),
-                            &provider_artifacts.snapshot_rmeta,
-                        ),
-                        (
-                            ArtifactPath::Link(provider_artifacts.link.clone()),
-                            &provider_artifacts.snapshot_link,
-                        ),
-                    ];
-                    let mut current = ArtifactSnapshot::default();
-                    for (artifact, _) in &tracked {
-                        let path = AsRef::<Utf8Path>::as_ref(artifact);
-                        let bytes = fs::read(path).unwrap_or_else(|err| {
-                            aux_cx.fatal(&format!("failed to read artifact `{path}`: {err}"))
-                        });
-                        current.0.insert(artifact.clone(), bytes);
-                    }
-
-                    let own_delta = current.changed_paths_since(&previous);
-                    if let Err(message) =
-                        check_byte_expectations(&expectations, &previous, &current)
+                if !auxres.status.success() {
+                    if !aux_props.error_patterns.is_empty()
+                        || !aux_props.regex_error_patterns.is_empty()
                     {
-                        aux_cx.fatal(&message);
+                        aux_cx.check_correct_failure_status(&auxres);
+                        aux_cx.check_all_error_patterns(&aux_cx.get_output(&auxres), &auxres);
+                        self.fatal(&format!(
+                            "auxiliary build of {input_path} failed with expected diagnostics"
+                        ));
                     }
+                    self.fatal_proc_rec(
+                        &format!("auxiliary build of {input_path} failed to compile:"),
+                        &auxres,
+                    );
+                }
 
-                    for (artifact, snapshot) in &tracked {
-                        fs::write(snapshot, &current.0[artifact]).unwrap_or_else(|err| {
+                if let Some(inputs_snapshot) = &inputs_snapshot {
+                    let layout = logical_source_layout(
+                        &aux_cx.dep_info(build_key),
+                        source_root,
+                        &aux_props.revision_source_candidates,
+                        &aux_path,
+                    )
+                    .unwrap_or_else(|message| aux_cx.fatal(&message));
+                    ignore_not_found(|| recursive_remove(inputs_snapshot)).unwrap_or_else(|err| {
+                        aux_cx.fatal(&format!(
+                            "failed to clear input snapshot `{inputs_snapshot}`: {err}"
+                        ))
+                    });
+                    for (logical, physical) in &layout {
+                        let staged = inputs_snapshot.join(logical);
+                        if let Some(parent) = staged.parent() {
+                            create_dir_all(parent).unwrap_or_else(|err| {
+                                aux_cx.fatal(&format!("failed to create `{parent}`: {err}"))
+                            });
+                        }
+                        fs::copy(physical, &staged).unwrap_or_else(|err| {
                             aux_cx.fatal(&format!(
-                                "failed to write artifact snapshot `{snapshot}`: {err}"
+                                "failed to snapshot `{physical}` as `{staged}`: {err}"
                             ))
                         });
                     }
-
-                    ProviderDelta::Measured(own_delta)
                 }
-                None => ProviderDelta::Unmeasured,
+
+                let own_delta = match &tracked {
+                    Some(tracked) => {
+                        let mut current = ArtifactSnapshot::default();
+                        for (artifact, _) in tracked {
+                            let path = AsRef::<Utf8Path>::as_ref(artifact);
+                            let bytes = fs::read(path).unwrap_or_else(|err| {
+                                aux_cx.fatal(&format!("failed to read artifact `{path}`: {err}"))
+                            });
+                            current.0.insert(artifact.clone(), bytes);
+                        }
+
+                        let own_delta = current.changed_paths_since(&previous);
+                        if let Err(message) =
+                            check_byte_expectations(&expectations, &previous, &current)
+                        {
+                            aux_cx.fatal(&message);
+                        }
+
+                        for (artifact, snapshot) in tracked {
+                            fs::write(snapshot, &current.0[artifact]).unwrap_or_else(|err| {
+                                aux_cx.fatal(&format!(
+                                    "failed to write artifact snapshot `{snapshot}`: {err}"
+                                ))
+                            });
+                        }
+
+                        ProviderDelta::Measured(own_delta)
+                    }
+                    None => ProviderDelta::Unmeasured,
+                };
+                if let Some(current) = self.variant.revision() {
+                    self.record_build(
+                        build_record.as_deref(),
+                        BuildRecord { revision: current.to_owned(), command },
+                    );
+                }
+                own_delta
             }
         };
 

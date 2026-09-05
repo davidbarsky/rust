@@ -151,12 +151,16 @@ fn make_directive_handlers_map() -> HashMap<&'static str, Handler> {
             config.set_name_directive(ln, RUSTC_NOT_INVOKED, &mut props.rustc_not_invoked);
         }),
         handler(EXPECT_RMETA, |config, ln, props| {
-            config.set_name_value_directive(ln, EXPECT_RMETA, &mut props.expect_rmeta, |value| {
-                let value = value.trim();
-                value.parse::<ByteExpectation>().unwrap_or_else(|()| {
-                    panic!("`//@ {EXPECT_RMETA}` expects `same` or `different`, found `{value}`")
-                })
+            let Some(value) = config.parse_name_value_directive(ln, EXPECT_RMETA) else {
+                return;
+            };
+            let value = value.trim();
+            let expectation = value.parse::<ByteExpectation>().unwrap_or_else(|()| {
+                panic!("`//@ {EXPECT_RMETA}` expects `same` or `different`, found `{value}`")
             });
+            if props.expect_rmeta.replace(expectation).is_some() {
+                panic!("`//@ {EXPECT_RMETA}` may only be specified once per revision");
+            }
         }),
         handler(PRETTY_MODE, |config, ln, props| {
             if let Some(m) = config.parse_name_value_directive(ln, PRETTY_MODE) {

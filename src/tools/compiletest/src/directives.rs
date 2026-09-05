@@ -103,7 +103,19 @@ fn parse_revision_source(value: String) -> Utf8PathBuf {
     if value.is_empty() {
         panic!("`//@ revision-source` expects a physical source path");
     }
-    Utf8PathBuf::from(value)
+    let value = Utf8PathBuf::from(value);
+    if !value.components().all(|component| match component {
+        camino::Utf8Component::Normal(_) => true,
+        camino::Utf8Component::Prefix(_)
+        | camino::Utf8Component::RootDir
+        | camino::Utf8Component::CurDir
+        | camino::Utf8Component::ParentDir => false,
+    }) {
+        panic!(
+            "`//@ revision-source` expects a path inside the auxiliary directory, found `{value}`"
+        );
+    }
+    value
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +398,11 @@ impl TestProps {
         let file_contents =
             if testfile.is_dir() { String::new() } else { fs::read_to_string(testfile).unwrap() };
         let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
+        if !testfile.is_dir() {
+            if let Err(message) = do_early_directives_check(config.mode, &file_directives) {
+                panic!("{message}");
+            }
+        }
         props.load_from(&file_directives, revision, config);
         props.withhold_revision_cfg = file_directives.lines.iter().any(|line| {
             (line.name == directives::RUSTC_NOT_INVOKED || line.name == directives::EXPECT_RMETA)
@@ -405,6 +422,13 @@ impl TestProps {
         let file_directives = FileDirectives::from_file_contents(testfile, &file_contents);
         props.load_from(&file_directives, revision, config);
         props.test_revisions = props.revisions.clone();
+        if props.expect_rmeta.is_some() || !props.revision_source_candidates.is_empty() {
+            panic!(
+                "`//@ {}` and `//@ {}` apply only to auxiliary crates, but `{testfile}` uses them",
+                directives::EXPECT_RMETA,
+                directives::REVISION_SOURCE,
+            );
+        }
         props.withhold_revision_cfg = config.mode == TestMode::Incremental
             && file_directives.lines.iter().any(|line| {
                 line.name == directives::RUSTC_NOT_INVOKED
@@ -445,9 +469,14 @@ impl TestProps {
                     };
                     self.revision_source_candidates.push(source.clone());
                     if line.applies_to_test_revision(test_revision)
-                        && self.revision_source.is_none()
+                        && self.revision_source.replace(source).is_some()
                     {
-                        self.revision_source = Some(source);
+                        panic!(
+                            "`//@ {}` applies more than once to revision {} of `{}`",
+                            directives::REVISION_SOURCE,
+                            test_revision.unwrap_or("<none>"),
+                            line.file_path,
+                        );
                     }
                     return;
                 }
@@ -459,6 +488,15 @@ impl TestProps {
                     handler.handle(config, line, self);
                 }
             });
+
+            if !self.revision_source_candidates.is_empty() && self.revision_source.is_none() {
+                panic!(
+                    "`//@ {}` in `{}` declares physical sources, but none applies to revision {}",
+                    directives::REVISION_SOURCE,
+                    file_directives.path,
+                    test_revision.unwrap_or("<none>"),
+                );
+            }
         }
 
         if config.mode == TestMode::Incremental {
@@ -488,6 +526,7 @@ impl TestProps {
         // to rustc last.
         self.compile_flags.insert(0, format!("--edition={edition}"));
     }
+
     fn update_pass_fail_mode(&mut self, ln: &DirectiveLine<'_>, config: &Config) {
         let name = ln.name;
         if config.mode != TestMode::Ui {

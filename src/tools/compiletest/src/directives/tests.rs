@@ -426,6 +426,89 @@ fn revision_source_is_revision_scoped() {
 }
 
 #[test]
+#[should_panic(expected = "expects a path inside the auxiliary directory")]
+fn revision_sources_outside_the_auxiliary_directory_are_rejected() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] revision-source: ../a_first.rs
+"#,
+    );
+
+    let mut props = TestProps::new();
+    props.load_from(&file_directives, Some("bpass1"), &config);
+}
+
+#[test]
+#[should_panic(expected = "applies more than once to revision bpass1")]
+fn several_applicable_revision_sources_are_rejected() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] revision-source: a_first.rs
+//@ [bpass1] revision-source: a_second.rs
+"#,
+    );
+
+    let mut props = TestProps::new();
+    props.load_from(&file_directives, Some("bpass1"), &config);
+}
+
+#[test]
+#[should_panic(expected = "declares physical sources, but none applies to revision bpass2")]
+fn revision_source_candidates_without_an_applicable_source_are_rejected() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] revision-source: a_first.rs
+"#,
+    );
+
+    let mut props = TestProps::new();
+    props.load_from(&file_directives, Some("bpass2"), &config);
+}
+
+#[test]
+#[should_panic(expected = "apply only to auxiliary crates")]
+fn auxiliary_only_directives_are_rejected_on_the_main_test() {
+    let config = cfg().mode("incremental").build();
+    let path = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("compiletest-main-auxiliary-directives-{}.rs", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"
+//@ [bpass2] expect-rmeta: same
+"#,
+    )
+    .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TestProps::from_file(&path, Some("bpass2"), &config)
+    }));
+    std::fs::remove_file(&path).unwrap();
+    std::panic::resume_unwind(result.unwrap_err());
+}
+
+#[test]
+#[should_panic(expected = "`//@ expect-rmeta` may only be specified once per revision")]
+fn duplicate_byte_expectations_for_one_revision_are_rejected() {
+    let config = cfg().mode("incremental").build();
+    let file_directives = FileDirectives::from_file_contents(
+        Utf8Path::new("auxiliary/a.rs"),
+        r#"
+//@ [bpass1] expect-rmeta: same
+//@ [bpass1] expect-rmeta: different
+"#,
+    );
+
+    let mut props = TestProps::new();
+    props.load_from(&file_directives, Some("bpass1"), &config);
+}
+
+#[test]
 fn llvm_version() {
     let config: Config = cfg().llvm_version("8.1.2").build();
     assert!(check_ignore(&config, "//@ min-llvm-version: 9.0"));
@@ -1247,7 +1330,7 @@ fn parse_edition_range(line: &str) -> Option<EditionRange> {
     let line =
         line_directive(Utf8Path::new("tmp.rs"), LineNumber::ZERO, &line_with_comment).unwrap();
 
-    super::parse_edition_range(&config, &line)
+    crate::directives::parse_edition_range(&config, &line)
 }
 
 #[test]
@@ -1393,4 +1476,56 @@ fn needs_asm_ret() {
     assert!(!check_ignore(&config_aarch64, "//@ needs-asm-ret"));
     assert!(check_ignore(&config_arm32, "//@ needs-asm-ret"));
     assert!(check_ignore(&config_wasm, "//@ needs-asm-ret"));
+}
+
+#[test]
+fn auxiliary_files_reject_unknown_directives() {
+    let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("compiletest-auxiliary-directives-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("provider.rs");
+    std::fs::write(&path, "//@ expect-rmta: same\npub fn value() {}\n").unwrap();
+    let config = cfg().mode("incremental").build();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TestProps::new().from_aux_file(&path, None, &config)
+    }));
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let payload = result.expect_err("an unknown auxiliary directive was accepted");
+    let message = payload.downcast_ref::<String>().unwrap();
+    assert!(message.contains("unknown compiletest directive"), "{message}");
+}
+
+#[test]
+fn revision_cfg_accounts_for_reuse_in_other_declared_revisions() {
+    let dir = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("compiletest-revision-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = dir.join("main.rs");
+    let auxiliary = dir.join("provider.rs");
+    let config = cfg().mode("incremental").build();
+
+    for (revision, expected) in [("bpass2", true), ("undeclared", false)] {
+        std::fs::write(
+            &main,
+            format!("//@ revisions: bpass1 bpass2\n//@ [{revision}] rustc-not-invoked\n"),
+        )
+        .unwrap();
+        let props = TestProps::from_file(&main, Some("bpass1"), &config);
+        assert!(!props.rustc_not_invoked);
+        assert_eq!(props.withhold_revision_cfg, expected);
+
+        for directive in ["rustc-not-invoked", "expect-rmeta: same"] {
+            std::fs::write(&auxiliary, format!("//@ [{revision}] {directive}\n")).unwrap();
+            let auxiliary = props.from_aux_file(&auxiliary, Some("bpass1"), &config);
+            assert!(!auxiliary.rustc_not_invoked);
+            assert_eq!(auxiliary.expect_rmeta, None);
+            assert_eq!(auxiliary.withhold_revision_cfg, expected);
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }
