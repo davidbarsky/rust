@@ -44,6 +44,11 @@ fn main() {
     eprintln!("paths_test => PathsFlag::Remap");
     paths_test(PathsFlag::Remap);
 
+    eprintln!("incremental_test => IncrementalFlag::SeparateCaches");
+    incremental_test(IncrementalFlag::SeparateCaches);
+    eprintln!("incremental_test => IncrementalFlag::SharedCache");
+    incremental_test(IncrementalFlag::SharedCache);
+
     // Builds should be reproducible even if each build is done in a different directory,
     // with both --remap-path-prefix and -Z remap-cwd-prefix.
 
@@ -176,6 +181,21 @@ fn paths_test(flag: PathsFlag) {
 }
 
 #[track_caller]
+fn incremental_test(flag: IncrementalFlag) {
+    run_in_tmpdir(|| {
+        rustc().input("reproducible-build-aux.rs").run();
+        let (first, second) = match flag {
+            IncrementalFlag::SeparateCaches => ("incr1", "incr2"),
+            IncrementalFlag::SharedCache => ("incr", "incr"),
+        };
+        rustc().input("reproducible-build.rs").crate_type("rlib").incremental(first).run();
+        rfs::rename(rust_lib_name("reproducible_build"), rust_lib_name("foo"));
+        rustc().input("reproducible-build.rs").crate_type("rlib").incremental(second).run();
+        assert!(rfs::read(rust_lib_name("foo")) == rfs::read(rust_lib_name("reproducible_build")))
+    });
+}
+
+#[track_caller]
 fn diff_dir_test(crate_type: CrateType, remap_type: RemapType) {
     run_in_tmpdir(|| {
         let base_dir = cwd();
@@ -268,6 +288,11 @@ enum SmokeFlag {
 enum PathsFlag {
     Link,
     Remap,
+}
+
+enum IncrementalFlag {
+    SeparateCaches,
+    SharedCache,
 }
 
 enum CrateType {

@@ -1195,17 +1195,6 @@ pub struct OutputFilenames {
     filestem: String,
     pub single_output_file: Option<OutFileName>,
     temps_directory: Option<PathBuf>,
-
-    /// A random string generated per invocation of rustc.
-    ///
-    /// This is prepended to all temporary files so that they do not collide
-    /// during concurrent invocations of rustc, or past invocations that were
-    /// preserved with a flag like `-C save-temps`, since these files may be
-    /// hard linked.
-    // This does not affect incr comp outputs, only where temp files are stored.
-    #[stable_hash(ignore)]
-    invocation_temp: Option<String>,
-
     explicit_dwo_out_directory: Option<PathBuf>,
     pub outputs: OutputTypes,
 }
@@ -1248,7 +1237,6 @@ impl OutputFilenames {
         out_filestem: String,
         single_output_file: Option<OutFileName>,
         temps_directory: Option<PathBuf>,
-        invocation_temp: Option<String>,
         explicit_dwo_out_directory: Option<PathBuf>,
         extra: String,
         outputs: OutputTypes,
@@ -1257,7 +1245,6 @@ impl OutputFilenames {
             out_directory,
             single_output_file,
             temps_directory,
-            invocation_temp,
             explicit_dwo_out_directory,
             outputs,
             crate_stem: format!("{out_crate_name}{extra}"),
@@ -1315,12 +1302,6 @@ impl OutputFilenames {
     /// OutputType, like noopt-bitcode or lto-bitcode.
     pub fn temp_path_ext_for_cgu(&self, ext: &str, codegen_unit_name: &str) -> PathBuf {
         let mut extension = codegen_unit_name.to_string();
-
-        // Append `.{invocation_temp}` to ensure temporary files are unique.
-        if let Some(rng) = &self.invocation_temp {
-            extension.push('.');
-            extension.push_str(rng);
-        }
 
         // FIXME: This is sketchy that we're not appending `.rcgu` when the ext is empty.
         // Append `.rcgu.{ext}`.

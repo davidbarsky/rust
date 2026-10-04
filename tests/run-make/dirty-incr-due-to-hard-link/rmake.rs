@@ -1,4 +1,5 @@
-//@ only-x86_64-unknown-linux-gnu
+//@ needs-asm-support
+//@ ignore-cross-compile
 // FIXME: remove the ignore gcc once fixed.
 //@ ignore-backends: gcc
 
@@ -9,26 +10,34 @@
 // across incremental sessions that are not finalized due to errors originating from the
 // codegen backend.
 
-use run_make_support::{run, rustc};
+use run_make_support::{is_windows, run, run_in_tmpdir, rustc};
 
 fn main() {
-    let mk_rustc = || {
-        let mut rustc = rustc();
-        rustc.input("test.rs").incremental("incr").arg("-Csave-temps").output("test");
-        rustc
-    };
+    let mut flag_sets = vec![vec!["-Csave-temps"]];
+    if !is_windows() {
+        flag_sets.push(vec!["-Cdebuginfo=1", "-Csplit-debuginfo=unpacked"]);
+    }
+    for flags in flag_sets {
+        run_in_tmpdir(|| {
+            let mk_rustc = || {
+                let mut rustc = rustc();
+                rustc.input("test.rs").incremental("incr").args(&flags).output("test");
+                rustc
+            };
 
-    // Revision 1
-    mk_rustc().cfg("rpass1").run();
+            // Revision 1
+            mk_rustc().cfg("rpass1").run();
 
-    run("test");
+            run("test");
 
-    // Revision 2
-    mk_rustc().cfg("cfail2").run_fail();
-    // Expected to fail.
+            // Revision 2
+            mk_rustc().cfg("cfail2").run_fail();
+            // Expected to fail.
 
-    // Revision 3
-    mk_rustc().cfg("rpass3").run();
+            // Revision 3
+            mk_rustc().cfg("rpass3").run();
 
-    run("test");
+            run("test");
+        });
+    }
 }

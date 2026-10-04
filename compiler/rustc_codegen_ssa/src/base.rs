@@ -30,7 +30,7 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, PatternKind, Ty, TyCtxt, UintTy, Unnormalized};
-use rustc_session::config::{self, EntryFnType};
+use rustc_session::config::{self, EntryFnType, OutputType};
 use rustc_span::{DUMMY_SP, Symbol, bug, span_bug};
 use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
@@ -40,7 +40,7 @@ use rustc_trait_selection::traits::{ObligationCause, ObligationCtxt};
 use tracing::{debug, info};
 
 use crate::assert_module_sources::CguReuse;
-use crate::back::link::are_upstream_rust_objects_already_included;
+use crate::back::link::{are_upstream_rust_objects_already_included, ensure_removed};
 use crate::back::write::{
     ComputedLtoType, ModuleConfig, OngoingCodegen, compute_per_cgu_lto_type, start_async_codegen,
     submit_codegened_module_to_llvm, submit_post_lto_module_to_llvm, submit_pre_lto_module_to_llvm,
@@ -746,6 +746,24 @@ pub fn codegen_crate<
     if tcx.dep_graph.is_fully_enabled() {
         for cgu in codegen_units {
             tcx.ensure_ok().codegen_unit(cgu.name());
+        }
+    }
+
+    if tcx.sess.opts.incremental.is_some() {
+        let outputs = tcx.output_filenames(());
+        let allocator = cgu_name_builder.build_cgu_name(LOCAL_CRATE, &["crate"], Some("allocator"));
+        for name in codegen_units.iter().map(|cgu| cgu.name()).chain([allocator]) {
+            let name = name.as_str();
+            for path in [
+                outputs.temp_path_for_cgu(OutputType::Object, name),
+                outputs.temp_path_dwo_for_cgu(name),
+                outputs.temp_path_for_cgu(OutputType::Bitcode, name),
+                outputs.temp_path_for_cgu(OutputType::Assembly, name),
+                outputs.temp_path_for_cgu(OutputType::LlvmAssembly, name),
+                outputs.temp_path_ext_for_cgu("asm.o", name),
+            ] {
+                ensure_removed(tcx.dcx(), &path);
+            }
         }
     }
 
