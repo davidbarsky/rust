@@ -210,7 +210,7 @@ pub fn setup_dep_graph(
             Default::default()
         }
         LoadResult::DataOutOfDate => {
-            invalidate_old_session_dir(sess, &mut incr_comp_session);
+            incr_comp_session.old_session_directory = None;
             Default::default()
         }
         LoadResult::Ok { prev_graph, prev_work_products } => (prev_graph, prev_work_products),
