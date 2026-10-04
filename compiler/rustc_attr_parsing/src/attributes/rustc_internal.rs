@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use rustc_ast::{GenericParamKind, ItemKind, LitIntType, LitKind, MetaItemLit};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_attr_ir::{
-    BorrowckGraphvizFormatKind, CguFields, CguKind, RustcCleanAttribute, RustcCleanQueries,
-    RustcMirKind,
+    BorrowckGraphvizFormatKind, CguFields, CguKind, IncrementalStateAssertion,
+    MetadataStateExpectation, RustcCleanAttribute, RustcCleanQueries, RustcMirKind,
 };
 use rustc_data_structures::fx::FxHashMap;
 use rustc_feature::AttributeStability;
@@ -378,6 +378,106 @@ impl AttributeParser for RustcCguTestAttributeParser {
 
     fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         Some(AttributeKind::RustcCguTestAttr(self.items))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RustcIncrementalStateAssertionParser {
+    items: ThinVec<(Span, IncrementalStateAssertion)>,
+}
+
+impl AttributeParser for RustcIncrementalStateAssertionParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(
+        &[sym::rustc_expected_metadata_state],
+        template!(List: &[r#"cfg = "...", state = "reused|changed|discarded""#]),
+        unstable!(rustc_attrs),
+        |this, cx, args| {
+            if !cx.cx.sess.opts.unstable_opts.query_dep_graph {
+                cx.emit_err(AttributeRequiresOpt { span: cx.attr_span, opt: "-Z query-dep-graph" });
+            }
+            let Some(list) = cx.expect_list(args, cx.attr_span) else {
+                return;
+            };
+
+            let mut cfg = None;
+            let mut state = None;
+            for item in list.mixed() {
+                let Some(meta) = item.meta_item() else {
+                    cx.adcx().expected_specific_argument(item.span(), &[sym::cfg, sym::state]);
+                    continue;
+                };
+                let Some(ident) = meta.ident() else {
+                    cx.adcx().expected_identifier(meta.span());
+                    continue;
+                };
+                if ident.name == sym::cfg {
+                    let Some(value) =
+                        cx.expect_name_value(meta.args(), item.span(), Some(sym::cfg))
+                    else {
+                        continue;
+                    };
+                    let Some(value) = cx.expect_string_literal(value) else {
+                        continue;
+                    };
+                    if cfg.replace(value).is_some() {
+                        cx.adcx().duplicate_key(item.span(), sym::cfg);
+                    }
+                } else if ident.name == sym::state {
+                    let Some(value) =
+                        cx.expect_name_value(meta.args(), item.span(), Some(sym::state))
+                    else {
+                        continue;
+                    };
+                    let value_span = value.value_span;
+                    let Some(value) = cx.expect_string_literal(value) else {
+                        continue;
+                    };
+                    let value = if value == sym::reused {
+                        MetadataStateExpectation::Reused
+                    } else if value == sym::changed {
+                        MetadataStateExpectation::Changed
+                    } else if value == sym::discarded {
+                        MetadataStateExpectation::Discarded
+                    } else {
+                        cx.adcx().expected_specific_argument_strings(
+                            value_span,
+                            &[sym::reused, sym::changed, sym::discarded],
+                        );
+                        continue;
+                    };
+                    if state.replace(value).is_some() {
+                        cx.adcx().duplicate_key(item.span(), sym::state);
+                    }
+                } else {
+                    meta.ignore_args();
+                    cx.adcx().expected_specific_argument(ident.span, &[sym::cfg, sym::state]);
+                }
+            }
+
+            let Some(cfg) = cfg else {
+                cx.emit_err(CguFieldsMissing {
+                    span: list.span,
+                    name: &cx.attr_path,
+                    field: sym::cfg,
+                });
+                return;
+            };
+            let Some(state) = state else {
+                cx.emit_err(CguFieldsMissing {
+                    span: list.span,
+                    name: &cx.attr_path,
+                    field: sym::state,
+                });
+                return;
+            };
+            this.items.push((cx.attr_span, IncrementalStateAssertion { cfg, state }));
+        },
+    )];
+
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
+
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
+        Some(AttributeKind::RustcIncrementalStateAssertion(self.items))
     }
 }
 

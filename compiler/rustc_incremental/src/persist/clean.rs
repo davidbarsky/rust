@@ -19,11 +19,16 @@
 //! Errors are reported if we are in the suitable configuration but
 //! the required condition is not met.
 
-use rustc_attr_ir::{Attribute, AttributeKind, RustcCleanAttribute, find_attr};
+use rustc_attr_ir::{
+    Attribute, AttributeKind, IncrementalStateAssertion, MetadataStateExpectation,
+    RustcCleanAttribute, find_attr,
+};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::unord::UnordSet;
-use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind, intravisit};
+use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
+use rustc_hir::{
+    CRATE_HIR_ID, ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind, intravisit,
+};
 use rustc_middle::dep_graph::{DepKind, DepNode, dep_kind_from_label};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
@@ -124,6 +129,25 @@ struct Assertion {
     loaded_from_disk: Labels,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum NodeState {
+    Green,
+    Red,
+    Uncolored,
+}
+
+impl NodeState {
+    fn of(tcx: TyCtxt<'_>, dep_node: &DepNode) -> Self {
+        if tcx.dep_graph.is_green(dep_node) {
+            NodeState::Green
+        } else if tcx.dep_graph.is_red(dep_node) {
+            NodeState::Red
+        } else {
+            NodeState::Uncolored
+        }
+    }
+}
+
 pub(crate) fn check_clean_annotations(tcx: TyCtxt<'_>) {
     if !tcx.sess.opts.unstable_opts.query_dep_graph {
         return;
@@ -132,6 +156,47 @@ pub(crate) fn check_clean_annotations(tcx: TyCtxt<'_>) {
     // can't add `#[rustc_clean]` etc without opting into this feature
     if !tcx.features().rustc_attrs() {
         return;
+    }
+
+    for &(span, IncrementalStateAssertion { cfg, state }) in find_attr!(
+        tcx.hir_attrs(CRATE_HIR_ID),
+        RustcIncrementalStateAssertion(assertions) => assertions)
+    .into_iter()
+    .flatten()
+    {
+        if !tcx.sess.config.contains(&(cfg, None)) {
+            continue;
+        }
+
+        let required = match state {
+            MetadataStateExpectation::Reused => NodeState::Green,
+            MetadataStateExpectation::Changed => NodeState::Red,
+            MetadataStateExpectation::Discarded => NodeState::Uncolored,
+        };
+        for (component, dep_node, red) in [
+            (
+                "metadata hash",
+                DepNode::construct(tcx, DepKind::crate_hash, &LOCAL_CRATE),
+                "changed",
+            ),
+            ("metadata", tcx.metadata_dep_node(), "rebuilt"),
+        ] {
+            let actual = NodeState::of(tcx, &dep_node);
+            if actual == required {
+                continue;
+            }
+            let describe = |node_state| match node_state {
+                NodeState::Green => "reused",
+                NodeState::Red => red,
+                NodeState::Uncolored => "unavailable",
+            };
+            tcx.dcx().emit_err(diagnostics::UnexpectedIncrementalState {
+                span,
+                component,
+                expected: describe(required),
+                actual: describe(actual),
+            });
+        }
     }
 
     tcx.dep_graph.with_ignore(|| {

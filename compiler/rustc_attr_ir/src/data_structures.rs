@@ -73,6 +73,19 @@ pub enum CguFields {
 }
 
 #[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
+pub enum MetadataStateExpectation {
+    Reused,
+    Changed,
+    Discarded,
+}
+
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
+pub struct IncrementalStateAssertion {
+    pub cfg: Symbol,
+    pub state: MetadataStateExpectation,
+}
+
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
 pub enum InlineAttr {
     None,
     Hint,
@@ -1281,6 +1294,8 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_if_this_changed]`
     RustcIfThisChanged(Span, Option<Symbol>),
+
+    RustcIncrementalStateAssertion(ThinVec<(Span, IncrementalStateAssertion)>),
 
     /// Represents `#[rustc_inherit_overflow_checks]`
     RustcInheritOverflowChecks,

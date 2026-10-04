@@ -1,0 +1,118 @@
+error[E0539]: malformed `rustc_expected_metadata_state` attribute input
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:4:4
+   |
+LL | #![rustc_expected_metadata_state]
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected this to be a list
+   |
+help: must be of the form
+   |
+LL | #![rustc_expected_metadata_state(cfg = "...", state = "reused|changed|discarded")]
+   |                                 +++++++++++++++++++++++++++++++++++++++++++++++++
+
+error: `#[rustc_expected_metadata_state)]` is missing a `state` argument
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:5:33
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a")]
+   |                                 ^^^^^^^^^^^
+
+error: `#[rustc_expected_metadata_state)]` is missing a `cfg` argument
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:6:33
+   |
+LL | #![rustc_expected_metadata_state(state = "reused")]
+   |                                 ^^^^^^^^^^^^^^^^^^
+
+error[E0539]: malformed `rustc_expected_metadata_state` attribute input
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:7:4
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", state = "rebuilt")]
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^---------^
+   |                                                     |
+   |                                                     valid arguments are "reused", "changed" or "discarded"
+   |
+help: must be of the form
+   |
+LL - #![rustc_expected_metadata_state(cfg = "a", state = "rebuilt")]
+LL + #![rustc_expected_metadata_state(cfg = "...", state = "reused|changed|discarded")]
+   |
+
+error: `#[rustc_expected_metadata_state)]` is missing a `state` argument
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:7:33
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", state = "rebuilt")]
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0538]: malformed `rustc_expected_metadata_state` attribute input
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:10:4
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", state = "reused", state = "changed")]
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-----------------^
+   |                                                               |
+   |                                                               found `state` used as a key more than once
+   |
+help: must be of the form
+   |
+LL - #![rustc_expected_metadata_state(cfg = "a", state = "reused", state = "changed")]
+LL + #![rustc_expected_metadata_state(cfg = "...", state = "reused|changed|discarded")]
+   |
+
+error[E0538]: malformed `rustc_expected_metadata_state` attribute input
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:12:4
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", cfg = "b", state = "reused")]
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^---------^^^^^^^^^^^^^^^^^^^
+   |                                             |
+   |                                             found `cfg` used as a key more than once
+   |
+help: must be of the form
+   |
+LL - #![rustc_expected_metadata_state(cfg = "a", cfg = "b", state = "reused")]
+LL + #![rustc_expected_metadata_state(cfg = "...", state = "reused|changed|discarded")]
+   |
+
+error[E0539]: malformed `rustc_expected_metadata_state` attribute input
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:14:4
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", metadata_hash = "reused")]
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-------------^^^^^^^^^^^^
+   |                                             |
+   |                                             valid arguments are `cfg` or `state`
+   |
+help: must be of the form
+   |
+LL - #![rustc_expected_metadata_state(cfg = "a", metadata_hash = "reused")]
+LL + #![rustc_expected_metadata_state(cfg = "...", state = "reused|changed|discarded")]
+   |
+
+error: `#[rustc_expected_metadata_state)]` is missing a `state` argument
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:14:33
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", metadata_hash = "reused")]
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: expected a literal (`1u8`, `1.0f32`, `"string"`, etc.) here, found expression
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:17:53
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", state = reused)]
+   |                                                     ^^^^^^ expressions are not allowed here
+   |
+help: surround the identifier with quotation marks to make it into a string literal
+   |
+LL | #![rustc_expected_metadata_state(cfg = "a", state = "reused")]
+   |                                                     +      +
+
+error: crate-level attribute should be an inner attribute: add an exclamation mark: `#![rustc_expected_metadata_state]`
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:20:1
+   |
+LL | #[rustc_expected_metadata_state(cfg = "a", state = "reused")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: this attribute does not have an `!`, which means it is applied to this function
+  --> $DIR/rustc-expected-metadata-state-malformed.rs:22:1
+   |
+LL | fn main() {}
+   | ^^^^^^^^^^^^
+
+error: aborting due to 11 previous errors
+
+Some errors have detailed explanations: E0538, E0539.
+For more information about an error, try `rustc --explain E0538`.

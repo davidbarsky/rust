@@ -4,6 +4,8 @@
 #![feature(rustc_attrs)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
+#![rustc_expected_metadata_state(cfg = "foo", state = "reused")]
+//~^ ERROR attribute requires -Z query-dep-graph
 
 #[rustc_clean(cfg = "foo")] //~ ERROR attribute requires -Z query-dep-graph
 fn main() {}
