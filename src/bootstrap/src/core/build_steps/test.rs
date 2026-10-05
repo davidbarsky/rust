@@ -2356,7 +2356,7 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
                 })
             };
             if !builder.config.dry_run() {
-                for name in ["run_make_support"] {
+                for name in ["run_make_support", "hegel"] {
                     let rlib = find(name, "rlib")
                         .unwrap_or_else(|| panic!(".rlib not found when compiling lib{name}"));
                     cmd.arg("--run-make-extern").arg(format!("{name}={}", rlib.display()));

@@ -35,10 +35,15 @@ pub mod rfs {
 
 // Re-exports of third-party library crates.
 pub use bstr;
+pub use build_helper::dep_info;
+pub use camino;
 pub use gimli;
+pub use hegel;
+pub use indexmap;
 pub use libc;
 pub use object;
 pub use regex;
+pub use rustc_hash;
 pub use rustdoc_json_types;
 pub use serde_json;
 pub use similar;
