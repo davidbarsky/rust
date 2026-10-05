@@ -117,12 +117,8 @@ struct Args {
     /// Path to rustc to use for compiling run-make recipes.
     #[arg(long)]
     stage0_rustc_path: Option<Utf8PathBuf>,
-    /// Path to librun-make-support .rlib to use for compiling run-make recipes.
-    #[arg(long)]
-    run_make_support_rlib: Option<Utf8PathBuf>,
-    /// Path to librun-make-support .rmeta to use for compiling run-make recipes.
-    #[arg(long)]
-    run_make_support_rmeta: Option<Utf8PathBuf>,
+    #[arg(long = "run-make-extern")]
+    run_make_externs: Vec<String>,
     /// Path to rustc to use for querying target information.
     #[arg(long)]
     query_rustc_path: Option<Utf8PathBuf>,
@@ -490,8 +486,7 @@ pub(crate) fn parse_config(args: Vec<String>) -> Config {
         run,
         run_clang_based_tests_with: args.run_clang_based_tests_with,
         run_ignored: args.ignored,
-        run_make_support_rlib: args.run_make_support_rlib,
-        run_make_support_rmeta: args.run_make_support_rmeta,
+        run_make_externs: args.run_make_externs,
         runner: args.runner,
         rust_randomized_layout: args.rust_randomized_layout,
         rustc_path: args.rustc_path,

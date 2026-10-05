@@ -2339,14 +2339,16 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
             // Find .rlib and .rmeta files of the run-make-support library, and pass them to
             // compiletest
             let output = builder.tool(Tool::RunMakeSupport);
-            let find = |extension: &str| -> Option<&PathBuf> {
+            let find = |name: &str, extension: &str| -> Option<&PathBuf> {
                 output.artifacts.iter().find_map(|p| {
                     // We want librun_make_support .rlib and .rmeta files
                     // They can be in separate directories, because Cargo currently uplifts the
                     // .rlib file when using -Zembed-metadata=no, but it doesn't uplift the
                     // .rmeta file
-                    let filename = p.file_name()?.to_str()?;
-                    if !filename.starts_with("librun_make_support") {
+                    let library = p.file_stem()?.to_str()?.strip_prefix("lib")?;
+                    let crate_name =
+                        library.split_once('-').map_or(library, |(crate_name, _hash)| crate_name);
+                    if crate_name != name {
                         return None;
                     }
 
@@ -2354,13 +2356,15 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
                 })
             };
             if !builder.config.dry_run() {
-                let rlib =
-                    find("rlib").expect(".rlib not found when compiling librun_make_support");
-                cmd.arg("--run-make-support-rlib").arg(rlib);
+                for name in ["run_make_support"] {
+                    let rlib = find(name, "rlib")
+                        .unwrap_or_else(|| panic!(".rlib not found when compiling lib{name}"));
+                    cmd.arg("--run-make-extern").arg(format!("{name}={}", rlib.display()));
 
-                // .rmeta might not be found if we're not using -Zembed-metadata=no
-                if let Some(rmeta) = find("rmeta") {
-                    cmd.arg("--run-make-support-rmeta").arg(rmeta);
+                    // .rmeta might not be found if we're not using -Zembed-metadata=no
+                    if let Some(rmeta) = find(name, "rmeta") {
+                        cmd.arg("--run-make-extern").arg(format!("{name}={}", rmeta.display()));
+                    }
                 }
             }
         }
